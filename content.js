@@ -106,7 +106,11 @@
       source: BRIDGE_SOURCE,
       type: 'XTB_HELLO',
       token: sessionToken,
-      debug: debugEnabled
+      debug: debugEnabled,
+      // Sent on every handshake, not only on change: the page realm needs these
+      // before it can decide whether a profile timeline belongs to its owner.
+      ownAuthorIds: ownAuthorIds,
+      captureReplies: captureReplies
     });
 
     if (handshakeIndex < HANDSHAKE_RETRY_MS.length - 1) {
@@ -177,6 +181,80 @@
     }
     if (typeof serialized !== 'string' || serialized.length > MAX_INBOUND_BYTES) return null;
     return payload;
+  }
+
+  /** A timeline response is one page or two; a larger batch means something is wrong. */
+  const MAX_BACKFILL_RECORDS = 200;
+  const MAX_BACKFILL_BYTES = 4 * 1024 * 1024;
+
+  /**
+   * A profile-timeline sweep arrives as a batch, so it is the only message that
+   * can carry more than one record. Every row is validated on exactly the terms
+   * a live capture is — this is not a shortcut past the boundary just because
+   * the rows came from a different operation.
+   *
+   * `source.backfilled` is required, not optional: the whole point of the flag
+   * is that a row recovered by a sweep was not witnessed at publish time, and a
+   * payload that omitted it would be claiming otherwise.
+   *
+   * Validation is row by row, and a bad row costs its own row and nothing more.
+   * Refusing the whole batch meant one malformed entry threw away every good
+   * record travelling with it — and a dropped row here is a lost post, which is
+   * the one failure this extension is not allowed to have. The cap is applied by
+   * taking the first MAX_BACKFILL_RECORDS instead of rejecting the message: a
+   * response that large is unusual, but its first 200 rows are still worth
+   * keeping.
+   */
+  function validateBackfill(raw) {
+    if (!isObject(raw)) return null;
+    if (!isObject(raw.payload)) return null;
+    if (!Array.isArray(raw.payload.records)) return null;
+    if (raw.payload.records.length === 0) return null;
+
+    const incoming = raw.payload.records;
+    const limit = Math.min(incoming.length, MAX_BACKFILL_RECORDS);
+    const overCap = incoming.length - limit;
+    const records = [];
+    let dropped = 0;
+
+    for (let i = 0; i < limit; i++) {
+      const record = incoming[i];
+      if (!isObject(record) ||
+          !isTweetId(record.id) ||
+          typeof record.text !== 'string' ||
+          record.text.length > MAX_TEXT_CHARS ||
+          (record.media !== undefined && record.media !== null && !Array.isArray(record.media)) ||
+          (record.author !== undefined && record.author !== null && !isObject(record.author)) ||
+          !isObject(record.source) ||
+          record.source.backfilled !== true) {
+        dropped++;
+        continue;
+      }
+      records.push(record);
+    }
+    dropped += overCap;
+
+    let serialized;
+    try {
+      serialized = JSON.stringify(records);
+    } catch (_) {
+      return null;
+    }
+    if (typeof serialized !== 'string' || serialized.length > MAX_BACKFILL_BYTES) {
+      reportRejection('a backfill batch exceeded ' + MAX_BACKFILL_BYTES + ' bytes');
+      return null;
+    }
+
+    // A dropped row has to reach the page, or its only trace is a debug-gated
+    // console line nobody reads. reportRejection carries it to the diagnostics
+    // panel, which is where a lost post belongs.
+    if (dropped > 0) {
+      reportRejection('dropped ' + dropped + ' of ' + incoming.length + ' backfill rows before storage' +
+        (overCap > 0 ? ' (' + overCap + ' beyond the ' + MAX_BACKFILL_RECORDS + '-row cap)' : ''));
+    }
+
+    if (records.length === 0) return null;
+    return { records: records };
   }
 
   /**
@@ -322,6 +400,19 @@
         return;
       }
 
+      if (data.type === 'X_TWEET_BACKFILL') {
+        const payload = validateBackfill(data);
+        if (payload === null) {
+          log('rejected malformed backfill payload');
+          return;
+        }
+        forwardToBackground({
+          type: 'X_TWEET_BACKFILL',
+          payload: payload
+        });
+        return;
+      }
+
       if (data.type === 'X_TWEET_DELETED') {
         // A delete carries no tweet content — only which id was removed and
         // when — so it gets its own narrow validation rather than reusing the
@@ -351,6 +442,8 @@
             createTweetSeen: data.payload.createTweetSeen,
             deleteSeen: data.payload.deleteSeen,
             deleted: data.payload.deleted,
+            timelineSeen: data.payload.timelineSeen,
+            timelineKept: data.payload.timelineKept,
             requestBodyRead: data.payload.requestBodyRead,
             requestBodyFailed: data.payload.requestBodyFailed,
             responseCloneFailed: data.payload.responseCloneFailed,
@@ -383,25 +476,60 @@
       source: BRIDGE_SOURCE,
       type: 'XTB_CONFIG',
       token: sessionToken,
-      debug: debugEnabled
+      debug: debugEnabled,
+      ownAuthorIds: ownAuthorIds,
+      captureReplies: captureReplies
     });
+  }
+
+  /**
+   * Whether the page realm should also read the Replies tab. Mirrored here
+   * because the decision is enforced on the page side, at the point the request
+   * is recognised — a disabled Replies tab should cost nothing at all, not be
+   * read and then thrown away.
+   */
+  let captureReplies = false;
+
+  /**
+   * The account ids learned so far, mirrored into the page realm.
+   *
+   * These are ids, never credentials — they arrive from the author field of a
+   * CreateTweet response the extension already parses, and the page realm uses
+   * them for exactly one thing: deciding whether a profile timeline it happens
+   * to see belongs to this account.
+   */
+  let ownAuthorIds = [];
+
+  function adoptStoredOwnAuthors(list) {
+    if (!Array.isArray(list)) return;
+    ownAuthorIds = list
+      .filter((id) => typeof id === 'string' && /^[0-9]{1,25}$/.test(id))
+      .slice(0, 20);
+    pushConfig();
   }
 
   function applySettings(settings) {
     if (!isObject(settings)) return;
+    let changed = false;
     if (typeof settings.debug === 'boolean' && settings.debug !== debugEnabled) {
       debugEnabled = settings.debug;
-      pushConfig();
+      changed = true;
     }
+    if (typeof settings.captureReplies === 'boolean' && settings.captureReplies !== captureReplies) {
+      captureReplies = settings.captureReplies;
+      changed = true;
+    }
+    if (changed) pushConfig();
   }
 
   function loadSettings() {
     try {
       if (!chrome.runtime || !chrome.runtime.id || !chrome.storage || !chrome.storage.local) return;
-      chrome.storage.local.get({ xtbSettings: null }, (result) => {
+      chrome.storage.local.get({ xtbSettings: null, xtbOwnAuthors: null }, (result) => {
         try {
           if (chrome.runtime.lastError) return;
           applySettings(result ? result.xtbSettings : null);
+          adoptStoredOwnAuthors(result ? result.xtbOwnAuthors : null);
         } catch (_) { /* ignore */ }
       });
     } catch (err) {

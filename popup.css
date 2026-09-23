@@ -216,11 +216,19 @@ body {
 
 /* ---------------------------------------------------------------- notice */
 
-.notice {
-  margin: 0 14px 6px;
-  min-height: 0;
+/* In the header, sharing the row with the title and the refresh button. It takes
+   whatever width is left and wraps there rather than being cut off — a status
+   line that cannot be read is the same as no status line, and this one carries
+   both "exported N records" and the failure messages. */
+.header .notice {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
   font-size: 11px;
+  line-height: 1.35;
+  text-align: right;
   color: var(--text-soft);
+  overflow-wrap: anywhere;
 }
 
 .notice:empty {
@@ -278,6 +286,16 @@ body {
   margin-left: 4px;
 }
 
+/* The author doubles as a filter control — see renderCard. It has to look
+   interactive without competing with the text, so it only reacts on hover. */
+.card__author--filterable {
+  cursor: pointer;
+}
+
+.card__author--filterable:hover {
+  color: var(--accent);
+}
+
 .card__time {
   font-size: 10px;
   color: var(--text-faint);
@@ -286,6 +304,10 @@ body {
 
 .card__text {
   margin: 0;
+  /* Left at the original size. The complaint that this read too small turned
+     out to be about how little of the popup the list was given, not about the
+     type — once the settings were folded away the list has room and this size
+     is right. Enlarging the text was the wrong lever. */
   font-size: 12.5px;
   white-space: pre-wrap;
   word-break: break-word;
@@ -301,15 +323,15 @@ body {
   overflow: visible;
 }
 
+/* The wording itself is set from popup.js (data-empty-text), because a CSS
+   string cannot be localised — the two literals that used to live here were
+   Chinese for every user, English included. Which wording applies (an empty
+   post, or a retweet that has no text by definition) is a fact about the record,
+   so it is decided where the record is. */
 .card__text:empty::after {
-  content: "（无正文，可能是纯媒体推文）";
+  content: attr(data-empty-text);
   color: var(--text-faint);
   font-style: italic;
-}
-
-/* A retweet has no text by definition, so it gets its own wording. */
-.card__text--retweet:empty::after {
-  content: "转推，你没有添加文字";
 }
 
 .badge--retweet {
@@ -325,6 +347,13 @@ body {
 .badge--edit {
   color: var(--warn);
   border-color: color-mix(in srgb, var(--warn) 40%, var(--border));
+}
+
+/* Recovered from a profile sweep instead of captured at publish time. Muted:
+   the record is complete enough to keep, it just was not witnessed live. */
+.badge--backfilled {
+  color: var(--text-soft);
+  border-style: dotted;
 }
 
 /* An older version of an edited tweet: present in the archive, but no longer
@@ -642,13 +671,33 @@ body {
   background: var(--bg);
 }
 
+/* Settings, cleanup and the long notes folded away so the list can have the
+   height instead. A Chromium popup is capped at 600px, and the list is the only
+   part anyone opens the popup to see. */
+.settings {
+  margin: 8px 0 2px;
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+}
+
+.settings > summary {
+  cursor: pointer;
+  color: var(--text-soft);
+  font-size: 12px;
+  list-style-position: inside;
+}
+
+.settings[open] > summary {
+  margin-bottom: 6px;
+}
+
 .toggle {
   display: flex;
   align-items: center;
   gap: 7px;
-  font-size: 11.5px;
+  font-size: 12px;
   color: var(--text-soft);
-  padding: 3px 0;
+  padding: 4px 0;
   cursor: pointer;
 }
 
@@ -656,6 +705,13 @@ body {
   accent-color: var(--accent);
   margin: 0;
   cursor: pointer;
+}
+
+/* The button that brings the first-run panel back. Sat directly under the
+   toggles it is about, because that is where someone who wants to change one of
+   those four behaviours will already be looking. */
+.settings__action {
+  margin-top: 7px;
 }
 
 /* --------------------------------------------------------------- cleanup */
@@ -723,6 +779,97 @@ body {
 
 .footer__note--warning strong {
   font-weight: 650;
+}
+
+/* ------------------------------------------------------- first-run choices */
+
+/* A modal, deliberately: see the comment on #choice in popup.html. Nothing here
+   is in the flow, so the list keeps every pixel of its height while the panel is
+   up. `[hidden]` is spelled out because the `display: flex` below would other-
+   wise beat the attribute's own display:none. */
+.choice {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 12px;
+  background: rgba(12, 16, 22, 0.55);
+}
+
+.choice[hidden] {
+  display: none;
+}
+
+/* Capped and scrollable: four options plus their cost lines are taller than the
+   600px a popup is allowed, and a panel whose confirm button is off-screen would
+   be a panel nobody can answer. */
+/* The only line on this panel that is not a preference. It warns that the
+   archive can vanish without anyone choosing anything, so it is set apart by
+   colour rather than by position alone — a warning that reads as one more
+   paragraph of explanation is a warning nobody reads. */
+.choice__warning {
+  margin: 10px 0 0;
+  padding: 8px 10px;
+  border: 1px solid var(--warn);
+  border-left-width: 3px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--warn) 12%, transparent);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.choice__panel {
+  width: 100%;
+  max-width: 420px;
+  max-height: 100%;
+  overflow-y: auto;
+  padding: 12px 13px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+}
+
+.choice__title {
+  margin: 0 0 5px;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.choice__intro {
+  margin: 0 0 4px;
+  font-size: 10px;
+  line-height: 1.6;
+  color: var(--text-soft);
+}
+
+/* One question. The row itself reuses .toggle, so the panel and the settings
+   section cannot drift into two different ideas of what a settings checkbox
+   looks like — only the cost line underneath is new. */
+.choice__option {
+  padding: 3px 0 5px;
+  border-top: 1px solid var(--border);
+}
+
+/* Indented to sit under the label rather than under the checkbox. The cost is
+   not decoration: a choice whose price is invisible is not a choice. */
+.choice__cost {
+  margin: 0 0 0 20px;
+  font-size: 10px;
+  line-height: 1.6;
+  color: var(--text-faint);
+}
+
+.choice__note {
+  margin: 0 0 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+  font-size: 10px;
+  line-height: 1.6;
+  color: var(--text-faint);
 }
 
 /* ==========================================================================

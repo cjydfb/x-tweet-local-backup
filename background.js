@@ -18,6 +18,7 @@
 import {
   openDB,
   upsertTweet,
+  upsertBackfill,
   markSuperseded,
   markDeleted,
   recordDeletion,
@@ -26,8 +27,10 @@ import {
   clearAll,
   countTweets,
   countMedia,
+  getTweet,
   countTweetsByFilter,
   purgeTweets,
+  forEachTweet,
   PURGE_FILTERS,
   SCHEMA_VERSION
 } from './db.js';
@@ -39,7 +42,9 @@ import {
   resetStats,
   bumpLifetime,
   mergePageDiag,
-  noteCaptureTime
+  noteCaptureTime,
+  getOwnAuthors,
+  rememberOwnAuthors
 } from './settings.js';
 
 import { cacheMediaForTweet, hasMediaPermission } from './media-cache.js';
@@ -48,7 +53,20 @@ import { cacheMediaForTweet, hasMediaPermission } from './media-cache.js';
 /* Constants                                                                  */
 /* -------------------------------------------------------------------------- */
 
-const ALLOWED_PAGE_URL_PREFIXES = ['https://x.com/', 'https://twitter.com/'];
+/**
+ * Whether a hostname belongs to X.
+ *
+ * The manifest injects the content script into `https://*.x.com/*` and
+ * `https://*.twitter.com/*`, so a capture can legitimately arrive from
+ * mobile.x.com or www.x.com. The old prefix test only accepted the bare
+ * domains and silently refused those tabs. This is the same hostname test
+ * inject.js applies to the requests it observes.
+ */
+function isXHostname(hostname) {
+  const h = typeof hostname === 'string' ? hostname.toLowerCase() : '';
+  return h === 'x.com' || h.endsWith('.x.com') ||
+         h === 'twitter.com' || h.endsWith('.twitter.com');
+}
 const MAX_TEXT_CHARS = 200000;
 const MAX_MEDIA_ITEMS = 64;
 const MAX_VARIANTS_PER_MEDIA = 32;
@@ -362,6 +380,12 @@ function sanitizeSource(rawSource) {
     capturedVia: source.capturedVia === 'xhr' ? 'xhr' : 'fetch',
     httpStatus: asNumberOrNull(source.httpStatus),
     textFromRequest: asBooleanOrNull(source.textFromRequest) === true,
+    // True when the row was recovered from a profile timeline sweep rather than
+    // observed at publish time. `capturedAt` on such a row is when the sweep
+    // ran, not when the post was made, and the row may be missing fields the
+    // publish path would have had — so the archive says which is which instead
+    // of presenting a thinner record as an equal one.
+    backfilled: asBooleanOrNull(source.backfilled) === true,
     tombstone: false
   };
 }
@@ -438,22 +462,213 @@ function sanitizeRecord(raw) {
 /* Media cache queue (best effort, never blocks the tweet write)              */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * chrome.storage.local key holding the ids that were still waiting when the
+ * last service-worker life ended.
+ */
+const MEDIA_QUEUE_KEY = 'xtbMediaQueue';
+
+/**
+ * Ceiling on the persisted pending list.
+ *
+ * The same number as the largest queue any single pass may build (see
+ * MEDIA_QUEUE_LIMIT_FILL), so it cannot truncate anything a caller was allowed
+ * to queue. A tweet id is at most 25 characters, so the whole list is ~50 KB in
+ * one storage value — nowhere near chrome.storage.local's quota. The ceiling is
+ * here because this is the one structure that outlives the worker: a list that
+ * could grow without bound would be a way for a page to fill storage.
+ */
+const MEDIA_QUEUE_MAX_PENDING = 2000;
+
+/**
+ * How long to wait before retrying a drain whose database open failed.
+ *
+ * Long enough not to spin against a database that is still blocked (the open
+ * itself now spends its own deadline before failing), and short enough that the
+ * retry has a chance to run inside this worker life, which MV3 ends after
+ * roughly thirty idle seconds.
+ */
+const MEDIA_QUEUE_RETRY_MS = 15000;
+
 const mediaQueue = [];
 let mediaWorkerRunning = false;
+let mediaRetryTimer = null;
+let mediaRestoreInFlight = null;
+let mediaRestoreSettled = false;
+let mediaWriteChain = Promise.resolve();
+/**
+ * Ids read from storage that have not been re-queued yet. While a restore is
+ * running these are part of the pending set — the stored list is the only copy
+ * of that work, and writing out just `mediaQueue` mid-restore would drop the
+ * remainder, which is the same silent loss in a different place.
+ */
+let mediaRestorePending = [];
 
-function enqueueMedia(tweet) {
-  if (mediaQueue.length >= 50) return;
+/**
+ * The ids that have to be re-queued if this worker disappears right now: the
+ * queue itself, plus — while a restore is running — the stored ids that have
+ * not been read back yet. Both halves matter, because the in-memory queue is
+ * only ever a partial copy of the persisted list during a restore.
+ */
+function pendingMediaIds() {
+  const ids = [];
+  const add = (id) => {
+    if (typeof id === 'string' && ids.indexOf(id) === -1) ids.push(id);
+  };
+  for (const id of mediaRestorePending) add(id);
+  for (const tweet of mediaQueue) add(tweet && typeof tweet.id === 'string' ? tweet.id : null);
+  return ids;
+}
+
+/**
+ * Mirror the pending queue into chrome.storage.local.
+ *
+ * MV3 tears an idle service worker down after about thirty seconds, and a
+ * pending `await fetch()` does not hold it open. An in-memory queue is
+ * therefore not a queue: a single「补下缺失的媒体」pass can leave two thousand
+ * entries waiting, and everything still there when the worker dies simply
+ * disappears. Nothing moves — `mediaFailed` is not bumped, `mediaCached` just
+ * stops growing — and that reads exactly like "there was nothing left to
+ * download", which is the one thing it is not.
+ *
+ * Ids are enough. The record stays in IndexedDB, and cacheMediaForTweet looks
+ * each file up by tweetId:mediaId and skips what is already stored, so
+ * re-running a restored entry downloads only what is genuinely missing.
+ *
+ * Writes are chained and each is a complete snapshot of the pending set, so
+ * two of them completing out of order can only ever leave a *stale* list —
+ * never a half-written one. A stale list is safe: the ids in it are re-checked
+ * against the media store before anything is fetched.
+ */
+function persistMediaQueue() {
+  const all = pendingMediaIds();
+  const ids = all.slice(0, MEDIA_QUEUE_MAX_PENDING);
+  if (all.length > ids.length) {
+    log('media queue: ' + (all.length - ids.length) + ' pending ids beyond the ' +
+        MEDIA_QUEUE_MAX_PENDING + '-id persistence cap were NOT written');
+  }
+  mediaWriteChain = mediaWriteChain.then(
+    () => writeStoredMediaQueue(ids),
+    () => writeStoredMediaQueue(ids)
+  );
+}
+
+/** One write of the pending list. Never rejects: losing the mirror is not
+ *  losing the work, and there is nothing useful to do about it here. */
+function writeStoredMediaQueue(ids) {
+  return new Promise((resolve) => {
+    try {
+      if (!chrome || !chrome.storage || !chrome.storage.local) {
+        resolve();
+        return;
+      }
+      const result = chrome.storage.local.set({ [MEDIA_QUEUE_KEY]: ids });
+      if (result && typeof result.then === 'function') result.then(resolve, resolve);
+      else resolve();
+    } catch (_) {
+      resolve();
+    }
+  });
+}
+
+function readStoredMediaQueue() {
+  return new Promise((resolve) => {
+    try {
+      if (!chrome || !chrome.storage || !chrome.storage.local) {
+        resolve([]);
+        return;
+      }
+      const result = chrome.storage.local.get({ [MEDIA_QUEUE_KEY]: [] });
+      if (!result || typeof result.then !== 'function') {
+        resolve([]);
+        return;
+      }
+      result.then(
+        (stored) => {
+          const list = stored ? stored[MEDIA_QUEUE_KEY] : null;
+          if (!Array.isArray(list)) {
+            resolve([]);
+            return;
+          }
+          // Storage is shared with the settings and survives upgrades, so what
+          // comes back is treated as input: only strings that could be a tweet
+          // id may become a database lookup.
+          resolve(list.filter((id) => typeof id === 'string' && TWEET_ID_PATTERN.test(id)));
+        },
+        () => resolve([])
+      );
+    } catch (_) {
+      resolve([]);
+    }
+  });
+}
+
+/**
+ * Queue a tweet's media for download.
+ *
+ * Returns false when the queue is already at its cap. The cap exists so a
+ * runaway cannot fill memory, but a caller that drops work has to be able to
+ * say so — a silently skipped download looks exactly like a tweet that had no
+ * media, and those are very different things.
+ *
+ * `limit` lets a timeline sweep use a larger cap: it arrives as one batch of up
+ * to 200 posts, and the live-capture cap would discard most of it.
+ */
+function enqueueMedia(tweet, limit) {
+  const cap = Number.isInteger(limit) && limit > 0 ? limit : MEDIA_QUEUE_LIMIT;
+  if (mediaQueue.length >= cap) return false;
   mediaQueue.push(tweet);
+  // Mirrored before the download starts, not after: the point of the mirror is
+  // the entry that has not run yet.
+  persistMediaQueue();
   void runMediaQueue();
+  return true;
+}
+
+/**
+ * Give a drain whose database open failed another chance in this same worker
+ * life.
+ *
+ * The persisted list is what covers a termination; this covers the case where
+ * the worker survives. Neither replaces the other: a timer does not keep an
+ * MV3 worker alive, and a restored list only helps once the worker starts
+ * again.
+ */
+function scheduleMediaQueueRetry() {
+  if (mediaRetryTimer !== null || mediaQueue.length === 0) return;
+  mediaRetryTimer = setTimeout(() => {
+    mediaRetryTimer = null;
+    void runMediaQueue();
+  }, MEDIA_QUEUE_RETRY_MS);
 }
 
 async function runMediaQueue() {
   if (mediaWorkerRunning) return;
   mediaWorkerRunning = true;
+  // A retry that fired to get here must not fire again on top of this run.
+  if (mediaRetryTimer !== null) {
+    clearTimeout(mediaRetryTimer);
+    mediaRetryTimer = null;
+  }
   try {
-    const db = await openDB();
+    let db;
+    try {
+      db = await openDB();
+    } catch (err) {
+      // The queue is not lost — it is mirrored — but nothing else calls back in
+      // until the next enqueue, so what is left is retried rather than
+      // abandoned. If the worker dies first, the mirror covers that.
+      log('media queue: database unavailable, ' + describe(err));
+      scheduleMediaQueueRetry();
+      return;
+    }
     while (mediaQueue.length > 0) {
-      const tweet = mediaQueue.shift();
+      // Peeked, not shifted: the entry stays in the queue, and so in the
+      // mirror, until its download has finished one way or the other. A
+      // termination mid-fetch then resumes it, while a download that fails —
+      // a 404 the origin will keep answering — still leaves the queue below and
+      // so cannot wedge it forever.
+      const tweet = mediaQueue[0];
       try {
         const result = await cacheMediaForTweet(db, tweet, {});
         if (result.cached > 0 || result.failed > 0) {
@@ -464,12 +679,91 @@ async function runMediaQueue() {
         // Never allowed to affect the tweet record.
         log('media cache failed', err);
       }
+      mediaQueue.shift();
+      persistMediaQueue();
     }
   } catch (err) {
     log('media queue failed', err);
   } finally {
     mediaWorkerRunning = false;
   }
+}
+
+/**
+ * Re-arm the queue from the previous worker life.
+ *
+ * Ids are what is stored; a record is what the downloader needs, so each id is
+ * read back through getTweet. An id whose record is gone — the user removed
+ * that backup, or cleared the archive — is dropped rather than retried forever:
+ * there is nothing left to download, and a queue that cannot empty is worse
+ * than a short one.
+ *
+ * Runs once per worker life. A run that could not read or open anything leaves
+ * the stored list untouched and un-settles, so the next start retries it.
+ */
+async function restoreMediaQueue() {
+  if (mediaRestoreSettled || mediaRestoreInFlight !== null) return mediaRestoreInFlight;
+  mediaRestoreInFlight = restoreMediaQueueInternal().then(
+    (settled) => {
+      mediaRestoreInFlight = null;
+      if (settled) mediaRestoreSettled = true;
+    },
+    (err) => {
+      mediaRestoreInFlight = null;
+      log('media queue restore failed', describe(err));
+    }
+  );
+  return mediaRestoreInFlight;
+}
+
+async function restoreMediaQueueInternal() {
+  const ids = await readStoredMediaQueue();
+  if (ids.length === 0) return true;
+
+  // Nothing is downloaded behind an off switch. The list is left exactly as it
+  // is — not dropped — so switching media caching back on, or the next worker
+  // start, still finds the work that was queued while it was on.
+  const settings = await getSettings();
+  if (settings.mediaCache !== true) return false;
+
+  let db;
+  try {
+    db = await openDB();
+  } catch (err) {
+    // The stored list is the only copy of this work, so it is left alone.
+    log('media queue restore: database unavailable, ' + describe(err));
+    return false;
+  }
+
+  mediaRestorePending = ids;
+  let restored = 0;
+  for (const id of ids) {
+    // Taken out of the pending set before the enqueue, so the mirror never
+    // lists it twice: from here on the queue entry is what carries it.
+    const at = mediaRestorePending.indexOf(id);
+    if (at !== -1) mediaRestorePending.splice(at, 1);
+
+    let record = null;
+    try {
+      record = await getTweet(db, id);
+    } catch (err) {
+      log('media queue restore: could not read', id, describe(err));
+    }
+    if (!record || typeof record !== 'object' ||
+        !Array.isArray(record.media) || record.media.length === 0) {
+      continue; // nothing left to download for this id
+    }
+    if (enqueueMedia(record, MEDIA_QUEUE_MAX_PENDING)) restored++;
+  }
+  // Every id has been accounted for, so the queue alone is now the pending set.
+  // (An unexpected throw above skips this, leaving the remainder in the mirror
+  // for the next start rather than dropping it.)
+  mediaRestorePending = [];
+  persistMediaQueue();
+  if (restored > 0) {
+    log('media queue restored: ' + restored + ' of ' + ids.length + ' pending tweets re-queued');
+  }
+  return true;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -481,10 +775,11 @@ function isTrustedPageSender(sender) {
     if (!sender || sender.id !== chrome.runtime.id) return false;
     if (!sender.tab) return false;
     const url = typeof sender.url === 'string' ? sender.url : (sender.tab.url || '');
-    for (const prefix of ALLOWED_PAGE_URL_PREFIXES) {
-      if (url.indexOf(prefix) === 0) return true;
-    }
-    return false;
+    // Parsed, not prefix-matched: the hostname is the part that says whose page
+    // this is, and only a parsed one can tell x.com from x.com.evil.example.
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'https:') return false;
+    return isXHostname(parsed.hostname);
   } catch (_) {
     return false;
   }
@@ -528,6 +823,18 @@ async function handleCapture(payload) {
     await bumpLifetime({ upsertOk: 1 });
     await noteCaptureTime(record.capturedAt);
 
+    // Every published post names its author, which is how the extension learns
+    // whose account this is. That id is what lets the profile-timeline sweep
+    // tell "my profile" from "somebody else's profile" — without it the sweep
+    // would have to either stay off or archive other people's posts.
+    if (record.author.id !== null) {
+      try {
+        await rememberOwnAuthors([record.author.id]);
+      } catch (err) {
+        log('could not record the author id', err);
+      }
+    }
+
     // An edit arrives as a brand-new tweet id. Point the older version at it so
     // the archive shows the chain instead of two unrelated-looking records.
     // Failure here must never cost us the record that was just written.
@@ -541,7 +848,13 @@ async function handleCapture(payload) {
 
     const settings = await getSettings();
     if (settings.mediaCache && record.media.length > 0) {
-      enqueueMedia(record);
+      // enqueueMedia refuses when the queue is at its cap. Dropping that answer
+      // made a download that never happened look exactly like a post that had no
+      // media, so the count is kept — the record itself must never be affected.
+      if (!enqueueMedia(record)) {
+        await bumpLifetime({ mediaDropped: 1 });
+        log('media queue full: the download for', record.id, 'was NOT queued');
+      }
     }
 
     log('stored tweet', record.id, result.existed ? '(updated)' : '(new)');
@@ -550,6 +863,180 @@ async function handleCapture(payload) {
     await bumpLifetime({ upsertFailed: 1 }, 'IndexedDB write failed: ' + describe(err));
     return { ok: false, error: 'write failed' };
   }
+}
+
+/** A timeline response carries at most a page or two; anything larger is a bug. */
+const MAX_BACKFILL_BATCH = 200;
+
+/**
+ * Media queue caps. The standing one keeps a burst of live captures bounded;
+ * the sweep one is large enough to hold a whole recovered page without
+ * discarding any of it, since a sweep is a deliberate action with a known size.
+ */
+const MEDIA_QUEUE_LIMIT = 50;
+const MEDIA_QUEUE_LIMIT_SWEEP = 500;
+/** A gap-filling pass covers whatever is already archived, so it needs more room. */
+const MEDIA_QUEUE_LIMIT_FILL = 2000;
+
+/**
+ * Store the rows recovered from one profile-timeline sweep.
+ *
+ * These are posts the browser never saw published — most often made from the
+ * phone, which an extension cannot observe at all. Opening your own profile
+ * makes X fetch the timeline itself, and that response contains your posts
+ * regardless of which device posted them, so reading it fills the gap without
+ * the extension ever making a request of its own.
+ *
+ * Two rules make this safe:
+ *   - the page filters to this account's own author ids before sending, so
+ *     other people's posts are never even transmitted;
+ *   - `upsertBackfill` never overwrites an existing row, so the thinner
+ *     timeline view cannot replace a record the publish path captured properly.
+ *
+ * Counters are deliberately separate from the live-capture ones: "received 40
+ * records" meaning 2 published and 38 swept back in is a materially different
+ * thing, and a shared counter could not tell them apart.
+ */
+async function handleBackfill(payload) {
+  const records = isObject(payload) && Array.isArray(payload.records) ? payload.records : null;
+  if (records === null) {
+    await bumpLifetime({ rejected: 1 }, 'rejected a backfill payload with no records array');
+    return { ok: false, error: 'invalid payload' };
+  }
+
+  let db;
+  try {
+    db = await openDB();
+  } catch (err) {
+    await bumpLifetime({ upsertFailed: 1 }, 'IndexedDB open failed: ' + describe(err));
+    return { ok: false, error: 'database unavailable' };
+  }
+
+  // Read the settings once for the whole batch rather than per record.
+  const settings = await getSettings();
+  const wantMedia = settings.mediaCache === true && settings.backfillMedia === true;
+
+  let inserted = 0;
+  let skipped = 0;
+  let rejected = 0;
+  let mediaQueued = 0;
+  let mediaDropped = 0;
+
+  const limit = Math.min(records.length, MAX_BACKFILL_BATCH);
+  for (let i = 0; i < limit; i++) {
+    const record = sanitizeRecord(records[i]);
+    if (record === null) {
+      rejected++;
+      continue;
+    }
+    try {
+      const result = await upsertBackfill(db, record);
+      if (result.existed) {
+        skipped++;
+        // Already archived, so its media was queued when it was written. Do not
+        // queue it again.
+        continue;
+      }
+      inserted++;
+      if (wantMedia && record.media.length > 0) {
+        if (enqueueMedia(record, MEDIA_QUEUE_LIMIT_SWEEP)) mediaQueued++;
+        else mediaDropped++;
+      }
+    } catch (err) {
+      // One bad row must not cost the rest of the batch.
+      rejected++;
+      log('backfill row failed', describe(err));
+    }
+  }
+
+  // `rejected` is a lifetime counter, not only a return value: a sweep that
+  // stored nothing has to be visible in the diagnostics panel afterwards, long
+  // after the page that sent it is gone.
+  await bumpLifetime({ backfilled: inserted, backfillSkipped: skipped, rejected: rejected });
+  if (inserted > 0) await noteCaptureTime(new Date().toISOString());
+
+  // A dropped download must never be quiet: it looks identical to a post that
+  // simply had no media.
+  if (mediaDropped > 0) {
+    log('timeline sweep: ' + mediaDropped + ' media downloads were NOT queued (queue full)');
+  }
+  log('timeline sweep: ' + inserted + ' recovered, ' + skipped +
+      ' already archived, ' + rejected + ' rejected, ' +
+      mediaQueued + ' with media queued');
+
+  // Nothing stored, nothing already there, at least one row refused: the sweep
+  // accomplished nothing at all. Returning ok here was the one answer that could
+  // not be true — every row failed — and saying so is what turns a silent dead
+  // sweep into something the page can report and the panel can show.
+  if (inserted === 0 && skipped === 0 && rejected > 0) {
+    return {
+      ok: false, error: 'every row in the batch was rejected (' + rejected + ')',
+      inserted: inserted, skipped: skipped, rejected: rejected,
+      mediaQueued: mediaQueued, mediaDropped: mediaDropped
+    };
+  }
+
+  return {
+    ok: true, inserted: inserted, skipped: skipped, rejected: rejected,
+    mediaQueued: mediaQueued, mediaDropped: mediaDropped
+  };
+}
+
+/**
+ * Fetch the media files for posts that have a media address but no file.
+ *
+ * Two ways an archive ends up in that state: it was written before media
+ * caching was switched on, or the media belonged to a post recovered by a
+ * profile sweep — a sweep deliberately does not re-queue rows that are already
+ * archived, so those never got a second chance.
+ *
+ * No new download code is needed. `cacheMediaForTweet` looks up each file by
+ * `tweetId:mediaId` and skips anything already stored, so re-queuing every post
+ * that has media downloads exactly the missing ones and touches nothing else.
+ *
+ * What this cannot do is recover media X no longer serves — a deleted post's
+ * pictures are gone from the origin, and the request will simply fail.
+ */
+async function handleFillMedia() {
+  const settings = await getSettings();
+  if (settings.mediaCache !== true) {
+    return { ok: false, error: 'media caching is off' };
+  }
+  if (!(await hasMediaPermission())) {
+    return { ok: false, error: 'media host permission not granted' };
+  }
+
+  let db;
+  try {
+    db = await openDB();
+  } catch (err) {
+    await bumpLifetime({ upsertFailed: 1 }, 'IndexedDB open failed: ' + describe(err));
+    return { ok: false, error: 'database unavailable' };
+  }
+
+  let withMedia = 0;
+  let queued = 0;
+  let overflow = 0;
+
+  try {
+    await forEachTweet(db, (record) => {
+      if (!record || !Array.isArray(record.media) || record.media.length === 0) return;
+      withMedia++;
+      if (enqueueMedia(record, MEDIA_QUEUE_LIMIT_FILL)) queued++;
+      else overflow++;
+    });
+  } catch (err) {
+    log('gap fill scan failed', describe(err));
+    return { ok: false, error: 'scan failed' };
+  }
+
+  // Saying how many were left out is the whole point: a silent cap here would
+  // look exactly like "everything is cached now".
+  if (overflow > 0) {
+    log('gap fill: ' + overflow + ' posts did not fit the queue and were NOT queued');
+  }
+  log('gap fill: ' + queued + ' posts queued out of ' + withMedia + ' with media');
+  return { ok: true, withMedia: withMedia, queued: queued, overflow: overflow };
 }
 
 /**
@@ -609,6 +1096,16 @@ async function handleMessage(message, sender) {
       if (!isTrustedPageSender(sender)) return { ok: false, error: 'untrusted sender' };
       await bumpLifetime({ received: 1 });
       return handleCapture(message.payload);
+    }
+
+    case 'XTB_FILL_MEDIA': {
+      if (!isExtensionPageSender(sender)) return { ok: false, error: 'untrusted sender' };
+      return handleFillMedia();
+    }
+
+    case 'X_TWEET_BACKFILL': {
+      if (!isTrustedPageSender(sender)) return { ok: false, error: 'untrusted sender' };
+      return handleBackfill(message.payload);
     }
 
     case 'X_TWEET_DELETE': {
@@ -765,6 +1262,11 @@ async function initialize() {
   } catch (err) {
     log('initialize failed', err);
   }
+  // Deliberately outside the block above: a failed open must not also skip the
+  // restore, which is the only thing that can bring back the work a previous
+  // worker life left behind. It opens the database itself and leaves the
+  // stored list untouched when it cannot.
+  await restoreMediaQueue();
 }
 
 chrome.runtime.onInstalled.addListener(() => {

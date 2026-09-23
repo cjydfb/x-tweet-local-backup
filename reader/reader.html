@@ -1,0 +1,1009 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>X Tweet Local Backup — 归档阅读器</title>
+<style>
+  :root {
+    --bg: #ffffff; --bg-soft: #f5f7f9; --bg-raised: #ffffff;
+    --border: #e3e7ec; --text: #14181f; --text-soft: #5b6572; --text-faint: #8b95a3;
+    --accent: #1d7fe0; --danger: #d13b3b; --ok: #1f9254; --warn: #b3761a;
+    --radius: 10px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14171c; --bg-soft: #1b1f26; --bg-raised: #1e232b;
+      --border: #2c333d; --text: #e8ecf1; --text-soft: #a4aebc; --text-faint: #79838f;
+      --accent: #4a9ef0; --danger: #e06666; --ok: #4cc38a; --warn: #d8a44a;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 14px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+          "Microsoft YaHei", Roboto, Helvetica, Arial, sans-serif;
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+
+  /* ------------------------------------------------------------- header -- */
+  header {
+    padding: 12px 18px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    background: var(--bg-soft);
+  }
+  header h1 { margin: 0; font-size: 15px; font-weight: 650; letter-spacing: .2px; }
+  .grow { flex: 1; }
+  button, .filelabel {
+    border: 1px solid var(--border); background: var(--bg-raised); color: var(--text);
+    border-radius: var(--radius); padding: 6px 12px; font: inherit; font-size: 13px;
+    cursor: pointer; white-space: nowrap;
+  }
+  button:hover:not(:disabled), .filelabel:hover { border-color: var(--accent); }
+  button:disabled { opacity: .5; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  input[type=file] { display: none; }
+
+  /* -------------------------------------------------------------- stats -- */
+  .stats {
+    display: flex; gap: 18px; flex-wrap: wrap; align-items: baseline;
+    padding: 8px 18px; border-bottom: 1px solid var(--border);
+    font-size: 12px; color: var(--text-soft);
+  }
+  .stats b { color: var(--text); font-weight: 650; font-variant-numeric: tabular-nums; }
+  .stats .bad b { color: var(--danger); }
+  .stats .ok b { color: var(--ok); }
+
+  /* ------------------------------------------------------------- notice -- */
+  #notice { padding: 0 18px; font-size: 12.5px; }
+  #notice:empty { display: none; }
+  #notice .box {
+    margin: 10px 0; padding: 10px 12px; border-radius: var(--radius);
+    border: 1px solid var(--border); background: var(--bg-soft);
+  }
+  #notice .box.error { border-color: var(--danger); color: var(--danger); }
+  #notice .box.warn { border-color: var(--warn); }
+  #notice .box.ok { border-color: var(--ok); }
+  #notice ul { margin: 6px 0 0; padding-left: 20px; }
+
+  /* -------------------------------------------------------------- drop --- */
+  #drop {
+    flex: 1; display: flex; align-items: center; justify-content: center;
+    text-align: center; color: var(--text-faint); padding: 40px; cursor: pointer;
+  }
+  #drop.over { background: var(--bg-soft); color: var(--accent); }
+  #drop .big { font-size: 16px; color: var(--text); margin-bottom: 8px; }
+  #drop code { background: var(--bg-soft); padding: 2px 6px; border-radius: 5px; font-size: 12px; }
+
+  /* -------------------------------------------------------------- list --- */
+  #view { flex: 1; display: none; min-height: 0; }
+  #view.on { display: flex; }
+  #scroller { flex: 1; overflow-y: auto; overflow-x: hidden; position: relative; }
+  #spacer { position: relative; width: 100%; }
+  #win { position: absolute; left: 0; right: 0; top: 0; }
+
+  .row {
+    position: absolute; left: 0; right: 0; height: 76px; overflow: hidden;
+    padding: 9px 18px; border-bottom: 1px solid var(--border); cursor: pointer;
+    display: flex; flex-direction: column; justify-content: center; gap: 3px;
+  }
+  .row:hover { background: var(--bg-soft); }
+  .row.sel { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+  .row__top { display: flex; align-items: baseline; gap: 8px; font-size: 11.5px; color: var(--text-faint); }
+  .row__time { font-variant-numeric: tabular-nums; }
+  .row__text {
+    font-size: 13.5px; line-height: 1.45; overflow: hidden;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+    word-break: break-word; overflow-wrap: anywhere;
+    min-height: 1.45em;
+  }
+  .row__text.loading { color: var(--text-faint); font-style: italic; }
+  .row__text.dropped { color: var(--danger); font-style: italic; }
+  .badges { display: flex; gap: 4px; flex-wrap: wrap; }
+  .badge {
+    font-size: 10px; padding: 0 6px; border-radius: 20px;
+    border: 1px solid var(--border); color: var(--text-soft); background: var(--bg-raised);
+  }
+  .badge.reply { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); }
+  .badge.quote { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, var(--border)); }
+  .badge.poll  { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); }
+  .badge.edit  { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, var(--border)); }
+  .badge.dead  { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, var(--border)); }
+  .badge.media { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, var(--border)); }
+
+  /* ------------------------------------------------------------ detail --- */
+  #detail {
+    width: 420px; border-left: 1px solid var(--border); background: var(--bg-soft);
+    overflow-y: auto; padding: 14px 16px; display: none; font-size: 13px;
+  }
+  #detail.on { display: block; }
+  #detail h2 { margin: 0 0 8px; font-size: 13px; color: var(--text-faint); font-weight: 600; }
+  #detail .body { white-space: pre-wrap; word-break: break-word; overflow-wrap: anywhere; margin: 0 0 12px; }
+  #detail dl { display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; margin: 0 0 12px; font-size: 12px; }
+  #detail dt { color: var(--text-faint); white-space: nowrap; }
+  #detail dd { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
+  #detail a { color: var(--accent); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>归档阅读器</h1>
+  <span class="grow"></span>
+  <label class="filelabel" for="pick">打开归档 / JSON</label>
+  <input type="file" id="pick" accept=".zip,.json,application/zip,application/json">
+  <button id="btnVerify" disabled>完整性检查</button>
+</header>
+
+<div class="stats" id="stats" hidden></div>
+<div id="notice"></div>
+
+<div id="drop">
+  <div>
+    <div class="big">把归档文件拖到这里</div>
+    <div>支持扩展导出的 <code>.zip</code> 归档，或直接导出的小 <code>.json</code></div>
+    <div style="margin-top:6px">文件不会被上传——所有处理都在这个页面里完成</div>
+  </div>
+</div>
+
+<div id="view">
+  <div id="scroller"><div id="spacer"><div id="win"></div></div></div>
+  <aside id="detail"></aside>
+</div>
+
+<script>
+/* ===========================================================================
+ * CORE BEGIN
+ *
+ * Everything between these markers is pure logic: no DOM, no globals, no I/O
+ * beyond the Blob handed in. tools/test-reader.mjs extracts this block and runs
+ * it under Node, so the scanning and parsing below is actually covered by tests
+ * rather than only exercised by clicking around.
+ *
+ * The one rule that matters here: NEVER lose a record. A record that cannot be
+ * read must surface as an error, never as a silent gap. Every place where that
+ * could happen reports through the `problems` array instead of throwing away
+ * data or throwing out of the scan.
+ * ======================================================================== */
+
+var BYTE = {
+  QUOTE: 0x22, BACKSLASH: 0x5C,
+  LBRACE: 0x7B, RBRACE: 0x7D, LBRACKET: 0x5B, RBRACKET: 0x5D,
+  COMMA: 0x2C, COLON: 0x3A
+};
+
+/** Byte length of a UTF-8 sequence, from its lead byte. */
+function utf8Length(lead) {
+  if (lead < 0x80) return 1;
+  if ((lead & 0xE0) === 0xC0) return 2;
+  if ((lead & 0xF0) === 0xE0) return 3;
+  if ((lead & 0xF8) === 0xF0) return 4;
+  return 1; /* invalid lead byte; treat as one so the scan can continue */
+}
+
+/**
+ * Locate the top-level "tweets" array inside the export envelope.
+ *
+ * The key is found by byte search rather than by parsing the whole envelope:
+ * inside a JSON string a quote is always escaped, so the byte sequence
+ * `"tweets"` cannot occur inside tweet text — it can only be the envelope key.
+ * That makes the search exact, and it costs one pass with no allocation.
+ *
+ * Returns the offset just past the opening bracket, or -1.
+ */
+function findTweetsArray(bytes, from, to) {
+  const needle = [0x22, 0x74, 0x77, 0x65, 0x65, 0x74, 0x73, 0x22]; /* "tweets" */
+  const limit = to - needle.length;
+  outer:
+  for (let i = from; i < limit; i++) {
+    if (bytes[i] !== BYTE.QUOTE) continue;
+    for (let k = 1; k < needle.length; k++) {
+      if (bytes[i + k] !== needle[k]) continue outer;
+    }
+    /* followed by optional whitespace, ':' , whitespace, '[' */
+    let j = i + needle.length;
+    while (j < to && (bytes[j] === 0x20 || bytes[j] === 0x09 || bytes[j] === 0x0A || bytes[j] === 0x0D)) j++;
+    if (bytes[j] !== BYTE.COLON) continue;
+    j++;
+    while (j < to && (bytes[j] === 0x20 || bytes[j] === 0x09 || bytes[j] === 0x0A || bytes[j] === 0x0D)) j++;
+    if (bytes[j] !== BYTE.LBRACKET) continue;
+    return j + 1;
+  }
+  return -1;
+}
+
+/**
+ * Scan the JSON array beginning at `start` and record the byte range of every
+ * element.
+ *
+ * This walks raw bytes, not decoded text. Every structural character in JSON is
+ * ASCII, and in UTF-8 an ASCII byte can never appear inside a multi-byte
+ * sequence — so byte-level brace matching is exact, needs no decoding, and
+ * gives byte offsets for free (which is what Blob.slice needs later).
+ *
+ * The scanner is resumable: call with a chunk, keep the returned state, feed
+ * the next chunk. `elementStart` is an absolute file offset so a record split
+ * across two chunks is still bounded correctly.
+ */
+function createArrayScanner(start) {
+  return {
+    pos: start,          /* absolute offset of the next byte to read */
+    depth: 0,            /* nesting depth inside the array; 0 = between elements */
+    inString: false,
+    escaped: false,
+    elementStart: -1,
+    primitiveStart: -1,  /* an element that is not an object or array */
+    elements: [],
+    closed: false,       /* saw the array's closing bracket */
+    endOffset: -1,       /* offset just past that bracket */
+    problems: []
+  };
+}
+
+function scanChunk(state, bytes, base) {
+  for (let i = 0; i < bytes.length; i++) {
+    const b = bytes[i];
+    const abs = base + i;
+
+    if (state.inString) {
+      if (state.escaped) state.escaped = false;
+      else if (b === BYTE.BACKSLASH) state.escaped = true;
+      else if (b === BYTE.QUOTE) state.inString = false;
+      continue;
+    }
+
+    if (b === BYTE.QUOTE) {
+      /* A string at depth 0 is an element that is not an object (unexpected,
+         but it must not be dropped). */
+      if (state.depth === 0 && state.elementStart < 0 && state.primitiveStart < 0) state.primitiveStart = abs;
+      state.inString = true;
+      continue;
+    }
+
+    if (b === BYTE.LBRACE || b === BYTE.LBRACKET) {
+      if (state.depth === 0 && state.elementStart < 0) {
+        if (state.primitiveStart >= 0) {
+          state.problems.push({ at: state.primitiveStart, kind: 'mixed-element', detail: '元素开头既像基础值又像对象' });
+          state.primitiveStart = -1;
+        }
+        state.elementStart = abs;
+      }
+      state.depth++;
+      continue;
+    }
+
+    if (b === BYTE.RBRACE || b === BYTE.RBRACKET) {
+      if (b === BYTE.RBRACKET && state.depth === 0) {
+        /* the array itself closes here */
+        if (state.primitiveStart >= 0) {
+          state.elements.push({ start: state.primitiveStart, end: abs });
+          state.primitiveStart = -1;
+        }
+        state.closed = true;
+        state.endOffset = abs + 1;
+        state.pos = abs + 1;
+        return state;
+      }
+      state.depth--;
+      if (state.depth === 0 && state.elementStart >= 0) {
+        state.elements.push({ start: state.elementStart, end: abs + 1 });
+        state.elementStart = -1;
+      }
+      if (state.depth < 0) {
+        state.problems.push({ at: abs, kind: 'depth-underflow', detail: '括号不配对，扫描已停止' });
+        state.pos = abs + 1;
+        return state;
+      }
+      continue;
+    }
+
+    if (state.depth === 0) {
+      if (b === BYTE.COMMA) {
+        if (state.primitiveStart >= 0) {
+          state.elements.push({ start: state.primitiveStart, end: abs });
+          state.primitiveStart = -1;
+        }
+        continue;
+      }
+      /* whitespace, or the start of a number / true / false / null */
+      if (b !== 0x20 && b !== 0x09 && b !== 0x0A && b !== 0x0D && state.primitiveStart < 0) {
+        state.primitiveStart = abs;
+      }
+    }
+  }
+
+  state.pos = base + bytes.length;
+  if (state.depth === 0 && state.elementStart < 0 && state.primitiveStart < 0) {
+    /* clean boundary between elements: nothing to carry */
+  }
+  return state;
+}
+
+/**
+ * Only an http/https URL may reach an href.
+ *
+ * The reader opens archives from anywhere — a file edited by hand, one produced
+ * by another build, one carried between machines — so a stored tweetUrl is
+ * untrusted input here even though the extension's own writer sanitises what it
+ * stores. HTML-escaping is not enough: `javascript:alert(1)` needs no
+ * metacharacters at all, and escaping only stops it breaking out of the
+ * attribute, not from being a URL at all.
+ */
+function safeExternalUrl(value) {
+  try {
+    var parsed = new URL(String(value));
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return null;
+    return parsed.href;
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * Read a byte range out of a Blob and parse it as a JSON object.
+ *
+ * Failures are returned, never thrown: one unreadable record must degrade to a
+ * visible error on that row, not abort the whole archive.
+ */
+async function readRecordAt(blob, range) {
+  try {
+    const text = await blob.slice(range.start, range.end).text();
+    return { ok: true, value: JSON.parse(text) };
+  } catch (err) {
+    return { ok: false, error: err && err.message ? err.message : String(err) };
+  }
+}
+
+/**
+ * Walk a Blob in fixed-size chunks, calling `onChunk(bytes, absoluteOffset)`.
+ * Reads sequentially so that a multi-gigabyte file never exists in memory as a
+ * whole — only one chunk at a time.
+ */
+async function eachChunk(blob, chunkSize, onChunk, shouldStop) {
+  let offset = 0;
+  while (offset < blob.size) {
+    if (shouldStop && shouldStop()) return;
+    const end = Math.min(offset + chunkSize, blob.size);
+    const buf = await blob.slice(offset, end).arrayBuffer();
+    onChunk(new Uint8Array(buf), offset);
+    offset = end;
+    /* Yield to the event loop between chunks so a large scan does not freeze
+       the page — and so the progress text actually repaints. */
+    await new Promise(function (r) { setTimeout(r, 0); });
+  }
+}
+
+/* --------------------------------------------------------------- ZIP ---- */
+
+var ZIP_METHOD = { STORE: 0, DEFLATE: 8 };
+
+function u16(view, at) { return view.getUint16(at, true); }
+function u32(view, at) { return view.getUint32(at, true); }
+
+/**
+ * Read a ZIP's central directory.
+ *
+ * The directory sits at the END of the file, which is what makes this cheap:
+ * only the last 64 KB are read to list every entry, regardless of how large the
+ * archive is. Entry data is not touched at all until something asks for it.
+ */
+function parseZipDirectory(tail, tailOffset, fileSize) {
+  const view = new DataView(tail.buffer, tail.byteOffset, tail.byteLength);
+
+  let eocd = -1;
+  for (let i = tail.length - 22; i >= 0; i--) {
+    if (u32(view, i) === 0x06054B50) { eocd = i; break; }
+  }
+  if (eocd < 0) return { ok: false, error: '找不到 ZIP 中央目录（文件可能损坏或被截断）' };
+
+  const entryCount = u16(view, eocd + 10);
+  const cdSize = u32(view, eocd + 12);
+  const cdOffset = u32(view, eocd + 16);
+
+  /* 0xFFFF / 0xFFFFFFFF are the ZIP64 escape values. */
+  if (entryCount === 0xFFFF || cdOffset === 0xFFFFFFFF || cdSize === 0xFFFFFFFF) {
+    return { ok: false, error: 'ZIP64 归档暂不支持（归档超过 4 GB 或条目超过 65535 个）', zip64: true };
+  }
+  if (cdOffset + cdSize > fileSize) {
+    return { ok: false, error: 'ZIP 中央目录指向文件之外，归档已被截断' };
+  }
+  if (cdOffset < tailOffset) {
+    return { ok: false, error: 'ZIP 中央目录不在已读取的尾部数据中' };
+  }
+
+  const cdStart = cdOffset - tailOffset;
+  const entries = [];
+  let p = cdStart;
+  for (let i = 0; i < entryCount; i++) {
+    if (p + 46 > tail.length) return { ok: false, error: 'ZIP 中央目录条目超出已读取范围' };
+    if (u32(view, p) !== 0x02014B50) return { ok: false, error: '中央目录条目签名错误' };
+    const method = u16(view, p + 10);
+    const crc = u32(view, p + 16);
+    const compSize = u32(view, p + 20);
+    const size = u32(view, p + 24);
+    const nameLen = u16(view, p + 28);
+    const extraLen = u16(view, p + 30);
+    const commentLen = u16(view, p + 32);
+    const localOffset = u32(view, p + 42);
+    const name = new TextDecoder().decode(tail.subarray(p + 46, p + 46 + nameLen));
+    entries.push({ name: name, method: method, crc: crc, compSize: compSize, size: size, localOffset: localOffset });
+    p += 46 + nameLen + extraLen + commentLen;
+  }
+  return { ok: true, entries: entries, centralDirectoryOffset: cdOffset };
+}
+
+/** Resolve a directory entry to the byte range of its data within the file. */
+async function locateEntryData(file, entry) {
+  const head = new Uint8Array(await file.slice(entry.localOffset, entry.localOffset + 30).arrayBuffer());
+  if (head.length < 30) throw new Error('本地文件头超出文件末尾');
+  const view = new DataView(head.buffer, head.byteOffset, head.byteLength);
+  if (u32(view, 0) !== 0x04034B50) throw new Error('本地文件头签名错误');
+  const nameLen = u16(view, 26);
+  const extraLen = u16(view, 28);
+  const start = entry.localOffset + 30 + nameLen + extraLen;
+  return { start: start, end: start + entry.compSize };
+}
+
+/**
+ * Exact CRC32 of a byte range, used to prove an entry was read intact.
+ * The same table is in tools/make-zip.mjs — this is the check that catches a
+ * truncated or corrupted archive instead of quietly archiving half of it.
+ */
+var CRC_TABLE = (function () {
+  var table = new Int32Array(256);
+  for (var n = 0; n < 256; n++) {
+    var c = n;
+    for (var k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    table[n] = c;
+  }
+  return table;
+})();
+
+function crc32(bytes) {
+  var c = -1;
+  for (var i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ -1) >>> 0;
+}
+
+/* CORE END
+ * ======================================================================== */
+
+
+/* ===========================================================================
+ * UI
+ *
+ * Everything below may touch the DOM. It only ever calls into the block above,
+ * which is what keeps the tested part tested.
+ * ======================================================================== */
+
+var ROW_H = 76;
+var CACHE_LIMIT = 4000;     /* parsed records kept in memory; oldest evicted */
+var SCAN_CHUNK = 4 * 1024 * 1024;
+
+var state = {
+  file: null,          /* the Blob we sliced records out of */
+  source: null,        /* the tweets.json Blob inside it */
+  envelope: {},
+  ranges: [],          /* {start,end} per record, in file order */
+  index: [],           /* light per-record index: no body text */
+  cache: new Map(),    /* recordIndex -> parsed record (insertion order = LRU) */
+  pending: new Set(),
+  selected: -1,
+  scanning: false
+};
+
+var el = {
+  pick: document.getElementById('pick'),
+  drop: document.getElementById('drop'),
+  view: document.getElementById('view'),
+  stats: document.getElementById('stats'),
+  notice: document.getElementById('notice'),
+  scroller: document.getElementById('scroller'),
+  spacer: document.getElementById('spacer'),
+  win: document.getElementById('win'),
+  detail: document.getElementById('detail'),
+  verify: document.getElementById('btnVerify')
+};
+
+function say(html, kind) {
+  el.notice.innerHTML = html ? '<div class="box ' + (kind || '') + '">' + html + '</div>' : '';
+}
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+  });
+}
+function fmtBytes(n) {
+  if (n < 1024) return n + ' B';
+  if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+  if (n < 1073741824) return (n / 1048576).toFixed(1) + ' MB';
+  return (n / 1073741824).toFixed(2) + ' GB';
+}
+function fmtTime(iso) {
+  if (!iso) return '—';
+  var d = new Date(iso);
+  if (isNaN(d.getTime())) return iso;
+  var p = function (n) { return String(n).padStart(2, '0'); };
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) +
+         ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+}
+
+/* ------------------------------------------------------------ loading --- */
+
+async function openFile(file) {
+  state.file = file;
+  state.source = null;
+  state.envelope = {};
+  state.ranges = [];
+  state.index = [];
+  state.cache.clear();
+  state.pending.clear();
+  state.selected = -1;
+  el.detail.classList.remove('on');
+  el.view.classList.remove('on');
+  el.drop.style.display = 'none';
+  el.stats.hidden = true;
+  say('正在读取 <b>' + esc(file.name) + '</b>（' + fmtBytes(file.size) + '）…');
+
+  try {
+    var head = new Uint8Array(await file.slice(0, 4).arrayBuffer());
+    var isZip = head.length === 4 && head[0] === 0x50 && head[1] === 0x4B;
+
+    if (isZip) {
+      await openZip(file);
+    } else {
+      state.source = file;
+      await buildIndex(file, '（直接读取的 JSON）');
+    }
+  } catch (err) {
+    say('打开失败：' + esc(err && err.message ? err.message : err), 'error');
+    el.drop.style.display = '';
+  }
+}
+
+async function openZip(file) {
+  var tailLen = Math.min(65536, file.size);
+  var tailOffset = file.size - tailLen;
+  var tail = new Uint8Array(await file.slice(tailOffset, file.size).arrayBuffer());
+
+  var dir = parseZipDirectory(tail, tailOffset, file.size);
+  if (!dir.ok) {
+    say('这个 ZIP 读不了：' + esc(dir.error), 'error');
+    if (dir.zip64) {
+      say('<div class="box warn"><b>这是 ZIP64 归档。</b>media 多、归档超过 4 GB 时会触发。' +
+          '目前还没实现 ZIP64 解析——这是已知缺口，不是文件损坏。<br>' +
+          '临时办法：直接打开配套的 <code>x-tweet-backup-日期.json</code>，推文数据是一样的。</div>', 'warn');
+    }
+    el.drop.style.display = '';
+    return;
+  }
+
+  var entry = null;
+  for (var i = 0; i < dir.entries.length; i++) {
+    if (dir.entries[i].name === 'tweets.json') { entry = dir.entries[i]; break; }
+  }
+  if (!entry) {
+    var names = dir.entries.slice(0, 20).map(function (e) { return e.name; }).join('、');
+    say('这个 ZIP 里没有 <code>tweets.json</code>。包内条目：' + esc(names), 'error');
+    el.drop.style.display = '';
+    return;
+  }
+
+  var range = await locateEntryData(file, entry);
+  var raw = file.slice(range.start, range.end);
+
+  if (entry.method === ZIP_METHOD.STORE) {
+    /* Stored uncompressed: the bytes in the ZIP ARE the JSON, so byte offsets
+       into this slice are stable and records can be re-read at will. */
+    state.source = raw;
+    await buildIndex(raw, 'ZIP 内 <code>tweets.json</code>（未压缩存储，可随机读取）');
+  } else if (entry.method === ZIP_METHOD.DEFLATE) {
+    say('<div class="box warn"><b>归档里的 tweets.json 是压缩存储的。</b><br>' +
+        '压缩流无法随机定位——要读第 5000 条就必须从头解压一遍。当前版本会把它整个解压进内存，' +
+        '推文多时会很吃内存。<br>正在解压…</div>', 'warn');
+    var inflated = await inflateRaw(raw);
+    /* CRC is the proof that what came out is exactly what went in. */
+    var actual = crc32(inflated);
+    if (actual !== entry.crc) {
+      say('<div class="box error"><b>解压校验失败：CRC 不匹配。</b><br>' +
+          '期望 ' + entry.crc.toString(16) + '，实际 ' + actual.toString(16) +
+          '。归档可能已损坏——<b>不要</b>基于这份数据做合并，先换一份文件。</div>', 'error');
+      el.drop.style.display = '';
+      return;
+    }
+    state.source = new Blob([inflated]);
+    await buildIndex(state.source, 'ZIP 内 <code>tweets.json</code>（已解压，CRC 校验通过）');
+  } else {
+    say('归档里的 tweets.json 用了不支持的压缩方式（method=' + entry.method + '）', 'error');
+    el.drop.style.display = '';
+  }
+}
+
+/** Inflate a whole deflate-raw stream. Used only when the entry is compressed. */
+async function inflateRaw(blob) {
+  var stream = blob.stream().pipeThrough(new DecompressionStream('deflate-raw'));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+/* ------------------------------------------------------------- scanning -- */
+
+async function buildIndex(source, sourceLabel) {
+  var started = performance.now();
+  var scanner = createArrayScanner(0);
+  var arrayStart = -1;
+  _headText = null; /* the envelope probe is per-file; never reuse the last one */
+  var headerProbe = new Uint8Array(await source.slice(0, Math.min(4096, source.size)).arrayBuffer());
+
+  arrayStart = findTweetsArray(headerProbe, 0, headerProbe.length);
+  if (arrayStart < 0) {
+    /* The key may sit past the first 4 KB (a large envelope, say). Widen the
+       probe — and keep the wider buffer, because the envelope fields are read
+       out of it afterwards. */
+    headerProbe = new Uint8Array(await source.slice(0, Math.min(262144, source.size)).arrayBuffer());
+    arrayStart = findTweetsArray(headerProbe, 0, headerProbe.length);
+  }
+  if (arrayStart < 0) {
+    say('这个文件里找不到顶层的 <code>"tweets"</code> 数组——它可能不是本扩展导出的 JSON。', 'error');
+    el.drop.style.display = '';
+    return;
+  }
+
+  scanner.pos = arrayStart;
+
+  say('正在建立索引（只读一遍，不加载正文）…');
+  await eachChunk(
+    source,
+    SCAN_CHUNK,
+    function (bytes, offset) {
+      if (scanner.closed) return;
+      /* Only the part that overlaps the array matters. */
+      var from = Math.max(0, arrayStart - offset);
+      if (from >= bytes.length) return;
+      scanChunk(scanner, bytes.subarray(from), offset + from);
+    },
+    function () { return scanner.closed; }
+  );
+
+  var elapsed = performance.now() - started;
+
+  /* ---------------------------------------------------------------- */
+  /* Integrity: the whole point. Every check below either passes or is  */
+  /* reported. Nothing is silently dropped.                             */
+  /* ---------------------------------------------------------------- */
+  var sourceLabel2 = sourceLabel;
+  var problems = scanner.problems.slice();
+  var expectedCount = readEnvelopeNumber(source, headerProbe, 'count');
+
+  if (!scanner.closed) {
+    problems.push({
+      at: scanner.pos, kind: 'array-not-closed',
+      detail: '扫到文件末尾也没等到 tweets 数组的收尾括号——文件可能被截断，最后一条记录可能不完整'
+    });
+  }
+  if (expectedCount !== null && expectedCount !== scanner.elements.length) {
+    problems.push({
+      at: -1, kind: 'count-mismatch',
+      detail: '信封里写着 count=' + expectedCount + '，实际扫到 ' + scanner.elements.length +
+              ' 条。差额 ' + Math.abs(expectedCount - scanner.elements.length) + ' 条——这是数据丢失，必须查清'
+    });
+  }
+
+  state.ranges = scanner.elements;
+  state.envelope = {
+    count: expectedCount,
+    schemaVersion: readEnvelopeNumber(source, headerProbe, 'schemaVersion'),
+    generatorVersion: readEnvelopeString(source, headerProbe, 'generatorVersion'),
+    exportedAt: readEnvelopeString(source, headerProbe, 'exportedAt')
+  };
+
+  renderStats(sourceLabel2, elapsed, problems);
+  el.view.classList.add('on');
+  el.verify.disabled = false;
+  layoutRows();
+  renderWindow();
+}
+
+/**
+ * Read a scalar out of the envelope without parsing the whole document.
+ * The head is decoded once and matched; numbers and short strings only, so a
+ * few KB is always enough.
+ */
+function readEnvelopeNumber(source, head, key) {
+  var m = decodeHead(head).match(new RegExp('"' + key + '"\\s*:\\s*(-?\\d+)'));
+  return m ? Number(m[1]) : null;
+}
+function readEnvelopeString(source, head, key) {
+  var m = decodeHead(head).match(new RegExp('"' + key + '"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"'));
+  return m ? m[1] : null;
+}
+var _headText = null;
+function decodeHead(head) {
+  if (_headText === null) _headText = new TextDecoder().decode(head);
+  return _headText;
+}
+
+/* -------------------------------------------------------------- render --- */
+
+function renderStats(sourceLabel, elapsed, problems) {
+  var n = state.ranges.length;
+  var problemsHtml = '';
+  if (problems.length) {
+    problemsHtml = '<li>' + problems.map(function (p) {
+      return '<b>' + esc(p.kind) + '</b>：' + esc(p.detail) + (p.at >= 0 ? '（偏移 ' + p.at + '）' : '');
+    }).join('</li><li>') + '</li>';
+  }
+
+  var env = state.envelope;
+  var mismatch = env.count !== null && env.count !== n;
+
+  el.stats.hidden = false;
+  el.stats.innerHTML =
+    '<span>来源：' + sourceLabel + '</span>' +
+    '<span>记录：<b>' + n + '</b></span>' +
+    '<span>文件：<b>' + fmtBytes(state.file.size) + '</b></span>' +
+    '<span>建索引：<b>' + elapsed.toFixed(0) + ' ms</b></span>' +
+    '<span>信封 count：<b>' + (env.count === null ? '未读到' : env.count) + '</b></span>' +
+    '<span>schema：<b>' + (env.schemaVersion === null ? '?' : env.schemaVersion) + '</b></span>' +
+    '<span>导出：<b>' + esc(env.exportedAt || '?') + '</b></span>' +
+    '<span>生成版本：<b>' + esc(env.generatorVersion || '?') + '</b></span>' +
+    '<span class="' + (mismatch ? 'bad' : 'ok') + '">索引内存：<b>' +
+      fmtBytes(estimateIndexBytes()) + '</b></span>';
+
+  if (problems.length) {
+    say('<div class="box error"><b>完整性检查发现问题（' + problems.length + '）：</b><ul>' +
+        problemsHtml + '</ul>扫描是只读的，没有修改任何文件。请把上面的信息发出来。</div>', 'error');
+  } else {
+    say('<div class="box ok">索引建立完成：<b>' + n + ' 条</b>记录全部定位，与信封计数一致，' +
+        '没有发现截断或漏读。正文没有载入内存——滚动到哪一条才读哪一条。</div>', 'ok');
+  }
+}
+
+/**
+ * Live size of what is actually held in memory: the offset index, plus whatever
+ * record bodies the cache is currently holding.
+ *
+ * The index term is the point of this design. It is the only part that grows
+ * with the archive, and it grows at roughly 90 bytes per record instead of the
+ * ~2 KB a parsed record costs — which is what keeps a hundred-thousand-tweet
+ * archive from turning into a gigabyte of heap.
+ */
+function estimateIndexBytes() {
+  return state.ranges.length * 96 + state.cache.size * 900;
+}
+
+/* -------------------------------------------------- virtual scrolling --- */
+
+function layoutRows() {
+  el.spacer.style.height = (state.ranges.length * ROW_H) + 'px';
+}
+
+function renderWindow() {
+  var top = el.scroller.scrollTop;
+  var height = el.scroller.clientHeight;
+  var first = Math.max(0, Math.floor(top / ROW_H) - 4);
+  var last = Math.min(state.ranges.length, Math.ceil((top + height) / ROW_H) + 4);
+
+  el.win.style.transform = 'translateY(' + (first * ROW_H) + 'px)';
+
+  var html = '';
+  for (var i = first; i < last; i++) {
+    html += '<div class="row" data-i="' + i + '" style="top:' + ((i - first) * ROW_H) + 'px">' +
+              rowInner(i) + '</div>';
+  }
+  el.win.innerHTML = html;
+
+  for (var j = first; j < last; j++) ensureRecord(j);
+}
+
+function rowInner(i) {
+  var rec = state.cache.get(i);
+  if (!rec) {
+    return '<div class="row__top"><span class="row__time">#' + (i + 1) + '</span></div>' +
+           '<div class="row__text loading">读取中…</div>';
+  }
+  if (rec.error) {
+    return '<div class="row__top"><span class="row__time">#' + (i + 1) + '</span></div>' +
+           '<div class="row__text dropped">这一条读不出来：' + esc(rec.error) + '</div>';
+  }
+  var r = rec.data;
+  var badges = '';
+  if (r.isReply) badges += '<span class="badge reply">回复</span>';
+  if (r.quoteTweetId) badges += '<span class="badge quote">引用</span>';
+  if (r.isPoll) badges += '<span class="badge poll">投票</span>';
+  if (r.isEdit) badges += '<span class="badge edit">编辑过</span>';
+  if (r.deletedAt) badges += '<span class="badge dead">已删除</span>';
+  if (r.media && r.media.length) badges += '<span class="badge media">媒体 ' + r.media.length + '</span>';
+
+  return '<div class="row__top">' +
+           '<span class="row__time">' + esc(fmtTime(r.createdAt)) + '</span>' +
+           '<span class="badges">' + badges + '</span>' +
+         '</div>' +
+         '<div class="row__text">' + esc(r.text || '（无正文）') + '</div>';
+}
+
+/**
+ * Load one record's bytes and parse them, if not already cached.
+ *
+ * This is the only place a record body enters memory. Reading a record does not
+ * touch any other record, so the cost of scrolling is bounded by what is on
+ * screen — which is the whole reason the index stores offsets instead of text.
+ */
+function ensureRecord(i) {
+  if (state.cache.has(i) || state.pending.has(i)) {
+    if (state.cache.has(i)) touch(i);
+    return;
+  }
+  if (i < 0 || i >= state.ranges.length) return;
+  state.pending.add(i);
+  var range = state.ranges[i];
+
+  readRecordAt(state.source, range).then(function (res) {
+    state.pending.delete(i);
+    state.cache.set(i, res.ok ? { data: res.value } : { error: res.error });
+    evictIfNeeded();
+    updateRow(i);
+  });
+}
+
+function touch(i) {
+  var v = state.cache.get(i);
+  state.cache.delete(i);
+  state.cache.set(i, v);
+}
+
+/**
+ * Drop the least recently used records once the cache is over its limit.
+ *
+ * Rows currently rendered in the window are skipped: evicting one would blank
+ * a row that is on screen right now, and it would immediately be re-read — a
+ * thrash loop. There are only ever a few dozen of them, so skipping costs
+ * nothing.
+ */
+function evictIfNeeded() {
+  if (state.cache.size <= CACHE_LIMIT) return;
+  var visible = new Set();
+  var nodes = el.win.querySelectorAll('.row');
+  for (var n = 0; n < nodes.length; n++) visible.add(Number(nodes[n].getAttribute('data-i')));
+
+  var it = state.cache.keys();
+  var next;
+  while (state.cache.size > CACHE_LIMIT) {
+    next = it.next();
+    if (next.done) break;
+    if (visible.has(next.value)) continue;
+    state.cache.delete(next.value);
+  }
+}
+
+function updateRow(i) {
+  var node = el.win.querySelector('.row[data-i="' + i + '"]');
+  if (!node) return;
+  node.innerHTML = rowInner(i);
+  if (state.selected === i) node.classList.add('sel');
+}
+
+el.scroller.addEventListener('scroll', function () {
+  window.requestAnimationFrame(renderWindow);
+}, { passive: true });
+
+el.win.addEventListener('click', function (ev) {
+  var row = ev.target.closest('.row');
+  if (!row) return;
+  var i = Number(row.getAttribute('data-i'));
+  state.selected = i;
+  var prev = el.win.querySelector('.row.sel');
+  if (prev) prev.classList.remove('sel');
+  row.classList.add('sel');
+  showDetail(i);
+});
+
+window.addEventListener('resize', function () {
+  if (el.view.classList.contains('on')) renderWindow();
+});
+
+/* -------------------------------------------------------------- detail --- */
+
+function showDetail(i) {
+  var rec = state.cache.get(i);
+  el.detail.classList.add('on');
+  if (!rec) {
+    el.detail.innerHTML = '<h2>第 ' + (i + 1) + ' 条</h2><p>读取中…</p>';
+    ensureRecord(i);
+    return;
+  }
+  if (rec.error) {
+    el.detail.innerHTML = '<h2>第 ' + (i + 1) + ' 条</h2>' +
+      '<p class="body">这一条读不出来：' + esc(rec.error) + '</p>' +
+      '<dl><dt>字节范围</dt><dd>' + state.ranges[i].start + ' – ' + state.ranges[i].end + '</dd></dl>';
+    return;
+  }
+  var r = rec.data;
+  var rows = [
+    ['ID', r.id], ['发布时间', fmtTime(r.createdAt)], ['捕获时间', fmtTime(r.capturedAt)],
+    ['作者', (r.author && (r.author.name || r.author.screenName)) || '?'],
+    ['语言', r.lang], ['会话', r.conversationId],
+    ['回复给', r.replyTo && (r.replyTo.screenName || r.replyTo.id)],
+    ['引用', r.quoteTweetId], ['编辑自', r.editedFrom],
+    ['字节范围', state.ranges[i].start + ' – ' + state.ranges[i].end]
+  ];
+  var html = '<h2>第 ' + (i + 1) + ' 条</h2>' +
+    '<p class="body">' + esc(r.text || '（无正文）') + '</p><dl>';
+  for (var k = 0; k < rows.length; k++) {
+    if (rows[k][1] === undefined || rows[k][1] === null || rows[k][1] === '') continue;
+    html += '<dt>' + esc(rows[k][0]) + '</dt><dd>' + esc(rows[k][1]) + '</dd>';
+  }
+  html += '</dl>';
+  /* A stored URL is not trusted just because it is stored: only http/https is
+     allowed into an href, and anything else is simply not shown as a link. */
+  var tweetUrl = safeExternalUrl(r.tweetUrl);
+  if (tweetUrl) {
+    html += '<p><a href="' + esc(tweetUrl) + '" target="_blank" rel="noopener">在 X 上打开</a></p>';
+  } else if (r.tweetUrl) {
+    html += '<p>推文链接不可用（不是 http/https 地址）：' + esc(r.tweetUrl) + '</p>';
+  }
+  el.detail.innerHTML = html;
+}
+
+/* --------------------------------------------------------------- verify -- */
+
+/**
+ * Re-read every record and check that it parses.
+ *
+ * This is the expensive path by design: it touches every byte, which is exactly
+ * what the index deliberately avoids. It exists so "no data was lost" can be
+ * demonstrated on demand instead of assumed.
+ */
+el.verify.addEventListener('click', async function () {
+  if (state.scanning) return;
+  state.scanning = true;
+  el.verify.disabled = true;
+  var bad = [];
+  var t0 = performance.now();
+
+  for (var i = 0; i < state.ranges.length; i++) {
+    if (i % 200 === 0) {
+      say('正在逐条复读：' + i + ' / ' + state.ranges.length + ' …');
+      await new Promise(function (r) { setTimeout(r, 0); });
+    }
+    var res = await readRecordAt(state.source, state.ranges[i]);
+    if (!res.ok) bad.push({ i: i, error: res.error });
+  }
+
+  var dt = performance.now() - t0;
+  if (bad.length === 0) {
+    say('<div class="box ok"><b>完整性检查通过。</b>' + state.ranges.length +
+        ' 条记录逐条重新读取并解析，全部成功，用时 ' + dt.toFixed(0) + ' ms。' +
+        '没有任何一条丢失或损坏。</div>', 'ok');
+  } else {
+    say('<div class="box error"><b>有 ' + bad.length + ' 条记录读不出来：</b><ul>' +
+        bad.slice(0, 20).map(function (b) {
+          return '<li>第 ' + (b.i + 1) + ' 条（偏移 ' + state.ranges[b.i].start + '）：' + esc(b.error) + '</li>';
+        }).join('') +
+        '</ul>' + (bad.length > 20 ? '<p>只列出前 20 条。</p>' : '') +
+        '<p>这些是真实的数据缺口，不要基于这份文件做合并。</p></div>', 'error');
+  }
+  state.scanning = false;
+  el.verify.disabled = false;
+});
+
+/* ------------------------------------------------------------------ io --- */
+
+el.pick.addEventListener('change', function () {
+  if (el.pick.files && el.pick.files[0]) openFile(el.pick.files[0]);
+});
+el.drop.addEventListener('click', function () { el.pick.click(); });
+['dragenter', 'dragover'].forEach(function (t) {
+  document.addEventListener(t, function (e) { e.preventDefault(); el.drop.classList.add('over'); });
+});
+['dragleave', 'drop'].forEach(function (t) {
+  document.addEventListener(t, function (e) { e.preventDefault(); el.drop.classList.remove('over'); });
+});
+document.addEventListener('drop', function (e) {
+  e.preventDefault();
+  var f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+  if (f) openFile(f);
+});
+</script>
+</body>
+</html>

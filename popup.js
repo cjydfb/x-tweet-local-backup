@@ -19,6 +19,7 @@ import {
   getMediaRecord,
   listAllMedia,
   listDeletions,
+  sameKey,
   SCHEMA_VERSION
 } from './db.js';
 
@@ -89,6 +90,7 @@ const state = {
   purgeCounts: { superseded: 0, deleted: 0 },
   mediaPermission: false,
   armedPurge: null,
+  savingChoices: false,
   query: '',
   nextKey: null,
   hasMore: false,
@@ -122,6 +124,9 @@ const els = {
   optDebug: document.getElementById('opt-debug'),
   optThumbs: document.getElementById('opt-thumbs'),
   optMedia: document.getElementById('opt-media'),
+  optBackfillMedia: document.getElementById('opt-backfill-media'),
+  fillMedia: document.getElementById('btn-fill-media'),
+  optCaptureReplies: document.getElementById('opt-capture-replies'),
   cleanup: document.getElementById('cleanup'),
   purgeSuperseded: document.getElementById('btn-purge-superseded'),
   purgeDeleted: document.getElementById('btn-purge-deleted'),
@@ -129,7 +134,14 @@ const els = {
   purgeDeletedCount: document.getElementById('cleanup-deleted-count'),
   tab: document.getElementById('btn-tab'),
   media: document.getElementById('btn-media'),
-  clear: document.getElementById('btn-clear')
+  clear: document.getElementById('btn-clear'),
+  choice: document.getElementById('choice'),
+  choiceMedia: document.getElementById('choice-media'),
+  choiceBackfill: document.getElementById('choice-backfill'),
+  choiceReplies: document.getElementById('choice-replies'),
+  choiceThumbs: document.getElementById('choice-thumbs'),
+  choiceConfirm: document.getElementById('btn-choice-confirm'),
+  choiceShow: document.getElementById('btn-choice-show')
 };
 
 /* -------------------------------------------------------------------------- */
@@ -233,13 +245,30 @@ function safeExternalUrl(url) {
   }
 }
 
+/**
+ * The hosts background.js accepts before it will even store a tweetUrl.
+ * Duplicated rather than imported: background.js is a service worker module and
+ * importing it here would start a second copy of it.
+ */
+const ALLOWED_TWEET_HOSTS = ['x.com', 'www.x.com', 'twitter.com', 'www.twitter.com', 'mobile.x.com'];
+
+/**
+ * Only an https URL on an x.com/twitter.com host may reach this href — the same
+ * check background.js applies before storing one.
+ *
+ * Checking the scheme alone was weaker than the writer's rule, and the result of
+ * this function goes straight into an <a href>: anything the archive was
+ * tampered into holding (or a future writer bug) would have been clickable.
+ */
 function safeTweetUrl(url, fallbackId) {
+  const fallback = 'https://x.com/i/web/status/' + String(fallbackId);
   try {
     const parsed = new URL(String(url));
-    if (parsed.protocol !== 'https:') throw new Error('protocol');
+    if (parsed.protocol !== 'https:') return fallback;
+    if (ALLOWED_TWEET_HOSTS.indexOf(parsed.hostname.toLowerCase()) === -1) return fallback;
     return parsed.href;
   } catch (_) {
-    return 'https://x.com/i/web/status/' + String(fallbackId);
+    return fallback;
   }
 }
 
@@ -252,6 +281,16 @@ function revokeObjectUrls() {
   state.objectUrls = [];
 }
 
+/**
+ * Hand a file to the browser's download machinery.
+ *
+ * This is the FALLBACK, used only where `showSaveFilePicker` does not exist. It
+ * cannot report anything: `click()` on an anchor returns nothing, and the
+ * download it starts can be blocked by policy, by a setting or by the popup
+ * closing before the bytes are written, with no error surfacing here at all.
+ * The caller must therefore NOT claim the file exists after calling this — see
+ * the notice each export prints on this path.
+ */
 function downloadBlob(blob, filename) {
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement('a');
@@ -266,6 +305,64 @@ function downloadBlob(blob, filename) {
       URL.revokeObjectURL(url);
     } catch (_) { /* ignore */ }
   }, 60000);
+}
+
+/** Whether this browser can hand back a real file handle. */
+function hasSaveFilePicker() {
+  return typeof window !== 'undefined' && typeof window.showSaveFilePicker === 'function';
+}
+
+/**
+ * Ask the user where the export should go.
+ *
+ * MUST run before anything is built. Chrome only honours the picker while the
+ * click's user activation is still live, and building a large JSON document
+ * spends it — a picker opened after the build would be refused outright.
+ * Asking first also means a cancelled export costs nothing.
+ *
+ * Resolves with one of:
+ *   { handle }             a destination was chosen; nothing is written yet
+ *   { cancelled: true }    the user dismissed the picker
+ *   { unavailable: true }  no picker in this browser — the caller falls back
+ *   { error: '…' }         the picker failed for any other reason
+ */
+async function chooseSaveFile(suggestedName) {
+  if (!hasSaveFilePicker()) return { unavailable: true };
+  try {
+    const handle = await window.showSaveFilePicker({ suggestedName: suggestedName });
+    return { handle: handle };
+  } catch (err) {
+    // AbortError is the user pressing Cancel. It is neither success nor
+    // failure, and printing either one would be a lie about what is on disk.
+    if (err && err.name === 'AbortError') return { cancelled: true };
+    // Anything else (including NotAllowedError, which means the gesture was
+    // already spent) left no file behind, so it must not read as success.
+    return { error: describe(err) };
+  }
+}
+
+/**
+ * Write the blob through a real handle and wait for the close.
+ *
+ * `close()` is what commits the file, and it is awaited: when this resolves the
+ * bytes are on disk, which is the only condition under which the caller may say
+ * the export succeeded.
+ *
+ * A failed write aborts the stream rather than closing it — closing after a
+ * partial write would commit exactly the truncated file this is meant to
+ * prevent.
+ */
+async function writeBlobToHandle(handle, blob) {
+  const writable = await handle.createWritable();
+  try {
+    await writable.write(blob);
+  } catch (err) {
+    try {
+      await writable.abort();
+    } catch (_) { /* ignore */ }
+    throw err;
+  }
+  await writable.close();
 }
 
 /* -------------------------------------------------------------------------- */
@@ -288,6 +385,13 @@ async function refreshState() {
   els.optDebug.checked = state.settings.debug === true;
   els.optThumbs.checked = state.settings.showRemoteThumbnails === true;
   els.optMedia.checked = state.settings.mediaCache === true;
+  els.optBackfillMedia.checked = state.settings.backfillMedia === true;
+  els.optCaptureReplies.checked = state.settings.captureReplies === true;
+  // Meaningless without the master switch, so it says so rather than looking
+  // like a setting that does nothing.
+  els.optBackfillMedia.disabled = state.settings.mediaCache !== true;
+  // Same reasoning: with media caching off there is nothing to fill.
+  els.fillMedia.disabled = state.settings.mediaCache !== true;
   els.diagnostics.hidden = state.settings.debug !== true;
 
   renderSummary();
@@ -408,16 +512,28 @@ function renderDiagnostics() {
     [t('diagCloneFailed'), String(page.responseCloneFailed || 0), page.responseCloneFailed ? 'is-bad' : ''],
     [t('diagBodyFailed'), String(page.requestBodyFailed || 0), page.requestBodyFailed ? 'is-bad' : ''],
     [t('diagPosted'), String(page.posted || 0), ''],
+    // A record the page parsed but could not hand over. Without this row the
+    // only sign of it was that the count of kept posts quietly disagreed with
+    // the count of saved ones.
+    [t('diagPostFailed'), String(page.postFailed || 0), page.postFailed ? 'is-bad' : ''],
     [t('diagDeleteSeen'), String(page.deleteSeen || 0), ''],
     [t('diagDeleteMarked'), String(page.deleted || 0), ''],
+    [t('diagTimelineSeen'), String(page.timelineSeen || 0), ''],
+    [t('diagTimelineKept'), String(page.timelineKept || 0), ''],
     [t('diagReceived'), String(lifetime.received || 0), ''],
     [t('diagMarkedDeleted'), String(lifetime.deletedMarked || 0), ''],
     [t('diagUnmatchedDelete'), String(lifetime.deletedUnmatched || 0), ''],
+    [t('diagBackfilled'), String(lifetime.backfilled || 0), lifetime.backfilled ? 'is-good' : ''],
+    [t('diagBackfillSkipped'), String(lifetime.backfillSkipped || 0), ''],
     [t('diagUpsertOk'), String(lifetime.upsertOk || 0), lifetime.upsertOk ? 'is-good' : ''],
     [t('diagUpsertFailed'), String(lifetime.upsertFailed || 0), lifetime.upsertFailed ? 'is-bad' : ''],
     [t('diagRejected'), String(lifetime.rejected || 0), lifetime.rejected ? 'is-bad' : ''],
     [t('diagMediaCached'), String(lifetime.mediaCached || 0), ''],
     [t('diagMediaFailed'), String(lifetime.mediaFailed || 0), lifetime.mediaFailed ? 'is-bad' : ''],
+    // Not the same failure as mediaFailed: nothing was requested at all. A post
+    // whose download was dropped looks exactly like a post that had no media,
+    // so without this row there is nothing to tell the two apart.
+    [t('diagMediaDropped'), String(lifetime.mediaDropped || 0), lifetime.mediaDropped ? 'is-bad' : ''],
     [t('diagLastError'), stats.lastError || t('diagNone'), stats.lastError ? 'is-bad' : ''],
     [t('diagErrorAt'), stats.lastErrorAt ? formatDateTime(stats.lastErrorAt) : '—', ''],
     [t('diagReportedAt'), page.reportedAt ? formatDateTime(page.reportedAt) : '—', '']
@@ -605,6 +721,28 @@ function renderCard(record) {
     : null;
 
   authorEl.textContent = displayName || (screenName !== null ? '@' + screenName : t('unknownAuthor'));
+
+  // Clicking the author filters the list down to that account.
+  //
+  // Once more than one account is archived the rows are interleaved and nothing
+  // in the list separates them — the search box is the only thing that can, and
+  // retyping a handle to use it is exactly the friction that stops people
+  // bothering. The name is already on screen and already identifies the
+  // account, so it becomes the control.
+  if (screenName !== null) {
+    authorEl.classList.add('card__author--filterable');
+    authorEl.title = t('filterByAuthor', [screenName]);
+    authorEl.addEventListener('click', (ev) => {
+      // The card itself may have its own click behaviour; filtering is a
+      // different intent and must not also trigger it.
+      ev.stopPropagation();
+      els.search.value = screenName;
+      // Re-dispatch rather than calling the search routine by name: the input
+      // already has a handler, and going through it keeps debounce, paging and
+      // the empty-state text on exactly one code path.
+      els.search.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+  }
   if (displayName !== null && screenName !== null) {
     const handle = document.createElement('span');
     handle.textContent = '@' + screenName;
@@ -624,10 +762,19 @@ function renderCard(record) {
   const text = typeof record.text === 'string' ? record.text : '';
   const textEl = document.createElement('p');
   textEl.className = 'card__text';
-  // A retweet legitimately has no text of its own; saying "probably a
-  // media-only post" there would be wrong.
-  if (record.isRetweet === true && text.length === 0) {
-    textEl.classList.add('card__text--retweet');
+  // An empty body is rendered as a note, and the wording has to come from here
+  // rather than from CSS: a CSS string cannot be localised, so the two literal
+  // Chinese strings that used to sit in .card__text::after were shown to every
+  // user, English included. data-empty-text is what the rule renders.
+  if (text.length === 0) {
+    // A retweet legitimately has no text of its own; saying "probably a
+    // media-only post" there would be wrong.
+    if (record.isRetweet === true) {
+      textEl.classList.add('card__text--retweet');
+      textEl.dataset.emptyText = t('emptyRetweet');
+    } else {
+      textEl.dataset.emptyText = t('emptyMediaOnly');
+    }
   }
   textEl.textContent = text; // never innerHTML
   card.appendChild(textEl);
@@ -829,6 +976,17 @@ function renderCard(record) {
       : t('badgeEditVersion');
     badges.appendChild(badge);
   }
+  // Recovered by a profile-timeline sweep rather than witnessed when it was
+  // published. Worth saying out loud: its backup timestamp is the sweep time,
+  // not the publish time, and it may be missing fields only the publish path
+  // can see (poll choices, the edit chain, the full media entities).
+  if (record.source && record.source.backfilled === true) {
+    const badge = document.createElement('span');
+    badge.className = 'badge badge--backfilled';
+    badge.textContent = t('badgeBackfilled');
+    badge.title = t('badgeBackfilledTitle');
+    badges.appendChild(badge);
+  }
   // Written by background.js when the user deletes the post on X. The record
   // is deliberately kept — the archive exists to answer "what did I publish?",
   // and a deletion is part of that answer.
@@ -1025,7 +1183,9 @@ async function fetchBatch(targetCount) {
     if (!page.hasMore) break;
     if (page.nextKey === null) break;
     // Guard against a resume key that does not advance, which would spin.
-    if (page.nextKey === previousKey && page.items.length === 0) {
+    // sameKey comes from db.js — the same rule queryTweets itself applies, so
+    // the two cannot drift apart.
+    if (page.items.length === 0 && sameKey(page.nextKey, previousKey)) {
       state.hasMore = false;
       break;
     }
@@ -1220,6 +1380,27 @@ function disarmClear() {
  * store, so this stays a metadata document.
  */
 /**
+ * The version of the extension doing the exporting.
+ *
+ * Stamped into every export so a file can say which build produced it. Two
+ * archives taken a year apart should not be indistinguishable: if the record
+ * schema ever changes, the older file has to be able to explain itself, and
+ * `schemaVersion` alone cannot say whether a bug was fixed on the way.
+ *
+ * Falls back to a literal rather than throwing — not knowing the version must
+ * never be the reason an export fails.
+ */
+function extensionVersion() {
+  try {
+    const manifest = chrome.runtime.getManifest();
+    const version = manifest ? manifest.version : null;
+    return typeof version === 'string' && version.length > 0 ? version : 'unknown';
+  } catch (_) {
+    return 'unknown';
+  }
+}
+
+/**
  * Every timestamp in this file is UTC. Rather than repeat a converted local
  * time next to each one (which would be wrong the moment you change timezone),
  * the file states once which zone it was written from, and any reader can
@@ -1245,6 +1426,7 @@ async function buildTweetsJson() {
   const chunks = [];
   chunks.push('{\n  "schemaVersion": ' + JSON.stringify(SCHEMA_VERSION) + ',\n');
   chunks.push('  "generator": "x-tweet-backup",\n');
+  chunks.push('  "generatorVersion": ' + JSON.stringify(extensionVersion()) + ',\n');
   chunks.push('  "exportedAt": ' + JSON.stringify(new Date().toISOString()) + ',\n');
   chunks.push('  "timezone": ' + JSON.stringify(timezoneBlock()) + ',\n');
   chunks.push('  "tweets": [');
@@ -1262,10 +1444,18 @@ async function buildTweetsJson() {
   // travel even when this machine never archived the tweet — that is what
   // carries it across a merge — and a record with no text, author or media
   // does not belong in the tweet list.
-  let deletions = [];
+  //
+  // A failed read here STOPS the export. Writing an empty array instead — which
+  // this used to do — produced a file that looks complete and is missing every
+  // tombstone this machine ever recorded, and a merge against it would apply
+  // the deletions it does know about and silently resurrect everything else.
+  // A missing backup is recoverable; a plausible-looking wrong one is not.
+  let deletions;
   try {
     deletions = await listDeletions(state.db);
-  } catch (_) { /* an unreadable store must not sink the whole export */ }
+  } catch (err) {
+    throw new Error(t('errDeletionsUnreadable', [describe(err)]));
+  }
   chunks.push('  "deletions": ' + JSON.stringify(deletions) + '\n}\n');
 
   return { text: chunks.join(''), count: count, deletions: deletions.length };
@@ -1276,15 +1466,43 @@ async function exportAll() {
   state.exporting = true;
   els.export.disabled = true;
   els.export.textContent = t('busyExportingShort');
-  setNotice(t('busyExporting'));
 
   try {
+    const filename = 'x-tweet-backup-' + todayStamp() + '.json';
+    // The destination is chosen before the document is built: the picker needs
+    // the click's user activation and building spends it. See chooseSaveFile.
+    const target = await chooseSaveFile(filename);
+    if (target.cancelled) {
+      setNotice(t('exportCancelled'), '');
+      return;
+    }
+    if (target.error) {
+      setNotice(t('errExport', [target.error]), 'error');
+      return;
+    }
+
+    setNotice(t('busyExporting'));
     const built = await buildTweetsJson();
     const blob = new Blob([built.text], { type: 'application/json;charset=utf-8' });
-    downloadBlob(blob, 'x-tweet-backup-' + todayStamp() + '.json');
-    let message = t('okExported', [String(built.count), todayStamp()]);
+
+    let message;
+    if (target.handle) {
+      const name = typeof target.handle.name === 'string' && target.handle.name.length > 0
+        ? target.handle.name
+        : filename;
+      // Awaited, and only this path may claim the file exists: the write and
+      // its close have both returned, so the bytes are on disk.
+      await writeBlobToHandle(target.handle, blob);
+      message = t('okExported', [String(built.count), name]);
+    } else {
+      // No picker in this browser, so nothing can be confirmed — not by the
+      // click, not afterwards. The notice says a download was STARTED and the
+      // user should check that the file arrived.
+      downloadBlob(blob, filename);
+      message = t('okExportStarted', [String(built.count), filename]);
+    }
     if (built.deletions > 0) message += t('okExportedDeletions', [String(built.deletions)]);
-    setNotice(message, 'ok');
+    setNotice(message, target.handle ? 'ok' : '');
   } catch (err) {
     setNotice(t('errExport', [describe(err)]), 'error');
   } finally {
@@ -1333,6 +1551,19 @@ async function exportArchive() {
   setNotice(t('busyReading'));
 
   try {
+    const filename = 'x-tweet-backup-archive-' + todayStamp() + '.zip';
+    // Destination first, for the same reason as exportAll: the picker needs the
+    // click's user activation, and packing the ZIP would spend it.
+    const target = await chooseSaveFile(filename);
+    if (target.cancelled) {
+      setNotice(t('exportCancelled'), '');
+      return;
+    }
+    if (target.error) {
+      setNotice(t('errExportArchive', [target.error]), 'error');
+      return;
+    }
+
     const built = await buildTweetsJson();
 
     const records = await listAllMedia(state.db);
@@ -1368,18 +1599,30 @@ async function exportArchive() {
         extraFiles: [
           { name: 'tweets.json', text: built.text, date: new Date() },
           { name: 'MEDIA-INDEX.txt', text: describeMediaArchive(rows, { generatedAt: generatedAt, skipped: skipped }), date: new Date() },
-          { name: 'MEDIA-INDEX.json', text: buildMediaIndexJson(rows, { generatedAt: generatedAt, skipped: skipped, schemaVersion: SCHEMA_VERSION }), date: new Date() }
+          { name: 'MEDIA-INDEX.json', text: buildMediaIndexJson(rows, { generatedAt: generatedAt, skipped: skipped, schemaVersion: SCHEMA_VERSION, version: extensionVersion() }), date: new Date() }
         ]
       }
     );
 
-    downloadBlob(zip, 'x-tweet-backup-archive-' + todayStamp() + '.zip');
-
-    let message = t('okArchiveExported', [
-      String(built.count), String(rows.length), formatBytes(zip.size)
-    ]);
+    let message;
+    if (target.handle) {
+      // Awaited, and only this path may claim the file exists: the write and
+      // its close have both returned, so the bytes are on disk.
+      await writeBlobToHandle(target.handle, zip);
+      message = t('okArchiveExported', [
+        String(built.count), String(rows.length), formatBytes(zip.size)
+      ]);
+    } else {
+      // No picker in this browser, so the download cannot be confirmed. The
+      // notice says one was STARTED and the user should check that the archive
+      // arrived; the byte count is what it will have if it did.
+      downloadBlob(zip, filename);
+      message = t('okArchiveStarted', [
+        String(built.count), String(rows.length), formatBytes(zip.size)
+      ]);
+    }
     if (skipped > 0) message += t('okArchiveSkipped', [String(skipped)]);
-    setNotice(message, skipped > 0 ? '' : 'ok');
+    setNotice(message, target.handle && skipped === 0 ? 'ok' : '');
   } catch (err) {
     setNotice(t('errExportArchive', [describe(err)]), 'error');
   } finally {
@@ -1405,15 +1648,21 @@ async function applySettings(patch) {
   return true;
 }
 
-async function onMediaToggle() {
-  if (els.optMedia.checked !== true) {
-    await applySettings({ mediaCache: false });
-    setNotice(t('okMediaOff'), 'ok');
-    return;
-  }
-
-  // chrome.permissions.request must run from this user gesture in an extension
-  // page — never from the service worker.
+/**
+ * Switch local media caching on, host permission included.
+ *
+ * MUST be entered from a user gesture: chrome.permissions.request is only
+ * honoured while the click's activation is still live, so this has to run before
+ * any other await inside its handler, and it can never move into the service
+ * worker. A refusal and a thrown error are deliberately the same answer — there
+ * is no permission either way.
+ *
+ * Returns whether caching actually ended up ON. That return value is the point:
+ * the setting is a claim about the archive, so a refused grant has to leave it
+ * false and say why, rather than storing a wish. Every caller shows the answer
+ * this returns instead of the checkbox the user just clicked.
+ */
+async function enableMediaCache() {
   let granted = false;
   try {
     granted = await requestMediaPermission();
@@ -1422,15 +1671,130 @@ async function onMediaToggle() {
   }
 
   if (granted !== true) {
-    els.optMedia.checked = false;
     await applySettings({ mediaCache: false });
     setNotice(t('errMediaPermission'), 'error');
-    return;
+    return false;
   }
 
   state.mediaPermission = true;
   await applySettings({ mediaCache: true });
   setNotice(t('okMediaOn'), 'ok');
+  return true;
+}
+
+async function onMediaToggle() {
+  if (els.optMedia.checked !== true) {
+    await applySettings({ mediaCache: false });
+    setNotice(t('okMediaOff'), 'ok');
+    return;
+  }
+  // The checkbox shows intent; enableMediaCache reports what happened, so a
+  // refused grant puts the switch back to off instead of leaving it claiming
+  // caching that does not exist.
+  if ((await enableMediaCache()) !== true) els.optMedia.checked = false;
+}
+
+/* -------------------------------------------------------------------------- */
+/* First-run choices                                                          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The four questions the panel asks, each bound to the settings key it writes.
+ *
+ * A table rather than four copies of the same three lines: a box added to the
+ * markup but forgotten here — or wired to a key that settings.js does not know —
+ * would be a behaviour the user can see and cannot set, and it would look like a
+ * checkbox that simply does nothing.
+ */
+const CHOICE_QUESTIONS = [
+  { box: els.choiceMedia, key: 'mediaCache' },
+  { box: els.choiceBackfill, key: 'backfillMedia' },
+  { box: els.choiceReplies, key: 'captureReplies' },
+  { box: els.choiceThumbs, key: 'showRemoteThumbnails' }
+];
+
+/**
+ * Show the panel, with every box on the value that is actually in force.
+ *
+ * Reading the boxes from the settings rather than from the defaults is what
+ * makes re-opening it a review instead of a reset. On the first run the two are
+ * the same thing; afterwards they are not, and a panel that silently reset four
+ * behaviours to their defaults would be worse than no panel.
+ */
+function openChoicePanel() {
+  for (const question of CHOICE_QUESTIONS) {
+    question.box.checked = state.settings[question.key] === true;
+  }
+  els.choice.hidden = false;
+  // Confirm takes focus so the panel can be answered from the keyboard without
+  // tabbing through the page behind it first.
+  try {
+    els.choiceConfirm.focus();
+  } catch (_) { /* ignore */ }
+}
+
+function closeChoicePanel() {
+  els.choice.hidden = true;
+}
+
+/**
+ * Write every answer at once, and only then mark the panel answered.
+ *
+ * One patch, not five. A flag stored while a choice was not — the popup closed
+ * mid-sequence, a write that failed between two of them — would hide the
+ * question forever and leave that setting at whatever it happened to be, which
+ * is the one failure this panel exists to prevent.
+ *
+ * The permission request goes FIRST, before anything else is awaited: the
+ * click's activation is what makes it legal, and every await spends part of the
+ * window it has to run in. A refused or unavailable grant leaves media caching
+ * off and leaves the refusal on screen, through the same function the settings
+ * toggle uses, so the two can never report different outcomes.
+ */
+async function confirmChoices() {
+  if (state.savingChoices === true) return;
+  state.savingChoices = true;
+  els.choiceConfirm.disabled = true;
+
+  try {
+    const wanted = {};
+    for (const question of CHOICE_QUESTIONS) {
+      wanted[question.key] = question.box.checked === true;
+    }
+
+    let mediaOn = state.settings.mediaCache === true && wanted.mediaCache === true;
+    if (wanted.mediaCache === true && state.settings.mediaCache !== true) {
+      mediaOn = await enableMediaCache();
+      // The box shows intent; a refused grant must not leave it showing caching
+      // that is not there.
+      els.choiceMedia.checked = mediaOn === true;
+    }
+
+    const saved = await applySettings({
+      mediaCache: mediaOn,
+      backfillMedia: wanted.backfillMedia,
+      captureReplies: wanted.captureReplies,
+      showRemoteThumbnails: wanted.showRemoteThumbnails,
+      choicePanelAnswered: true
+    });
+    // applySettings has already said what went wrong; the panel stays open so
+    // the answers are not closed away along with the message.
+    if (saved !== true) return;
+
+    // A refused permission is the one answer that must be read rather than
+    // assumed, and enableMediaCache has just said so — a cheerful "saved" over
+    // the top of it would bury the only line that explains why the box is off.
+    if (mediaOn === true || wanted.mediaCache !== true) {
+      setNotice(t('okChoiceSaved'), 'ok');
+    }
+    // After the notice: if reading the state back fails, that failure is the
+    // more urgent thing and must be the line left standing.
+    await refreshState();
+    closeChoicePanel();
+  } finally {
+    state.savingChoices = false;
+    els.choiceConfirm.disabled = false;
+  }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1491,7 +1855,70 @@ function bindEvents() {
   });
 
   els.optMedia.addEventListener('change', () => {
-    void onMediaToggle();
+    // The master switch decides whether the sweep switch can do anything, so
+    // its enabled state is re-derived from the checkbox itself rather than from
+    // whatever the settings round-trip happened to leave behind. `.finally`
+    // covers the paths that bail out early, including a revoked permission.
+    void onMediaToggle().finally(() => {
+      els.optBackfillMedia.disabled = els.optMedia.checked !== true;
+    });
+  });
+
+  els.optBackfillMedia.addEventListener('change', () => {
+    void (async () => {
+      const ok = await applySettings({ backfillMedia: els.optBackfillMedia.checked });
+      if (ok) {
+        // Two literal lookups rather than one computed key: the i18n checker
+        // matches on literal t('...') calls, and a computed key would read as an
+        // unused string rather than as a real reference.
+        setNotice(
+          els.optBackfillMedia.checked ? t('okBackfillMediaOn') : t('okBackfillMediaOff'),
+          'ok'
+        );
+      }
+    })();
+  });
+
+  els.fillMedia.addEventListener('click', () => {
+    void (async () => {
+      els.fillMedia.disabled = true;
+      setNotice(t('busyFillMedia'));
+      try {
+        const response = await send({ type: 'XTB_FILL_MEDIA' });
+        if (!response || response.ok !== true) {
+          // The two refusals are actionable, so they get their own wording
+          // rather than a generic failure.
+          const reason = (response && response.error) || '';
+          if (reason === 'media caching is off') setNotice(t('errFillMediaOff'), 'error');
+          else if (reason === 'media host permission not granted') setNotice(t('errFillMediaNoPerm'), 'error');
+          else setNotice(t('errFillMedia', [reason || t('unknownError')]), 'error');
+          return;
+        }
+        let message = t('okFillMedia', [String(response.queued), String(response.withMedia)]);
+        if (response.overflow > 0) message += t('okFillMediaOverflow', [String(response.overflow)]);
+        setNotice(message, 'ok');
+        // Downloads run in the background; refresh later so the counts catch up.
+        setTimeout(() => { void refreshState(); }, 2500);
+      } finally {
+        els.fillMedia.disabled = state.settings.mediaCache !== true;
+      }
+    })();
+  });
+
+  els.optCaptureReplies.addEventListener('change', () => {
+    void (async () => {
+      const on = els.optCaptureReplies.checked;
+      const ok = await applySettings({ captureReplies: on });
+      if (ok) setNotice(on ? t('okCaptureRepliesOn') : t('okCaptureRepliesOff'), 'ok');
+    })();
+  });
+
+  // Only ever shows what is stored, so this is the way back to the panel for
+  // anyone who answered it before understanding one of the costs.
+  els.choiceShow.addEventListener('click', () => openChoicePanel());
+
+  els.choiceConfirm.addEventListener('click', () => {
+    void confirmChoices();
   });
 
   els.purgeSuperseded.addEventListener('click', () => onPurgeClick('superseded'));
@@ -1576,6 +2003,17 @@ async function init() {
       setNotice(t('errMediaRevoked'), 'error');
     }
   }
+
+  // The first-run panel, asked once. Opened from the same state read the
+  // settings toggles use, so its boxes start on the values that are really in
+  // force, and opened before the list is built so the popup is never seen in the
+  // un-asked state first.
+  //
+  // It is an overlay, not a gate. Posts, edits and deletions have been captured
+  // since the moment the extension was installed — nothing below this line, and
+  // nothing in settings.js, waits on the answer. The list loads on exactly the
+  // same schedule whether the panel is up or has been answered for months.
+  if (state.settings.choicePanelAnswered !== true) openChoicePanel();
 
   await reload();
 }

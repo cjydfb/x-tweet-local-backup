@@ -18,6 +18,11 @@
       <div class="header__title">
         <h1>X Tweet Backup</h1>
       </div>
+      <!-- The status line sits in the header, to the right of the title. It used
+           to be a full-width row between the toolbar and the list, where a long
+           message had nowhere to go and was clipped — "choices saved" ran off
+           the edge exactly when the user most needed to read it. -->
+      <p id="notice" class="notice" role="status" aria-live="polite"></p>
       <button id="btn-refresh" class="icon-button" type="button" data-i18n-title="refresh">↻</button>
     </header>
 
@@ -45,8 +50,6 @@
       <button id="btn-export" class="button button--primary" type="button" data-i18n="exportJson"></button>
     </section>
 
-    <p id="notice" class="notice" role="status" aria-live="polite"></p>
-
     <main id="list" class="list" data-i18n-aria-label="listAria"></main>
 
     <div class="list-footer">
@@ -61,40 +64,134 @@
     </details>
 
     <footer class="footer">
-      <label class="toggle">
-        <input type="checkbox" id="opt-debug">
-        <span data-i18n="optDebug"></span>
-      </label>
-      <label class="toggle">
-        <input type="checkbox" id="opt-thumbs">
-        <span data-i18n="optThumbs"></span>
-      </label>
-      <label class="toggle">
-        <input type="checkbox" id="opt-media">
-        <span data-i18n="optMedia"></span>
-      </label>
-      <details class="cleanup" id="cleanup">
-        <summary data-i18n="cleanupSummary"></summary>
-        <p class="cleanup__note" data-i18n="cleanupNote"></p>
-        <div class="cleanup__row">
-          <span class="cleanup__label"><span data-i18n="cleanupSuperseded"></span><span class="cleanup__count" id="cleanup-superseded-count">–</span></span>
-          <button id="btn-purge-superseded" class="button button--danger button--small" type="button" data-i18n="delete" disabled></button>
-        </div>
-        <div class="cleanup__row">
-          <span class="cleanup__label"><span data-i18n="cleanupDeleted"></span><span class="cleanup__count" id="cleanup-deleted-count">–</span></span>
-          <button id="btn-purge-deleted" class="button button--danger button--small" type="button" data-i18n="delete" disabled></button>
-        </div>
-      </details>
-
       <div class="footer__actions">
         <button id="btn-tab" class="button button--small" type="button" data-i18n="openInTab"></button>
+        <button id="btn-fill-media" class="button button--small" type="button" data-i18n="fillMedia" data-i18n-title="fillMediaTitle"></button>
         <button id="btn-media" class="button button--small" type="button" data-i18n="exportArchive" data-i18n-title="exportArchiveTitle"></button>
         <button id="btn-clear" class="button button--danger button--small" type="button" data-i18n="clearAll"></button>
       </div>
-      <p class="footer__note footer__note--warning" data-i18n-html="warnReload"></p>
-      <p class="footer__note" data-i18n="noteStorage"></p>
-      <p class="footer__note" data-i18n-html="noteSnapshot"></p>
+
+      <!-- Settings, bulk cleanup and the long explanatory notes. Closed by
+           default: these are visited rarely and the controls inside them are
+           not the reason anyone opens the popup. -->
+      <details class="settings" id="settings">
+        <summary data-i18n="settingsSummary"></summary>
+
+        <label class="toggle">
+          <input type="checkbox" id="opt-debug">
+          <span data-i18n="optDebug"></span>
+        </label>
+        <label class="toggle">
+          <input type="checkbox" id="opt-thumbs">
+          <span data-i18n="optThumbs"></span>
+        </label>
+        <label class="toggle">
+          <input type="checkbox" id="opt-media">
+          <span data-i18n="optMedia"></span>
+        </label>
+        <label class="toggle">
+          <input type="checkbox" id="opt-backfill-media">
+          <span data-i18n="optBackfillMedia"></span>
+        </label>
+        <label class="toggle">
+          <input type="checkbox" id="opt-capture-replies">
+          <span data-i18n="optCaptureReplies"></span>
+        </label>
+
+        <!-- The first-run panel, read again. A one-time dialog with no way back
+             is a trap: what gets remembered is the answer, not the reasoning
+             behind it, and a user who answered before understanding the cost has
+             no way to revisit the question. -->
+        <button id="btn-choice-show" class="button button--small settings__action" type="button" data-i18n="showChoicePanel"></button>
+
+        <details class="cleanup" id="cleanup">
+          <summary data-i18n="cleanupSummary"></summary>
+          <p class="cleanup__note" data-i18n="cleanupNote"></p>
+          <div class="cleanup__row">
+            <span class="cleanup__label"><span data-i18n="cleanupSuperseded"></span><span class="cleanup__count" id="cleanup-superseded-count">–</span></span>
+            <button id="btn-purge-superseded" class="button button--danger button--small" type="button" data-i18n="delete" disabled></button>
+          </div>
+          <div class="cleanup__row">
+            <span class="cleanup__label"><span data-i18n="cleanupDeleted"></span><span class="cleanup__count" id="cleanup-deleted-count">–</span></span>
+            <button id="btn-purge-deleted" class="button button--danger button--small" type="button" data-i18n="delete" disabled></button>
+          </div>
+        </details>
+
+        <!-- The reload warning lives here rather than in the footer. It used to
+             sit outside on the argument that an actionable warning must not be
+             hidden — but the action only applies to an unpacked install being
+             reloaded by hand, and for a store install the extension updates
+             itself. Worse, anything missed that way is recovered by the next
+             profile sweep, so the warning was shouting about a loss that mostly
+             is not one. The one case it does still matter — a deletion made
+             from a stale tab, which leaves no tombstone — is worth reading, and
+             that is what a note inside Settings is for. -->
+        <p class="footer__note footer__note--warning" data-i18n-html="warnReload"></p>
+        <p class="footer__note" data-i18n="noteStorage"></p>
+        <p class="footer__note" data-i18n="noteBackfill"></p>
+        <p class="footer__note" data-i18n-html="noteSnapshot"></p>
+      </details>
     </footer>
+  </div>
+
+  <!-- First-run choices. A MODAL over the popup, never a block inside it: a
+       Chromium popup is capped at 600px and the list is the only reason anyone
+       opens it, so a panel that took list height would cost exactly the thing it
+       is asking about. `position: fixed` keeps it out of the layout entirely —
+       the list is built behind it and is not shortened by a single pixel.
+
+       The four checkboxes start from whatever is actually stored, so re-opening
+       it shows the current answers rather than resetting them to the defaults. -->
+  <div class="choice" id="choice" hidden>
+    <div class="choice__panel" role="dialog" aria-modal="true" aria-labelledby="choice-title">
+      <h2 class="choice__title" id="choice-title" data-i18n="choiceTitle"></h2>
+      <p class="choice__intro" data-i18n="choiceIntro"></p>
+
+      <div class="choice__option">
+        <label class="toggle">
+          <input type="checkbox" id="choice-media">
+          <span data-i18n="optMedia"></span>
+        </label>
+        <p class="choice__cost" data-i18n="choiceMediaCost"></p>
+      </div>
+
+      <div class="choice__option">
+        <label class="toggle">
+          <input type="checkbox" id="choice-backfill">
+          <span data-i18n="optBackfillMedia"></span>
+        </label>
+        <p class="choice__cost" data-i18n="choiceBackfillCost"></p>
+      </div>
+
+      <div class="choice__option">
+        <label class="toggle">
+          <input type="checkbox" id="choice-replies">
+          <span data-i18n="optCaptureReplies"></span>
+        </label>
+        <p class="choice__cost" data-i18n="choiceRepliesCost"></p>
+      </div>
+
+      <div class="choice__option">
+        <label class="toggle">
+          <input type="checkbox" id="choice-thumbs">
+          <span data-i18n="optThumbs"></span>
+        </label>
+        <p class="choice__cost" data-i18n="choiceThumbsCost"></p>
+      </div>
+
+      <p class="choice__note" data-i18n="choiceCoreNote"></p>
+
+      <!-- The one thing on this panel that is not a preference. Everything
+           above asks what to keep; this says the archive can disappear without
+           anyone choosing anything — clearing browser data, uninstalling, or a
+           dead profile takes it — and that the export is the only copy that
+           survives. Coloured apart and placed last, immediately before the
+           button, so it is read on the way to the action rather than skipped
+           as one more paragraph of explanation. -->
+      <p class="choice__warning" data-i18n="choiceWarning"></p>
+
+      <button id="btn-choice-confirm" class="button button--primary button--wide" type="button" data-i18n="choiceConfirm"></button>
+    </div>
   </div>
 
   <script type="module" src="popup.js"></script>

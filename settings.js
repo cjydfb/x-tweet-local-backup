@@ -16,6 +16,48 @@ export const DEFAULT_SETTINGS = {
   mediaCache: false,
   /** Show remote twimg thumbnails in the popup when no cached blob exists. */
   showRemoteThumbnails: true,
+  /**
+   * Whether a profile-timeline sweep should also download the media for the
+   * posts it recovers.
+   *
+   * Separate from `mediaCache` on purpose. `mediaCache` is a standing decision
+   * about how this archive works; a sweep is a single action that can recover
+   * hundreds of posts at once. Scrolling through a whole profile with the
+   * master switch on would otherwise start a multi-gigabyte download nobody
+   * asked for at that moment. On by default, because recovering a post without
+   * its picture is only half the post — but it stays switchable.
+   */
+  backfillMedia: true,
+  /**
+   * Whether the profile's Replies tab is read as well as the Posts tab.
+   *
+   * Off by default. Turning it on can add a large number of rows in one go —
+   * nearly every entry in that response is a conversation holding both sides of
+   * an exchange — and that is a decision the archive's owner should make
+   * deliberately rather than discover afterwards.
+   */
+  captureReplies: false,
+  /**
+   * Whether the first-run choice panel has been answered.
+   *
+   * The four behaviours above are the reason the panel exists: each one changes
+   * what gets stored and what it costs, and none of them had a moment where the
+   * archive's owner agreed to it. This flag is only that moment — it is NOT a
+   * gate. Capturing posts, edits and deletions reads none of it, so the core of
+   * the extension works from the first second after install whether this is
+   * true, false or missing entirely.
+   *
+   * It lives in the settings store rather than its own key because it is read
+   * at the same instant as the settings it is about: the popup has to know
+   * whether to ask before it can know what to pre-set the boxes to, and two
+   * reads could disagree. A later version that re-asks (a new behaviour worth
+   * deciding) can ignore the stored `true` rather than needing a second key.
+   *
+   * False by default, so a fresh install is asked exactly once — and the panel
+   * stays reachable from the settings section afterwards, so answering it is
+   * never a one-way door.
+   */
+  choicePanelAnswered: false,
   /** Records per page in the popup list. */
   pageSize: 30
 };
@@ -36,7 +78,18 @@ export const DEFAULT_STATS = {
     /** Records removed by a bulk category cleanup. */
     purged: 0,
     mediaCached: 0,
-    mediaFailed: 0
+    mediaFailed: 0,
+    /**
+     * Media downloads that were never even queued because the queue was full.
+     * Counted apart from mediaFailed because the two look identical in the
+     * archive — a post with no cached file — while the causes are completely
+     * different: one request failed, the other was never made.
+     */
+    mediaDropped: 0,
+    /** Rows recovered from a profile timeline sweep — posts made elsewhere. */
+    backfilled: 0,
+    /** Swept rows whose id was already archived, so deliberately left untouched. */
+    backfillSkipped: 0
   },
   /** Latest snapshot reported by the page realm (per page load, not lifetime). */
   page: {
@@ -47,6 +100,10 @@ export const DEFAULT_STATS = {
     createTweetSeen: 0,
     deleteSeen: 0,
     deleted: 0,
+    /** Profile timeline responses seen on this page. */
+    timelineSeen: 0,
+    /** Tweets in those responses that belonged to this account and were kept. */
+    timelineKept: 0,
     requestBodyRead: 0,
     requestBodyFailed: 0,
     responseCloneFailed: 0,
@@ -110,6 +167,9 @@ export async function getSettings() {
     if (typeof stored.debug === 'boolean') merged.debug = stored.debug;
     if (typeof stored.mediaCache === 'boolean') merged.mediaCache = stored.mediaCache;
     if (typeof stored.showRemoteThumbnails === 'boolean') merged.showRemoteThumbnails = stored.showRemoteThumbnails;
+    if (typeof stored.backfillMedia === 'boolean') merged.backfillMedia = stored.backfillMedia;
+    if (typeof stored.captureReplies === 'boolean') merged.captureReplies = stored.captureReplies;
+    if (typeof stored.choicePanelAnswered === 'boolean') merged.choicePanelAnswered = stored.choicePanelAnswered;
     // A stored `captureRetweets` from an older version is simply ignored — the
     // key is gone, and carrying it forward would suggest a setting that no
     // longer does anything.
@@ -133,6 +193,9 @@ async function saveSettingsInternal(patch) {
     if (typeof patch.debug === 'boolean') current.debug = patch.debug;
     if (typeof patch.mediaCache === 'boolean') current.mediaCache = patch.mediaCache;
     if (typeof patch.showRemoteThumbnails === 'boolean') current.showRemoteThumbnails = patch.showRemoteThumbnails;
+    if (typeof patch.backfillMedia === 'boolean') current.backfillMedia = patch.backfillMedia;
+    if (typeof patch.captureReplies === 'boolean') current.captureReplies = patch.captureReplies;
+    if (typeof patch.choicePanelAnswered === 'boolean') current.choicePanelAnswered = patch.choicePanelAnswered;
     if (Number.isInteger(patch.pageSize) && patch.pageSize >= 10 && patch.pageSize <= 200) {
       current.pageSize = patch.pageSize;
     }
@@ -145,6 +208,70 @@ async function saveSettingsInternal(patch) {
     } catch (_) { /* quota or context error: settings stay in-memory this session */ }
   }
   return current;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Whose posts are "mine"                                                     */
+/* -------------------------------------------------------------------------- */
+
+export const OWN_AUTHORS_KEY = 'xtbOwnAuthors';
+
+/** A cap, not an expectation: one person rarely has more than a couple of accounts. */
+const MAX_OWN_AUTHORS = 20;
+
+function validAuthorId(value) {
+  return typeof value === 'string' && /^[0-9]{1,25}$/.test(value);
+}
+
+/**
+ * The account ids whose posts this archive is allowed to keep.
+ *
+ * This is what makes the timeline sweep safe to run at all. Opening your own
+ * profile makes X fetch a timeline; opening *someone else's* profile makes it
+ * fetch theirs, through the same operation. Without a list of your own ids the
+ * sweep could not tell the two apart, and the archive would quietly start
+ * hoovering up other people's posts — a different product, and not one anybody
+ * asked for.
+ *
+ * Ids are learned from the CreateTweet responses the extension already
+ * processes (the author id is in every one), then persisted here. A brand-new
+ * install therefore learns its first id from the first post made in the
+ * browser, and the sweep stays inert until then.
+ */
+export async function getOwnAuthors() {
+  const area = storageArea();
+  if (area === null) return [];
+  try {
+    const result = await area.get({ [OWN_AUTHORS_KEY]: null });
+    const stored = result ? result[OWN_AUTHORS_KEY] : null;
+    if (!Array.isArray(stored)) return [];
+    return stored.filter(validAuthorId).slice(0, MAX_OWN_AUTHORS);
+  } catch (_) {
+    return [];
+  }
+}
+
+export function rememberOwnAuthors(ids) {
+  return serialize(() => rememberOwnAuthorsInternal(ids));
+}
+
+async function rememberOwnAuthorsInternal(ids) {
+  const existing = await getOwnAuthors();
+  const merged = existing.slice();
+  if (Array.isArray(ids)) {
+    for (const id of ids) {
+      if (validAuthorId(id) && merged.indexOf(id) === -1) merged.push(id);
+    }
+  }
+  if (merged.length === existing.length) return existing; /* nothing new: no write */
+  const capped = merged.slice(-MAX_OWN_AUTHORS);
+  const area = storageArea();
+  if (area !== null) {
+    try {
+      await area.set({ [OWN_AUTHORS_KEY]: capped });
+    } catch (_) { /* quota or context error: it will be relearned from the next post */ }
+  }
+  return capped;
 }
 
 export async function getStats() {
@@ -230,7 +357,7 @@ async function mergePageDiagInternal(diag) {
   const numericKeys = [
     'createTweetSeen', 'deleteSeen', 'deleted', 'requestBodyRead', 'requestBodyFailed',
     'responseCloneFailed', 'responseJsonFailed', 'parseFailed', 'parsed',
-    'posted', 'postFailed'
+    'posted', 'postFailed', 'timelineSeen', 'timelineKept'
   ];
   // A new document means a new session token: start the page counters over so
   // the popup never shows a stale maximum from a previous tab or reload.

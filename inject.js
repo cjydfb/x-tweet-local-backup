@@ -94,6 +94,41 @@
 
   const ALL_OPERATIONS = CREATE_OPERATIONS.concat(DELETE_OPERATIONS);
 
+  /* Reading your own profile makes X fetch your posts — including the ones
+   * published from the phone, which this browser can never observe directly.
+   *
+   * This is the one place the extension listens to something other than a
+   * publish or a delete, and it is a QUERY rather than a mutation. It is safe
+   * for a reason that does not generalise to other queries: the page was making
+   * this exact request anyway, so the extension issues nothing, adds no traffic,
+   * and touches no credential. It simply reads a response that already exists.
+   *
+   * The response is not filtered to you — a timeline response also carries
+   * "who to follow" cards and any post you quoted. Nothing is archived until the
+   * author id matches an account this browser has been seen to publish from, so
+   * on a fresh install the sweep is inert until the first post is made here.
+   */
+  const TIMELINE_OPERATIONS = ['useroriginalstimeline'];
+
+  /* The Replies tab, reached from the same profile page.
+   *
+   * Structurally it is the same query — identical response path, identical
+   * tweet shape — so it costs almost nothing to read. The difference is what
+   * comes back: nearly every entry is a conversation module holding BOTH sides
+   * of the exchange. Measured on a real response, 31 tweets of which only 22
+   * were the account's own, so the author filter is doing real work here rather
+   * than being a formality.
+   *
+   * Off unless asked for: switching this on can add a great many rows to the
+   * archive at once, and that is a choice the archive's owner should make
+   * rather than find out about afterwards.
+   */
+  const REPLY_TIMELINE_OPERATIONS = ['userrepliestimeline'];
+
+  /** Guard against a pathological response; no real timeline page approaches this. */
+  const MAX_TIMELINE_NODES = 200000;
+  const MAX_TIMELINE_TWEETS = 500;
+
   /* ------------------------------------------------------------------ */
   /* Diagnostics (primitives only, never credentials)                    */
   /* ------------------------------------------------------------------ */
@@ -107,6 +142,10 @@
     // a delete as a post the hook saw and then failed to archive.
     deleteSeen: 0,
     deleted: 0,
+    // Counted apart from createTweetSeen: a timeline sweep did not observe a
+    // publish, and folding the two together would report one publish as several.
+    timelineSeen: 0,
+    timelineKept: 0,
     requestBodyRead: 0,
     requestBodyFailed: 0,
     responseCloneFailed: 0,
@@ -157,6 +196,8 @@
       createTweetSeen: diag.createTweetSeen,
       deleteSeen: diag.deleteSeen,
       deleted: diag.deleted,
+      timelineSeen: diag.timelineSeen,
+      timelineKept: diag.timelineKept,
       requestBodyRead: diag.requestBodyRead,
       requestBodyFailed: diag.requestBodyFailed,
       responseCloneFailed: diag.responseCloneFailed,
@@ -188,6 +229,21 @@
     return '*';
   }
 
+  /**
+   * The exact envelope post() puts on the wire. Shared with the backfill
+   * chunker, which has to know what a message will weigh BEFORE sending it:
+   * the bridge limit applies to this finished shape, envelope included.
+   */
+  function bridgeMessage(type, payload) {
+    return {
+      __xtb: true,
+      source: PAGE_SOURCE,
+      type: type,
+      token: sessionToken,
+      payload: payload
+    };
+  }
+
   /** Returns true when the message actually reached the bridge. */
   function post(type, payload) {
     // The extension side is gone from this page; posting is pointless until the
@@ -201,13 +257,7 @@
       return false;
     }
     try {
-      const message = {
-        __xtb: true,
-        source: PAGE_SOURCE,
-        type: type,
-        token: sessionToken,
-        payload: payload
-      };
+      const message = bridgeMessage(type, payload);
       let serialized;
       try {
         serialized = JSON.stringify(message);
@@ -260,11 +310,20 @@
 
       if (data.type === 'XTB_HELLO') {
         if (typeof data.token !== 'string' || data.token.length < 8) return;
+        // A token is accepted only while none is set — i.e. only to establish the
+        // session. content.js stops sending after its five retries, so a HELLO
+        // arriving later could only come from the page, and re-keying the bridge
+        // here would make every subsequent message fail the token check in BOTH
+        // directions, silently, for the rest of the page's life. Ignoring it
+        // costs nothing: the handshake it offers is already done.
+        if (sessionToken !== null) return;
         sessionToken = data.token;
         if (typeof data.debug === 'boolean') debugEnabled = data.debug;
+        adoptOwnAuthors(data.ownAuthorIds);
+        if (typeof data.captureReplies === 'boolean') captureReplies = data.captureReplies;
         post('XTB_READY', {
           hookInstalled: diag.hookInstalled,
-          operations: ALL_OPERATIONS
+          operations: ALL_OPERATIONS.concat(TIMELINE_OPERATIONS).concat(REPLY_TIMELINE_OPERATIONS)
         });
         flushQueue();
         return;
@@ -272,6 +331,8 @@
 
       if (data.type === 'XTB_CONFIG') {
         if (typeof data.debug === 'boolean') debugEnabled = data.debug;
+        adoptOwnAuthors(data.ownAuthorIds);
+        if (typeof data.captureReplies === 'boolean') captureReplies = data.captureReplies;
         return;
       }
 
@@ -405,8 +466,10 @@
    */
   function analyzeRequestUrl(rawUrl, method) {
     if (typeof method !== 'string') return null;
-    if (method.toUpperCase() !== 'POST') return null;
     if (typeof rawUrl !== 'string' || rawUrl.length === 0) return null;
+
+    const upperMethod = method.toUpperCase();
+    if (upperMethod !== 'POST' && upperMethod !== 'GET') return null;
 
     let url;
     try {
@@ -427,12 +490,24 @@
     if (!queryId || !operationName) return null;
 
     const lower = operationName.toLowerCase();
-    if (ALL_OPERATIONS.indexOf(lower) === -1) return null;
+    const isReplyTimeline = REPLY_TIMELINE_OPERATIONS.indexOf(lower) !== -1;
+    if (isReplyTimeline && !captureReplies) return null;
+    const isTimeline = TIMELINE_OPERATIONS.indexOf(lower) !== -1 || isReplyTimeline;
+
+    // A publish or a delete is always a POST. Matching those names on a GET
+    // would mean the operation is not what we think it is, so they are kept
+    // strictly POST-only; the timeline query is the one GET that is wanted.
+    if (isTimeline) {
+      if (upperMethod !== 'GET') return null;
+    } else if (upperMethod !== 'POST' || ALL_OPERATIONS.indexOf(lower) === -1) {
+      return null;
+    }
 
     return {
       queryId: queryId,
       operationName: operationName,
-      isDelete: DELETE_OPERATIONS.indexOf(lower) !== -1
+      isDelete: DELETE_OPERATIONS.indexOf(lower) !== -1,
+      isTimeline: isTimeline
     };
   }
 
@@ -615,11 +690,14 @@
    *   operation CreateNoteTweet  -> data.notetweet_create   <-- not "create_note_tweet"
    *
    * The other entries are kept as fallbacks for shapes seen in older clients.
+   *
+   * There is deliberately no `create_retweet` entry: CreateRetweet is not a
+   * matched operation (see CREATE_OPERATIONS), so no response that reaches this
+   * parser can carry that key — it could only ever have matched a forged one.
    */
   const CREATE_RESULT_KEYS = [
     'create_tweet',
     'notetweet_create',
-    'create_retweet',
     'create_note_tweet',
     'CreateTweet'
   ];
@@ -1364,6 +1442,10 @@
         capturedVia: capturedVia === 'xhr' ? 'xhr' : 'fetch',
         httpStatus: httpStatus,
         textFromRequest: textFromRequest,
+        // Set to true by the timeline path below. A backfilled row was not
+        // witnessed at publish time, so its capturedAt is the sweep time and it
+        // may lack fields the publish path would have had.
+        backfilled: false,
         tombstone: false
       },
       schemaVersion: 2
@@ -1538,6 +1620,241 @@
     });
   }
 
+  /* ------------------------------------------------------- profile timeline */
+
+  /**
+   * The account ids whose posts this archive may keep.
+   *
+   * Seeded from storage (ids learned by earlier sessions) and grown from every
+   * publish this page witnesses. The id is read out of the CreateTweet response
+   * the extension already parses — no extra request, no credential, no lookup.
+   *
+   * This set is the entire safety argument for reading a timeline at all: the
+   * same operation serves your profile and anybody else's, and only this list
+   * can tell them apart.
+   */
+  const ownAuthorIds = new Set();
+
+  /** Whether the Replies tab is read as well. Off until the user turns it on. */
+  let captureReplies = false;
+
+  function noteOwnAuthor(record) {
+    try {
+      if (record !== null && record.author !== null && record.author.id !== null) {
+        ownAuthorIds.add(record.author.id);
+      }
+    } catch (err) {
+      recordError('noteOwnAuthor', err);
+    }
+  }
+
+  /** Seed the set from ids learned by earlier sessions (via content.js). */
+  function adoptOwnAuthors(list) {
+    try {
+      if (!Array.isArray(list)) return;
+      const limit = Math.min(list.length, 20);
+      for (let i = 0; i < limit; i++) {
+        const id = normalizeTweetId(list[i]);
+        if (id !== null) ownAuthorIds.add(id);
+      }
+    } catch (err) {
+      recordError('adoptOwnAuthors', err);
+    }
+  }
+
+  /**
+   * Collect every tweet node in a timeline response, wherever it is nested.
+   *
+   * Walking specific paths does not work here. A timeline entries array mixes
+   * single posts with modules, and one kind of module holds a thread of your own
+   * posts while another holds "who to follow" profile cards. Measured against a
+   * real response, reading only the single-post entries missed a third of the
+   * posts. So this walks the whole structure and lets the author filter decide.
+   *
+   * Posts you quote are skipped on purpose: a quoted tweet hangs off
+   * `quoted_status_result`, not `tweet_results`, so it is never collected — and
+   * it usually belongs to somebody else anyway.
+   */
+  function collectTimelineTweets(root) {
+    const out = [];
+    const seen = new Set();
+    let visited = 0;
+
+    const walk = (node, depth) => {
+      if (visited++ > MAX_TIMELINE_NODES) return;
+      if (depth > 30 || node === null || typeof node !== 'object') return;
+      if (Array.isArray(node)) {
+        for (let i = 0; i < node.length; i++) walk(node[i], depth + 1);
+        return;
+      }
+
+      const tweetResults = node.tweet_results;
+      if (tweetResults !== null && typeof tweetResults === 'object' && !Array.isArray(tweetResults)) {
+        const inner = tweetResults.result;
+        if (inner !== null && typeof inner === 'object') {
+          // A visibility wrapper sits between: {result: {tweet: {...}}}
+          const tweet = (inner.tweet !== null && typeof inner.tweet === 'object') ? inner.tweet : inner;
+          if (!seen.has(tweet)) {
+            seen.add(tweet);
+            out.push(tweet);
+          }
+        }
+      }
+
+      const keys = Object.keys(node);
+      for (let i = 0; i < keys.length; i++) {
+        if (keys[i] === 'quoted_status_result') continue;
+        walk(node[keys[i]], depth + 1);
+      }
+    };
+
+    walk(root, 0);
+    return out;
+  }
+
+  /**
+   * Turn one timeline response into records, keeping only this account's posts.
+   *
+   * Every tweet that is not ours is dropped here, on this side of the bridge —
+   * other people's content is never even transmitted, let alone stored.
+   */
+  function buildTimelineRecords(json, requestInfo, httpStatus, capturedVia) {
+    const tweets = collectTimelineTweets(json);
+    const records = [];
+    const seenIds = new Set();
+    const limit = Math.min(tweets.length, MAX_TIMELINE_TWEETS);
+
+    for (let i = 0; i < limit; i++) {
+      let record = null;
+      try {
+        const author = extractAuthor(tweets[i]);
+        if (author.id === null || !ownAuthorIds.has(author.id)) continue;
+        record = buildTweetRecord(tweets[i], null, requestInfo, httpStatus, capturedVia);
+      } catch (err) {
+        recordError('buildTimelineRecord', err);
+        continue;
+      }
+      if (record === null) continue;
+      if (seenIds.has(record.id)) continue;
+      seenIds.add(record.id);
+      record.source.backfilled = true;
+      records.push(record);
+    }
+    return records;
+  }
+
+  /**
+   * Send a sweep's records in as few messages as the bridge limit allows.
+   *
+   * A whole timeline page routinely serializes past MAX_BRIDGE_BYTES, and post()
+   * refuses an oversized message outright — which discarded the ENTIRE sweep,
+   * every post on the page. So the batch is split, and the split point is found
+   * by measuring real serializations rather than by guessing a record count: one
+   * long-form post can weigh more than a hundred short ones.
+   *
+   * Returns how many records actually left the page. A record that cannot fit in
+   * a message even on its own is skipped and named in the diagnostics — one
+   * oversized row must never cost the rest of the page.
+   */
+  function postBackfillRecords(records) {
+    // Fixed per-message cost: the envelope (source/type/token) plus the empty
+    // records array. Measured, not assumed, and measured against the same token
+    // post() will send. If it cannot be measured, 0 makes the chunks look
+    // smaller than they are — post() then refuses one, counts nothing as kept,
+    // and the refusal shows up in the diagnostics instead of vanishing.
+    let overhead = 0;
+    try {
+      overhead = JSON.stringify(bridgeMessage('X_TWEET_BACKFILL', { records: [] })).length;
+    } catch (_) { /* fall through: post() is the backstop */ }
+
+    let chunk = [];
+    let chunkBytes = 0;   // serialized length of the records array alone
+    let posted = 0;
+
+    const flush = () => {
+      if (chunk.length === 0) return;
+      const batch = chunk;
+      const batchBytes = chunkBytes;
+      chunk = [];
+      chunkBytes = 0;
+      const delivered = post('X_TWEET_BACKFILL', { records: batch });
+      if (delivered) {
+        posted += batch.length;
+        diag.posted++;
+      }
+      log('timeline chunk: ' + batch.length + ' records, ' + (overhead + batchBytes) +
+          ' bytes, ' + (delivered ? 'delivered' : 'refused'));
+    };
+
+    for (let i = 0; i < records.length; i++) {
+      const record = records[i];
+      let recordBytes;
+      try {
+        recordBytes = JSON.stringify(record).length;
+      } catch (err) {
+        diag.postFailed++;
+        recordError('timeline serialize', err);
+        continue;
+      }
+      // JSON.stringify joins an array's elements with ',' — so the running total
+      // is the exact length of the finished array, not an approximation.
+      const grownBytes = chunkBytes === 0 ? recordBytes : chunkBytes + recordBytes + 1;
+
+      if (overhead + grownBytes <= MAX_BRIDGE_BYTES) {
+        chunk.push(record);
+        chunkBytes = grownBytes;
+        continue;
+      }
+
+      // Full: send what fits, then retry this record against an empty chunk.
+      flush();
+      if (overhead + recordBytes <= MAX_BRIDGE_BYTES) {
+        chunk = [record];
+        chunkBytes = recordBytes;
+        continue;
+      }
+
+      diag.postFailed++;
+      recordError('postMessage',
+        'timeline record ' + record.id + ' exceeds the bridge limit on its own and was skipped');
+    }
+
+    flush();
+    return posted;
+  }
+
+  function handleTimelineJson(json, requestInfo, httpStatus, capturedVia) {
+    diag.timelineSeen++;
+    if (ownAuthorIds.size === 0) {
+      // Not an error: a fresh install has published nothing here yet, so there
+      // is no way to know which posts in this response are its owner's.
+      if (debugEnabled) warn('timeline seen, but no own author id is known yet — skipping');
+      scheduleDiag();
+      return;
+    }
+    if (json === null || typeof json !== 'object') {
+      diag.responseJsonFailed++;
+      diag.lastError = 'timeline response was not a usable object';
+      diag.lastErrorAt = new Date().toISOString();
+      scheduleDiag();
+      return;
+    }
+
+    let records = [];
+    try {
+      records = buildTimelineRecords(json, requestInfo, httpStatus, capturedVia);
+    } catch (err) {
+      recordError('buildTimelineRecords', err);
+      scheduleDiag();
+      return;
+    }
+
+    // Counted only once a chunk has actually left the page. Incrementing before
+    // the post let the panel claim rows were kept that post() had just refused.
+    diag.timelineKept += postBackfillRecords(records);
+    scheduleDiag();
+  }
+
   async function handleResponse(response, requestInfo, variablesPromise) {
     try {
       if (!response || typeof response !== 'object') return;
@@ -1545,6 +1862,29 @@
       const status = asFiniteNumber(response.status);
       if (status === null || status < 200 || status > 299) return;
       if (response.ok !== true) return;
+
+      // A profile timeline is a query, not a publish. It is read for posts that
+      // were made elsewhere and is never treated as one that just happened.
+      if (requestInfo.isTimeline === true) {
+        let timelineClone;
+        try {
+          timelineClone = response.clone();
+        } catch (err) {
+          diag.responseCloneFailed++;
+          recordError('response.clone (timeline)', err);
+          return;
+        }
+        let timelineJson = null;
+        try {
+          timelineJson = await timelineClone.json();
+        } catch (err) {
+          diag.responseJsonFailed++;
+          recordError('clone.json (timeline)', err);
+          return;
+        }
+        handleTimelineJson(timelineJson, requestInfo, status, 'fetch');
+        return;
+      }
 
       // A delete marks an existing record instead of writing a new one.
       // (deleteSeen was already counted when the request went out.)
@@ -1623,6 +1963,7 @@
       }
 
       diag.parsed++;
+      noteOwnAuthor(record);
       if (post('X_TWEET_CAPTURED', record)) diag.posted++;
       scheduleDiag();
     } catch (err) {
@@ -1715,6 +2056,11 @@
       const status = asFiniteNumber(xhr.status);
       if (status === null || status < 200 || status > 299) return;
 
+      if (info.isTimeline === true) {
+        handleTimelineJson(readXhrResponseJson(xhr), info, status, 'xhr');
+        return;
+      }
+
       // A delete marks an existing record instead of writing a new one.
       // (deleteSeen was already counted when the request went out.)
       if (info.isDelete === true) {
@@ -1771,6 +2117,7 @@
       }
 
       diag.parsed++;
+      noteOwnAuthor(record);
       if (post('X_TWEET_CAPTURED', record)) diag.posted++;
       scheduleDiag();
     } catch (err) {
@@ -1790,7 +2137,29 @@
       const originalOpen = proto.open;
       const originalSend = proto.send;
 
+      /**
+       * True only for a real XMLHttpRequest.
+       *
+       * These methods live on the prototype, so a page can call them with ANY
+       * receiver. A plain object carrying its own status/responseText/
+       * addEventListener used to be good enough to get an entry written into
+       * xhrInfoMap and a listener attached to it — and the page could then fire
+       * that listener itself, feeding a fabricated response straight into the
+       * pipeline with no bridge message involved. The prototype check keeps
+       * every legitimate receiver (including a page that subclasses XHR) and
+       * rejects everything else before anything is written.
+       */
+      function isGenuineXhr(receiver) {
+        try {
+          return typeof window.XMLHttpRequest === 'function' &&
+                 receiver instanceof window.XMLHttpRequest;
+        } catch (_) {
+          return false;
+        }
+      }
+
       const hookedOpen = function open(method, url) {
+        if (!isGenuineXhr(this)) return Reflect.apply(originalOpen, this, arguments);
         try {
           const absolute = resolveUrl(url);
           const analysis = absolute === null ? null : analyzeRequestUrl(absolute, method);
@@ -1800,7 +2169,8 @@
               url: absolute,
               queryId: analysis.queryId,
               operationName: analysis.operationName,
-              isDelete: analysis.isDelete
+              isDelete: analysis.isDelete,
+              isTimeline: analysis.isTimeline
             });
           } else {
             // The same XHR object can be reused via open(); never let stale
@@ -1814,10 +2184,14 @@
       };
 
       const hookedSend = function send(body) {
+        // Same check as open(): a receiver that never went through open() has no
+        // entry to read, but it must not get a listener attached to it either.
+        if (!isGenuineXhr(this)) return Reflect.apply(originalSend, this, arguments);
         try {
           const info = xhrInfoMap.get(this);
           if (info !== undefined) {
             if (info.isDelete === true) diag.deleteSeen++;
+            else if (info.isTimeline === true) { /* counted when the body arrives */ }
             else diag.createTweetSeen++;
             // The body is handed to us as-is; we only read it when it is a
             // string, and we never modify or replace it.
@@ -1899,6 +2273,9 @@
         try {
           if (requestInfo !== null && requestInfo.isCreateTweet) {
             if (requestInfo.isDelete === true) diag.deleteSeen++;
+            // A timeline GET is a query, not a publish — it is counted when the
+            // body arrives (handleTimelineJson), exactly as on the XHR path.
+            else if (requestInfo.isTimeline === true) { /* counted when the body arrives */ }
             else diag.createTweetSeen++;
             observeResponse(originalPromise, requestInfo);
             scheduleDiag();

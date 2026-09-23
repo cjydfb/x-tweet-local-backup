@@ -320,10 +320,10 @@ function glyphDownloadPlain(cv) {
 }
 
 const CANDIDATES = [
-  { key: 'solid-hollow',      label: '实心竖 + 空心横（照你给的比例）', paint: glyphSolidHollowFaithful },
-  { key: 'solid-hollow-tuned', label: '实心竖 + 空心横（加粗到 16px 可用）', paint: glyphSolidHollowTuned },
-  { key: 'plus-bars',         label: '两笔各自描边（细）', paint: glyphPlusBars },
-  { key: 'arrow-tray',        label: '向下箭头 + 托盘',    paint: glyphDownloadPlain }
+  { key: 'plus-join-bold',    label: '镂空加号 · 中心相连（最早那版）', paint: glyphPlusConnectedBold },
+  { key: 'plus-bars-bold',    label: '两笔各自描边 · 加粗',            paint: glyphPlusBarsBold },
+  { key: 'solid-hollow',      label: '实心竖 + 空心横（现在这版）',     paint: glyphSolidHollowFaithful },
+  { key: 'arrow-tray',        label: '向下箭头 + 托盘',                paint: glyphDownloadPlain }
 ];
 
 /* ------------------------------------------------------------- rendering --- */

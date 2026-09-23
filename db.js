@@ -12,7 +12,7 @@ export const DB_NAME = 'xTweetBackup';
 // Bumped only when the OBJECT STORES or INDEXES change; additive record fields
 // do not need a migration.
 //   v2 added the `deletions` store (see below).
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 // Version of the RECORD/export shape. v2 added `lang` and `entities`
 // (link expansions, hashtags, mentions). Records captured under v1 simply have
 // no such fields — the shape is additive, so readers must tolerate their
@@ -40,7 +40,49 @@ export const INDEX_CREATED_AT = 'createdAt';
 export const INDEX_AUTHOR = 'authorScreenName';
 export const INDEX_MEDIA_TWEET = 'tweetId';
 
+/**
+ * The list is ordered by publish time, and paginated with a cursor over this
+ * compound index rather than over `createdAt` alone.
+ *
+ * X reports `created_at` to the second, so two posts made in the same second
+ * share a timestamp. Paging with an exclusive upper bound on `createdAt` would
+ * silently skip the second of the pair — the record would still be in the
+ * database and in every export, but it would never appear in the list, which is
+ * exactly the kind of invisible loss this archive exists to prevent. Adding the
+ * tweet id makes every cursor position unique.
+ */
+export const INDEX_CREATED_AT_ID = 'createdAtId';
+
 let dbPromise = null;
+
+/**
+ * Deadline for a single open attempt.
+ *
+ * Opening a local database is a millisecond-scale operation; the only thing
+ * that makes it take seconds is `onblocked`, where a connection holding an
+ * older version — a tab or popup left open across an extension update — has to
+ * close before the upgrade can run, and may never do so.
+ *
+ * Ten seconds is far longer than any healthy open (the popup's own scan over
+ * twenty thousand records finishes faster) and short enough that the caller
+ * that was waiting still exists to report it. Without a deadline this promise
+ * simply never settles, and a hang is the worst possible failure here: the
+ * service worker never answers the message, the page that sent it waits
+ * forever, and nothing anywhere says why.
+ */
+const OPEN_TIMEOUT_MS = 10000;
+
+/**
+ * The rejection a blocked open produces. Named, so a caller can tell "the
+ * database is blocked by another connection" apart from "the open failed" —
+ * the two want different advice and the message has to carry that.
+ */
+function openTimeoutError() {
+  const err = new Error('IndexedDB open timed out after ' + OPEN_TIMEOUT_MS +
+    ' ms; another tab or popup is holding an older version open');
+  err.name = 'OpenTimeoutError';
+  return err;
+}
 
 /* -------------------------------------------------------------------------- */
 /* Open / migrate                                                             */
@@ -50,13 +92,29 @@ export function openDB() {
   if (dbPromise !== null) return dbPromise;
 
   dbPromise = new Promise((resolve, reject) => {
+    let settled = false;
+    let timer = null;
+
+    // One gate for every way this promise can finish. An open that is blocked
+    // can still fire onsuccess later, once the blocking connection goes away;
+    // without this the timeout would reject and the late success would then try
+    // to resolve the same promise a second time.
+    const settle = (finish, value) => {
+      if (settled) return;
+      settled = true;
+      if (timer !== null) clearTimeout(timer);
+      finish(value);
+    };
+
     let request;
     try {
       request = indexedDB.open(DB_NAME, DB_VERSION);
     } catch (err) {
-      reject(err);
+      settle(reject, err);
       return;
     }
+
+    timer = setTimeout(() => settle(reject, openTimeoutError()), OPEN_TIMEOUT_MS);
 
     request.onupgradeneeded = (event) => {
       const db = request.result;
@@ -84,28 +142,60 @@ export function openDB() {
         }
       }
 
-      // Future migrations go here as `if (oldVersion < 3) { ... }`.
+      // v2 -> v3: the list is ordered by publish time instead of capture time.
+      //
+      // Capture order was fine while every record was written at the moment it
+      // was posted. It stops being fine the moment a row can be recovered later
+      // by a profile sweep: twenty posts from the last two days would all carry
+      // the same capture timestamp and would pile up at the top of the list in
+      // an order that has nothing to do with when they were written.
+      //
+      // Creating an index on an existing store is additive — IndexedDB fills it
+      // in from the records already there — so this cannot lose anything.
+      if (oldVersion < 3) {
+        if (db.objectStoreNames.contains(STORE_TWEETS)) {
+          const stores = request.transaction.objectStore(STORE_TWEETS);
+          if (!stores.indexNames.contains(INDEX_CREATED_AT_ID)) {
+            stores.createIndex(INDEX_CREATED_AT_ID, ['createdAt', 'id'], { unique: true });
+          }
+        }
+      }
     };
 
     request.onsuccess = () => {
       const db = request.result;
+      // The deadline may already have passed. That connection is still a real
+      // one, and leaving it open would be the very thing blocking the next
+      // attempt, so it is closed before its result is thrown away.
+      if (settled) {
+        try {
+          db.close();
+        } catch (_) { /* ignore */ }
+        return;
+      }
       db.onversionchange = () => {
         try {
           db.close();
         } catch (_) { /* ignore */ }
       };
-      resolve(db);
+      settle(resolve, db);
     };
 
     request.onerror = () => {
-      reject(request.error || new Error('IndexedDB open failed'));
+      settle(reject, request.error || new Error('IndexedDB open failed'));
     };
 
     request.onblocked = () => {
-      // Another tab/popup holds an old version open. The promise stays pending
-      // on purpose; the caller-side timeout decides what to do.
+      // Another tab/popup holds an old version open. Nothing further happens
+      // here until that connection closes, which may be never — so the deadline
+      // above is what turns this into a reported failure rather than a message
+      // that never gets an answer.
     };
   }).catch((err) => {
+    // A rejection must not stay memoized. dbPromise is the module's only copy
+    // of "an open is in flight", and leaving a failed one there would answer
+    // every later call with the first failure forever — including the retry
+    // that the blocking connection finally going away should allow.
     dbPromise = null;
     throw err;
   });
@@ -157,6 +247,72 @@ function transactionDone(tx) {
  *
  * Resolves with { existed, record }.
  */
+/**
+ * Insert a record recovered from a profile timeline sweep, WITHOUT touching one
+ * that is already archived.
+ *
+ * A publish-time capture is the better record: it has the request body, the
+ * poll card, the edit chain and the full media entities as they stood when the
+ * post was made. A timeline record is a later, thinner view of the same tweet —
+ * its `entities` may be missing keys entirely, and it is only visible to the
+ * extent the profile page happened to page back.
+ *
+ * So an id that already exists is left exactly as it is. Overwriting it would
+ * trade good data for worse, which is the one outcome a backup must never
+ * produce. Returns how many rows were actually new.
+ */
+export function upsertBackfill(db, record) {
+  return new Promise((resolve, reject) => {
+    let tx;
+    try {
+      tx = db.transaction(STORE_TWEETS, 'readwrite');
+    } catch (err) {
+      reject(err);
+      return;
+    }
+
+    const store = tx.objectStore(STORE_TWEETS);
+    let existed = false;
+    let failure = null;
+
+    const done = transactionDone(tx);
+    done.then(
+      () => {
+        if (failure !== null) reject(failure);
+        else resolve({ existed: existed });
+      },
+      (err) => {
+        if (failure !== null) reject(failure);
+        else reject(err);
+      }
+    );
+
+    try {
+      const getRequest = store.get(record.id);
+      getRequest.onsuccess = () => {
+        const previous = getRequest.result;
+        if (previous && typeof previous === 'object') {
+          existed = true;
+          return; /* already archived from the publish path: leave it alone */
+        }
+        try {
+          store.put(record);
+        } catch (err) {
+          failure = err;
+          try {
+            tx.abort();
+          } catch (_) { /* ignore */ }
+        }
+      };
+    } catch (err) {
+      failure = err;
+      try {
+        tx.abort();
+      } catch (_) { /* ignore */ }
+    }
+  });
+}
+
 export function upsertTweet(db, record) {
   return new Promise((resolve, reject) => {
     let tx;
@@ -195,6 +351,20 @@ export function upsertTweet(db, record) {
             firstCapturedAt: previous.firstCapturedAt || previous.capturedAt || record.capturedAt,
             updatedAt: record.capturedAt
           });
+
+          // `record` came out of sanitizeRecord, which rebuilds from a whitelist
+          // of fields that a capture can carry. The two marks below are NOT part
+          // of a capture — markSuperseded and markDeleted add them afterwards, to
+          // a row that is already stored. Copying the fresh record over the old
+          // one would therefore erase them, and an erased deletion mark makes the
+          // row quietly leave the cleanup panel even though nothing was restored.
+          // They are archive history, not capture data, so they survive.
+          if (typeof previous.supersededBy === 'string' && previous.supersededBy.length > 0) {
+            merged.supersededBy = previous.supersededBy;
+          }
+          if (typeof previous.deletedAt === 'string' && previous.deletedAt.length > 0) {
+            merged.deletedAt = previous.deletedAt;
+          }
         }
         try {
           store.put(merged);
@@ -441,7 +611,12 @@ export function clearAll(db) {
   return new Promise((resolve, reject) => {
     let tx;
     try {
-      tx = db.transaction([STORE_TWEETS, STORE_MEDIA], 'readwrite');
+      // Every store that gets cleared must be named in the scope. Asking a
+      // transaction for a store it was not opened over throws NotFoundError,
+      // and the abort discards the clears already queued on it — so listing one
+      // too few here does not partially clear, it clears nothing at all and
+      // reports failure.
+      tx = db.transaction([STORE_TWEETS, STORE_MEDIA, STORE_DELETIONS], 'readwrite');
     } catch (err) {
       reject(err);
       return;
@@ -525,16 +700,28 @@ function recordMatches(record, term) {
  * popup; if the budget runs out before the page is full, the caller gets
  * hasMore: true plus a resume key and simply asks for the next batch.
  *
- * Pagination uses an exclusive upper bound on the capturedAt index. Two tweets
- * captured within the same millisecond could theoretically be skipped; a human
- * publishing tweets cannot realistically hit that.
+ * Pagination walks the [createdAt, id] index, newest first, using an exclusive
+ * upper bound. This is the whole reason the list is ordered by publish time
+ * rather than capture time: a row recovered by a profile sweep was captured
+ * today but written days ago, and ordering by capture time would pile every
+ * swept row at the top in an order unrelated to when it was written.
+ *
+ * The id is part of the key because `created_at` only resolves to the second —
+ * two posts made in the same second would otherwise share a cursor position and
+ * the exclusive bound would skip one of them.
  */
 export function queryTweets(db, options) {
   const opts = options || {};
   const term = typeof opts.query === 'string' ? opts.query.trim().toLowerCase() : '';
   const pageSize = Number.isInteger(opts.pageSize) && opts.pageSize > 0 ? opts.pageSize : 30;
   const scanBudget = Number.isInteger(opts.scanBudget) && opts.scanBudget > 0 ? opts.scanBudget : 20000;
-  const afterKey = typeof opts.afterKey === 'string' && opts.afterKey.length > 0 ? opts.afterKey : null;
+
+  // A resume key is [createdAt, id]. An array coming back from IndexedDB is a
+  // fresh object each time, so callers must compare it by value, not identity.
+  let afterKey = null;
+  if (Array.isArray(opts.afterKey) && opts.afterKey.length === 2) {
+    afterKey = [String(opts.afterKey[0]), String(opts.afterKey[1])];
+  }
 
   return new Promise((resolve, reject) => {
     let tx;
@@ -546,7 +733,7 @@ export function queryTweets(db, options) {
     }
 
     const store = tx.objectStore(STORE_TWEETS);
-    const index = store.index(INDEX_CAPTURED_AT);
+    const index = store.index(INDEX_CREATED_AT_ID);
 
     let range = null;
     if (afterKey !== null) {
@@ -632,6 +819,20 @@ export function queryTweets(db, options) {
  * between batches so the popup stays responsive and so a large export does not
  * build one enormous array of objects.
  */
+/**
+ * Value comparison for a [createdAt, id] resume key (arrays never compare ===).
+ * Exported so the popup's paging loop uses THIS rule rather than a copy of it.
+ */
+export function sameKey(a, b) {
+  if (a === b) return true;
+  if (!Array.isArray(a) || !Array.isArray(b)) return false;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
 export async function forEachTweet(db, onRecord, options) {
   const opts = options || {};
   const batchSize = Number.isInteger(opts.batchSize) && opts.batchSize > 0 ? opts.batchSize : 500;
@@ -650,7 +851,10 @@ export async function forEachTweet(db, onRecord, options) {
     }
 
     if (!page.hasMore) return;
-    if (page.nextKey === null || page.nextKey === afterKey) return;
+    // The resume key is [createdAt, id]. IndexedDB hands back a fresh array each
+    // time and queryTweets re-wraps it, so `===` would never be true and this
+    // guard would never fire. Compare by value.
+    if (page.nextKey === null || sameKey(page.nextKey, afterKey)) return;
     afterKey = page.nextKey;
 
     // Yield: keeps the popup's UI thread breathing during big exports.

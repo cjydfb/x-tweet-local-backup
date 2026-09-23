@@ -205,6 +205,7 @@ export function buildMediaIndexJson(rows, meta) {
   const info = meta || {};
   return JSON.stringify({
     generator: 'x-tweet-backup',
+    generatorVersion: typeof info.version === 'string' && info.version.length > 0 ? info.version : 'unknown',
     schemaVersion: info.schemaVersion === undefined ? 1 : info.schemaVersion,
     generatedAt: info.generatedAt || new Date().toISOString(),
     note: 'Join against tweets.json: files[].tweetId === tweet.id and files[].mediaId === tweet.media[].id',
