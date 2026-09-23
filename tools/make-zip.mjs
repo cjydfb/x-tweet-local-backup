@@ -45,25 +45,68 @@ function crc32(buf) {
 
 /* ------------------------------------------------------------ what goes in */
 
-// Development-only. `tools/` holds this file and the icon generator; `reader/`
-// is the standalone archive reader, which is a separate product that ships as a
-// single HTML file — it must never end up inside the extension package. `.git*`
-// and archives are repository furniture.
+// Development-only. `tools/` holds this file, the icon generator and the
+// reader's tests; `reader/` is the standalone archive reader, a separate product
+// that ships as a single HTML file and must never end up inside the extension
+// package. `.git*` and archives are repository furniture.
 const SKIP_DIRS = new Set(['.git', 'tools', 'reader', 'node_modules']);
 const SKIP_FILES = new Set(['.gitignore', '.gitattributes', '.DS_Store', 'Thumbs.db', 'desktop.ini']);
 const SKIP_EXT = new Set(['.zip', '.crx', '.log']);
 
-function collect(dir, prefix, out) {
+// What the extension actually is. The package is built from this list rather
+// than from "everything not obviously development-only", because a blocklist
+// ships a directory nobody meant to include and an allowlist cannot. Both times
+// this has gone wrong were blocklist failures, and neither name looked wrong:
+// a literal `%TEMP%` directory left by an unexpanded shell variable rode along
+// in a real package, and `extracted/` — the scratch directory tools/test-zip.mjs
+// creates when it is pointed at the repository root — was picked up on the way
+// into 1.3.6, with a test export's media files inside it.
+const SHIPPED_TOP = new Set([
+  '_locales',
+  'icons',
+  'manifest.json',
+  'background.js',
+  'content.js',
+  'db.js',
+  'inject.js',
+  'media-cache.js',
+  'settings.js',
+  'zip.js',
+  'popup.html',
+  'popup.css',
+  'popup.js',
+  'privacy-policy.md',
+  'README.md'
+]);
+
+/**
+ * Refuse to build rather than guess.
+ *
+ * Skipping an entry that was added to the repository but not to either list
+ * would ship an extension missing a file it refers to — a package that installs
+ * and then breaks. Stopping with the name of the offender costs one command.
+ */
+function unknownTopLevel(name) {
+  return new Error(
+    'unrecognised entry at the repository root: "' + name + '"\n' +
+    '  If it belongs in the package, add it to SHIPPED_TOP in tools/make-zip.mjs.\n' +
+    '  If it does not, delete it, or add it to SKIP_DIRS / SKIP_FILES.'
+  );
+}
+
+function collect(dir, prefix, out, topLevel) {
   const entries = fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => (a.name < b.name ? -1 : 1));
   for (const entry of entries) {
     const abs = path.join(dir, entry.name);
     const rel = prefix === '' ? entry.name : prefix + '/' + entry.name;
     if (entry.isDirectory()) {
       if (SKIP_DIRS.has(entry.name)) continue;
-      collect(abs, rel, out);
+      if (topLevel && !SHIPPED_TOP.has(entry.name)) throw unknownTopLevel(entry.name);
+      collect(abs, rel, out, false);
     } else if (entry.isFile()) {
       if (SKIP_FILES.has(entry.name)) continue;
       if (SKIP_EXT.has(path.extname(entry.name).toLowerCase())) continue;
+      if (topLevel && !SHIPPED_TOP.has(entry.name)) throw unknownTopLevel(entry.name);
       out.push({ abs, rel, mtime: fs.statSync(abs).mtime });
     }
   }
@@ -206,7 +249,12 @@ if (typeof version !== 'string' || version.length === 0) {
 const outPath = process.argv[2] || path.join(REPO, '..', 'x-tweet-backup-' + version + '.zip');
 
 const files = [];
-collect(REPO, '', files);
+try {
+  collect(REPO, '', files, true);
+} catch (err) {
+  console.error('FAILED: ' + err.message);
+  process.exit(1);
+}
 if (files.length === 0) {
   console.error('nothing to package');
   process.exit(1);
