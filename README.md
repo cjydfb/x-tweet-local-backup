@@ -26,7 +26,9 @@
 
 ## 安装
 
-**从商店安装** —— 上架审核中，通过后这里会更新成商店链接。
+**从商店安装（推荐）** —— [Edge Add-ons](https://microsoftedge.microsoft.com/addons/detail/x-tweet-local-backup/cgomddpedljmgbdcmiiemiaanejaaohe)
+
+> 商店会自动更新到最新版。新功能通常先在这个仓库里，过审后才到商店。
 
 **手动安装：**
 
