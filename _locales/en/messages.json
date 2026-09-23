@@ -1,6 +1,6 @@
 {
   "appName": { "message": "X Tweet Local Backup" },
-  "appDesc": { "message": "Backs up your own X posts, replies and quotes to local storage as you publish them. No automation, no uploads." },
+  "appDesc": { "message": "Backs up your own X posts, replies and quotes to local storage as you publish them." },
 
   "refresh": { "message": "Refresh" },
   "summaryAria": { "message": "Overview" },

@@ -1,6 +1,6 @@
 {
   "appName": { "message": "X Tweet Local Backup" },
-  "appDesc": { "message": "发布推文时把你自己的帖子、回复和引用自动备份到本地。无自动化操作，不上传任何数据。" },
+  "appDesc": { "message": "发布推文时把你自己的帖子、回复和引用自动备份到本地。" },
 
   "refresh": { "message": "刷新" },
   "summaryAria": { "message": "概览" },
