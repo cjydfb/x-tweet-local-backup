@@ -846,13 +846,16 @@ function renderCard(record) {
       anchor.target = '_blank';
       anchor.rel = 'noopener noreferrer';
       anchor.title = t('linkTargetTitle', [link.href]);
-      // X's own display form when it exists, otherwise the host — a raw URL can
-      // be long enough to wreck the card layout.
-      let display = typeof link.display === 'string' && link.display.length > 0 ? link.display : null;
-      if (display === null) {
-        try { display = new URL(link.href).hostname; } catch (_) { display = link.href; }
-      }
-      anchor.textContent = display;
+      // The full destination, not X's display form.
+      //
+      // The display form is truncated with an ellipsis — `github.com/cjydfb/x-tweet…`
+      // — which hides exactly the part this line exists to preserve. The whole
+      // reason the resolved address is stored separately is that the t.co
+      // shortlink in the body stops working once the post ages; printing a
+      // shortened version of the real address puts the unreadable part back.
+      // `.card__link` already wraps anywhere, so a long URL makes the card
+      // taller rather than widening it.
+      anchor.textContent = link.href;
       linksEl.appendChild(anchor);
     }
     if (resolvableLinks.length > shown) {
