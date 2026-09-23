@@ -714,27 +714,29 @@ body {
    So the budget is subtracted instead: 100vh, less the chrome around this box
    (header, summary, toolbar, button row, this box's own summary — about 320px
    once every label and button has its real text) and less the 150px the list is
-   guaranteed. 620 is that sum plus deliberate slack, because the chrome grows
-   with the label text and a budget that came out exactly even would put the list
-   on its floor instead of above it.
+   guaranteed. 620 is that sum plus deliberate slack.
 
-   Which of the three numbers actually binds depends on the window, and the two
-   extremes were measured rather than reasoned about:
+   Which of the three numbers binds depends on the window. Both extremes were
+   measured in a browser rather than reasoned about, against the real stylesheet
+   and the real locale file — an earlier harness of mine left the locale text
+   empty, so the labels and the four notes had no height at all and every list
+   figure came out 30-160px too generous:
 
-     440x600 toolbar popup — the subtraction comes out negative, so the 88px
-     floor binds. The settings scroll in an 88px box and the list keeps the rest:
-     261px in the harness, about 195px once the real labels and button text are
-     in place. It was 60px before.
+     440x600 toolbar popup — the subtraction comes out negative, so the 130px
+     floor binds. 130 is not arbitrary: a toggle row is 26px, so the box shows
+     exactly the five switches with nothing sliced in half at the edge. The list
+     keeps 186px, against 228px when this floor was 88px and 60px in 1.3.5.
 
-     412x915 phone page — the subtraction binds at 295px, so the settings box is
-     nearly four times the popup's, and the list still keeps 491px. Collapsed, it
-     keeps 670px; the 600px popup ceiling used to hold it to about 355px.
+     412x915 phone page — the subtraction binds at 295px, which holds all five
+     switches plus the button under them, and the list keeps 336px. Collapsed it
+     keeps 637px; the old 600px popup ceiling held it to 325px whatever the
+     screen was, and cut 104px off the bottom of the settings while doing it.
 
-   88px is the lower bound so the box stays usable on a viewport too short for
-   the arithmetic to leave anything at all; 300px is the upper, so a tall window
-   does not hand the settings more room than the list they were opened over. */
+   130px is the lower bound so the box is never a keyhole; 300px is the upper, so
+   a tall window does not hand the settings more room than the list they were
+   opened over. */
 .settings__body {
-  max-height: max(88px, min(calc(100vh - 620px), 300px));
+  max-height: max(130px, min(calc(100vh - 620px), 300px));
   overflow-y: auto;
   overscroll-behavior: contain;
 }
