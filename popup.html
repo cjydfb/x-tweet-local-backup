@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>X Tweet Backup</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<!--
+  Every piece of text here is filled in from _locales/<lang>/messages.json at
+  boot (see applyStaticText in popup.js). Nothing user-authored ever goes
+  through data-i18n-html — those two messages are our own strings, and they are
+  the only place innerHTML is used at all.
+-->
+<body>
+  <div class="app">
+    <header class="header">
+      <div class="header__title">
+        <h1>X Tweet Backup</h1>
+      </div>
+      <button id="btn-refresh" class="icon-button" type="button" data-i18n-title="refresh">↻</button>
+    </header>
+
+    <section class="summary" data-i18n-aria-label="summaryAria">
+      <div class="summary__item">
+        <span class="summary__value" id="stat-count">–</span>
+        <span class="summary__label" data-i18n="statCount"></span>
+      </div>
+      <div class="summary__item">
+        <span class="summary__value" id="stat-usage">–</span>
+        <span class="summary__label" data-i18n="statUsage"></span>
+      </div>
+      <div class="summary__item">
+        <span class="summary__value" id="stat-media">–</span>
+        <span class="summary__label" data-i18n="statMedia"></span>
+      </div>
+      <div class="summary__item">
+        <span class="summary__value" id="stat-last">–</span>
+        <span class="summary__label" data-i18n="statLast"></span>
+      </div>
+    </section>
+
+    <section class="toolbar">
+      <input id="search" class="search" type="search" data-i18n-placeholder="searchPlaceholder" autocomplete="off" spellcheck="false">
+      <button id="btn-export" class="button button--primary" type="button" data-i18n="exportJson"></button>
+    </section>
+
+    <p id="notice" class="notice" role="status" aria-live="polite"></p>
+
+    <main id="list" class="list" data-i18n-aria-label="listAria"></main>
+
+    <div class="list-footer">
+      <button id="btn-more" class="button button--wide" type="button" data-i18n="loadMore" hidden></button>
+      <p id="list-hint" class="list-hint"></p>
+    </div>
+
+    <details class="diagnostics" id="diagnostics" hidden>
+      <summary data-i18n="diagnosticsSummary"></summary>
+      <dl class="diagnostics__grid" id="diagnostics-grid"></dl>
+      <button id="btn-reset-stats" class="button button--small" type="button" data-i18n="resetCounts"></button>
+    </details>
+
+    <footer class="footer">
+      <label class="toggle">
+        <input type="checkbox" id="opt-debug">
+        <span data-i18n="optDebug"></span>
+      </label>
+      <label class="toggle">
+        <input type="checkbox" id="opt-thumbs">
+        <span data-i18n="optThumbs"></span>
+      </label>
+      <label class="toggle">
+        <input type="checkbox" id="opt-media">
+        <span data-i18n="optMedia"></span>
+      </label>
+      <details class="cleanup" id="cleanup">
+        <summary data-i18n="cleanupSummary"></summary>
+        <p class="cleanup__note" data-i18n="cleanupNote"></p>
+        <div class="cleanup__row">
+          <span class="cleanup__label"><span data-i18n="cleanupSuperseded"></span><span class="cleanup__count" id="cleanup-superseded-count">–</span></span>
+          <button id="btn-purge-superseded" class="button button--danger button--small" type="button" data-i18n="delete" disabled></button>
+        </div>
+        <div class="cleanup__row">
+          <span class="cleanup__label"><span data-i18n="cleanupDeleted"></span><span class="cleanup__count" id="cleanup-deleted-count">–</span></span>
+          <button id="btn-purge-deleted" class="button button--danger button--small" type="button" data-i18n="delete" disabled></button>
+        </div>
+      </details>
+
+      <div class="footer__actions">
+        <button id="btn-tab" class="button button--small" type="button" data-i18n="openInTab"></button>
+        <button id="btn-media" class="button button--small" type="button" data-i18n="exportArchive" data-i18n-title="exportArchiveTitle"></button>
+        <button id="btn-clear" class="button button--danger button--small" type="button" data-i18n="clearAll"></button>
+      </div>
+      <p class="footer__note footer__note--warning" data-i18n-html="warnReload"></p>
+      <p class="footer__note" data-i18n="noteStorage"></p>
+      <p class="footer__note" data-i18n-html="noteSnapshot"></p>
+    </footer>
+  </div>
+
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

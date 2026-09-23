@@ -1,0 +1,793 @@
+/* ============================================================================
+ * popup.css — compact, readable, light/dark aware. No external assets.
+ * ========================================================================== */
+
+:root {
+  --bg: #ffffff;
+  --bg-soft: #f5f7f9;
+  --bg-raised: #ffffff;
+  --border: #e3e7ec;
+  --text: #14181f;
+  --text-soft: #5b6572;
+  --text-faint: #8b95a3;
+  --accent: #1d7fe0;
+  --accent-text: #ffffff;
+  --danger: #d13b3b;
+  --ok: #1f9254;
+  --warn: #b3761a;
+  --radius: 10px;
+  --shadow: 0 1px 2px rgba(16, 24, 40, 0.06), 0 1px 3px rgba(16, 24, 40, 0.04);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14171c;
+    --bg-soft: #1b1f26;
+    --bg-raised: #1e232b;
+    --border: #2c333d;
+    --text: #e8ecf1;
+    --text-soft: #a4aebc;
+    --text-faint: #79838f;
+    --accent: #4a9ef0;
+    --accent-text: #0d1117;
+    --danger: #e06666;
+    --ok: #4cc38a;
+    --warn: #d8a44a;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  width: 440px;
+  max-height: 600px;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", Roboto, Helvetica, Arial, sans-serif;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  max-height: 600px;
+}
+
+/* ---------------------------------------------------------------- header */
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 12px 14px 8px;
+}
+
+.header__title h1 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 650;
+  letter-spacing: 0.2px;
+}
+
+.icon-button {
+  border: 1px solid var(--border);
+  background: var(--bg-soft);
+  color: var(--text-soft);
+  border-radius: 8px;
+  width: 28px;
+  height: 28px;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  transition: transform 0.15s ease, color 0.15s ease;
+}
+
+.icon-button:hover {
+  color: var(--accent);
+}
+
+.icon-button.is-busy {
+  transform: rotate(180deg);
+}
+
+/* --------------------------------------------------------------- summary */
+
+.summary {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+  padding: 0 14px 10px;
+}
+
+.summary__item {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 7px 8px;
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  min-width: 0;
+}
+
+.summary__value {
+  font-size: 13px;
+  font-weight: 650;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.summary__label {
+  font-size: 10px;
+  color: var(--text-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* --------------------------------------------------------------- toolbar */
+
+.toolbar {
+  display: flex;
+  gap: 8px;
+  padding: 0 14px 8px;
+}
+
+.search {
+  flex: 1;
+  min-width: 0;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-raised);
+  color: var(--text);
+  font-size: 12px;
+  font-family: inherit;
+}
+
+.search:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.button {
+  border: 1px solid var(--border);
+  background: var(--bg-soft);
+  color: var(--text);
+  border-radius: var(--radius);
+  padding: 7px 12px;
+  font-size: 12px;
+  font-family: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: border-color 0.15s ease, opacity 0.15s ease;
+}
+
+.button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.button--primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-text);
+  font-weight: 600;
+}
+
+.button--danger {
+  color: var(--danger);
+  border-color: var(--border);
+}
+
+.button--danger.is-armed {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
+  font-weight: 600;
+}
+
+.button--wide {
+  width: 100%;
+}
+
+.button--small {
+  padding: 5px 9px;
+  font-size: 11px;
+}
+
+/* ---------------------------------------------------------------- notice */
+
+.notice {
+  margin: 0 14px 6px;
+  min-height: 0;
+  font-size: 11px;
+  color: var(--text-soft);
+}
+
+.notice:empty {
+  display: none;
+}
+
+.notice.is-error {
+  color: var(--danger);
+}
+
+.notice.is-ok {
+  color: var(--ok);
+}
+
+/* ------------------------------------------------------------------ list */
+
+.list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 60px;
+}
+
+.card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-raised);
+  padding: 9px 10px;
+  box-shadow: var(--shadow);
+}
+
+.card__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.card__author {
+  font-weight: 650;
+  font-size: 12px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.card__author span {
+  font-weight: 400;
+  color: var(--text-faint);
+  margin-left: 4px;
+}
+
+.card__time {
+  font-size: 10px;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
+.card__text {
+  margin: 0;
+  font-size: 12.5px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 6;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.card__text.is-expanded {
+  -webkit-line-clamp: unset;
+  overflow: visible;
+}
+
+.card__text:empty::after {
+  content: "（无正文，可能是纯媒体推文）";
+  color: var(--text-faint);
+  font-style: italic;
+}
+
+/* A retweet has no text by definition, so it gets its own wording. */
+.card__text--retweet:empty::after {
+  content: "转推，你没有添加文字";
+}
+
+.badge--retweet {
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 40%, var(--border));
+}
+
+.badge--poll {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+}
+
+.badge--edit {
+  color: var(--warn);
+  border-color: color-mix(in srgb, var(--warn) 40%, var(--border));
+}
+
+/* An older version of an edited tweet: present in the archive, but no longer
+   what the timeline shows. Muted rather than alarming — nothing is wrong. */
+.badge--stale {
+  color: var(--text-faint);
+  border-style: dashed;
+}
+
+/* Deleted on X. Marked, not removed: the record is the only remaining copy. */
+.badge--deleted {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 40%, var(--border));
+}
+
+/* ------------------------------------------------------------------- poll */
+
+.card__poll {
+  margin-top: 7px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-soft);
+  padding: 6px 9px;
+}
+
+.card__poll-choices {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+  color: var(--text);
+}
+
+.card__poll-choices li {
+  overflow-wrap: anywhere;
+}
+
+.card__poll-note {
+  margin: 4px 0 0;
+  font-size: 10px;
+  color: var(--text-faint);
+  line-height: 1.5;
+}
+
+.card__expand {
+  border: none;
+  background: none;
+  color: var(--accent);
+  font-size: 11px;
+  padding: 2px 0;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.card__media {
+  display: flex;
+  gap: 4px;
+  margin-top: 6px;
+  flex-wrap: wrap;
+}
+
+.card__thumb {
+  width: 62px;
+  height: 62px;
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+}
+
+.card__thumb img,
+.card__thumb video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.card__thumb video {
+  cursor: pointer;
+  background: #000;
+}
+
+/* A cached video is an MP4, so it needs a <video> element rather than an
+   <img>. The play marker keeps a still first frame from being mistaken for a
+   photo. */
+.card__thumb.is-motion::before {
+  content: "▶";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 20px;
+  height: 20px;
+  line-height: 20px;
+  text-align: center;
+  font-size: 9px;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.55);
+  border-radius: 50%;
+  pointer-events: none;
+}
+
+/* A thumbnail that is loaded over the network is NOT archived media. Without a
+   visible marker the popup looks like it saved the image when it only saved a
+   URL, so each thumbnail states which of the two it is. */
+.card__thumb.is-remote::after,
+.card__thumb.is-cached::after {
+  content: "";
+  position: absolute;
+  right: 3px;
+  bottom: 3px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  box-shadow: 0 0 0 1.5px var(--bg-raised);
+}
+
+.card__thumb.is-remote::after {
+  background: var(--warn);
+}
+
+.card__thumb.is-cached::after {
+  background: var(--ok);
+}
+
+.card__thumb--empty {
+  font-size: 10px;
+  color: var(--text-faint);
+  text-align: center;
+  padding: 2px;
+}
+
+.card__more-media {
+  font-size: 10px;
+  color: var(--text-faint);
+  align-self: center;
+}
+
+.card__badges {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+}
+
+.badge {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 20px;
+  border: 1px solid var(--border);
+  color: var(--text-soft);
+  background: var(--bg-soft);
+}
+
+.badge--reply {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+}
+
+.badge--quote {
+  color: var(--warn);
+  border-color: color-mix(in srgb, var(--warn) 40%, var(--border));
+}
+
+.card__meta {
+  margin-top: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 10px;
+  color: var(--text-faint);
+}
+
+.card__id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.card__actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.link-button {
+  border: none;
+  background: none;
+  color: var(--text-soft);
+  font-size: 10px;
+  cursor: pointer;
+  padding: 1px 2px;
+  text-decoration: none;
+  font-family: inherit;
+}
+
+.link-button:hover {
+  color: var(--accent);
+}
+
+.link-button.is-danger:hover {
+  color: var(--danger);
+}
+
+.empty {
+  text-align: center;
+  color: var(--text-faint);
+  font-size: 12px;
+  padding: 24px 10px;
+  line-height: 1.7;
+}
+
+/* ----------------------------------------------------------- list footer */
+
+.list-footer {
+  padding: 8px 14px 4px;
+}
+
+.list-hint {
+  margin: 6px 0 0;
+  font-size: 10px;
+  color: var(--text-faint);
+  text-align: center;
+  min-height: 12px;
+}
+
+/* ----------------------------------------------------------- diagnostics */
+
+.diagnostics {
+  margin: 6px 14px 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-soft);
+  padding: 6px 9px;
+  font-size: 11px;
+}
+
+.diagnostics summary {
+  cursor: pointer;
+  color: var(--text-soft);
+  font-size: 11px;
+}
+
+.diagnostics__grid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 10px;
+  margin: 8px 0 8px;
+}
+
+.diagnostics__grid dt {
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
+.diagnostics__grid dd {
+  margin: 0;
+  text-align: right;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  overflow-wrap: anywhere;
+}
+
+.diagnostics__grid dd.is-bad {
+  color: var(--danger);
+}
+
+.diagnostics__grid dd.is-good {
+  color: var(--ok);
+}
+
+/* ---------------------------------------------------------------- footer */
+
+.footer {
+  border-top: 1px solid var(--border);
+  padding: 9px 14px 11px;
+  background: var(--bg);
+}
+
+.toggle {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11.5px;
+  color: var(--text-soft);
+  padding: 3px 0;
+  cursor: pointer;
+}
+
+.toggle input {
+  accent-color: var(--accent);
+  margin: 0;
+  cursor: pointer;
+}
+
+/* --------------------------------------------------------------- cleanup */
+
+.cleanup {
+  margin: 8px 0 2px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-soft);
+  padding: 6px 9px;
+  font-size: 11px;
+}
+
+.cleanup summary {
+  cursor: pointer;
+  color: var(--text-soft);
+  font-size: 11px;
+}
+
+.cleanup__note {
+  margin: 7px 0 8px;
+  font-size: 10px;
+  line-height: 1.6;
+  color: var(--text-faint);
+}
+
+.cleanup__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 3px 0;
+}
+
+.cleanup__label {
+  color: var(--text-soft);
+  min-width: 0;
+}
+
+.cleanup__count {
+  margin-left: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--text-faint);
+}
+
+.footer__actions {
+  margin-top: 8px;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.footer__note {
+  margin: 8px 0 0;
+  font-size: 10px;
+  line-height: 1.6;
+  color: var(--text-faint);
+}
+
+.footer__note--warning {
+  color: var(--warn);
+}
+
+.footer__note--warning strong {
+  font-weight: 650;
+}
+
+/* ==========================================================================
+   Wide viewport: the same page opened in a TAB instead of the toolbar popup
+   (chrome-extension://<id>/popup.html). The popup sizing above is deliberately
+   narrow; here the layout becomes a comfortable full-height reading column.
+   ========================================================================== */
+
+@media (min-width: 700px) {
+  html,
+  body {
+    height: 100%;
+  }
+
+  body {
+    width: auto;
+    max-height: none;
+    height: 100%;
+    font-size: 14px;
+  }
+
+  .app {
+    height: 100%;
+    max-height: none;
+    max-width: 880px;
+    margin: 0 auto;
+    border-left: 1px solid var(--border);
+    border-right: 1px solid var(--border);
+  }
+
+  .header {
+    padding: 18px 22px 10px;
+  }
+
+  .header__title h1 {
+    font-size: 17px;
+  }
+
+  .summary {
+    padding: 0 22px 14px;
+    gap: 10px;
+  }
+
+  .summary__value {
+    font-size: 15px;
+  }
+
+  .toolbar {
+    padding: 0 22px 12px;
+  }
+
+  .notice {
+    margin: 0 22px 8px;
+    font-size: 12px;
+  }
+
+  .list {
+    padding: 0 22px;
+    gap: 12px;
+  }
+
+  .list-footer {
+    padding: 10px 22px 6px;
+  }
+
+  .diagnostics {
+    margin: 8px 22px 0;
+    font-size: 12px;
+  }
+
+  .footer {
+    padding: 12px 22px 16px;
+  }
+
+  .footer__note {
+    font-size: 11px;
+  }
+
+  .card {
+    padding: 14px 16px;
+  }
+
+  .card__author {
+    font-size: 13.5px;
+  }
+
+  .card__text {
+    font-size: 14.5px;
+    line-height: 1.7;
+    -webkit-line-clamp: 12;
+  }
+
+  .card__thumb {
+    width: 104px;
+    height: 104px;
+  }
+
+  .card__id {
+    font-size: 11px;
+  }
+}

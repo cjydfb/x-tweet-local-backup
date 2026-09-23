@@ -1,0 +1,13 @@
+# Exported archives contain your own post data. They are personal content and
+# must never be committed — the repo is the extension, not anyone's backup.
+x-tweet-backup-*.json
+*.zip
+
+# Contact sheets produced by tools/make-icons.mjs. The icons that ship are in
+# icons/; these are just the comparison sheets used to pick one.
+tools/icon-candidates*.png
+
+# OS clutter
+Thumbs.db
+desktop.ini
+.DS_Store
