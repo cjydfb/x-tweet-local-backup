@@ -691,6 +691,16 @@ body {
   margin-bottom: 6px;
 }
 
+/* Caps how much of the popup the settings may take, and scrolls the rest
+   inside the box. Without this, opening it grew the popup past its own height
+   and pushed the post list off the bottom — which on a phone meant off the
+   screen entirely. 45vh leaves the majority of a short popup to the list. */
+.settings__body {
+  max-height: 45vh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
 .toggle {
   display: flex;
   align-items: center;

@@ -77,6 +77,13 @@
       <details class="settings" id="settings">
         <summary data-i18n="settingsSummary"></summary>
 
+        <!-- Everything below scrolls inside this box rather than growing the
+             popup. Expanded inline, the settings pushed the list off the bottom
+             of the screen — and on a phone, where the popup is shorter, they
+             swallowed it entirely. The list is the reason the popup is open;
+             settings may scroll, but they do not get to take the whole window. -->
+        <div class="settings__body">
+
         <label class="toggle">
           <input type="checkbox" id="opt-debug">
           <span data-i18n="optDebug"></span>
@@ -130,6 +137,7 @@
         <p class="footer__note" data-i18n="noteStorage"></p>
         <p class="footer__note" data-i18n="noteBackfill"></p>
         <p class="footer__note" data-i18n-html="noteSnapshot"></p>
+        </div>
       </details>
     </footer>
   </div>
