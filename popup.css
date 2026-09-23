@@ -246,13 +246,19 @@ body {
 /* ------------------------------------------------------------------ list */
 
 .list {
-  flex: 1;
+  flex: 1 1 auto;
   overflow-y: auto;
   padding: 0 14px;
   display: flex;
   flex-direction: column;
   gap: 8px;
-  min-height: 60px;
+  /* A floor, not a hint. Every other row in this column is sized by its own
+     content and refuses to shrink, so when the settings below are expanded the
+     missing height can only come out of the list — and the 60px that used to be
+     here let it come out all the way down to one sliced card. This is the
+     smallest the list may ever be; .settings__body is capped so that it never
+     has to go below it. */
+  min-height: 150px;
 }
 
 .card {
@@ -691,12 +697,39 @@ body {
   margin-bottom: 6px;
 }
 
-/* Caps how much of the popup the settings may take, and scrolls the rest
-   inside the box. Without this, opening it grew the popup past its own height
-   and pushed the post list off the bottom — which on a phone meant off the
-   screen entirely. 45vh leaves the majority of a short popup to the list. */
+/* Caps how much of the popup the settings may take, and scrolls the rest inside
+   the box.
+
+   45vh was the number here first and it did not work. A cap on this box alone
+   reserves nothing for the list: the settings summary, the footer button row and
+   the four notes all sit outside it, and not one of them shrinks. 45% of a 600px
+   popup is 270px, and after everything else had taken its share that left the
+   list 60px — the one sliced card this is meant to prevent.
+
+   So the budget is subtracted instead: 100vh, less the chrome around this box
+   (header, summary, toolbar, button row, this box's own summary — about 320px
+   once every label and button has its real text) and less the 150px the list is
+   guaranteed. 620 is that sum plus deliberate slack, because the chrome grows
+   with the label text and a budget that came out exactly even would put the list
+   on its floor instead of above it.
+
+   Which of the three numbers actually binds depends on the window, and the two
+   extremes were measured rather than reasoned about:
+
+     440x600 toolbar popup — the subtraction comes out negative, so the 88px
+     floor binds. The settings scroll in an 88px box and the list keeps the rest:
+     261px in the harness, about 195px once the real labels and button text are
+     in place. It was 60px before.
+
+     412x915 phone page — the subtraction binds at 295px, so the settings box is
+     nearly four times the popup's, and the list still keeps 491px. Collapsed, it
+     keeps 670px; the 600px popup ceiling used to hold it to about 355px.
+
+   88px is the lower bound so the box stays usable on a viewport too short for
+   the arithmetic to leave anything at all; 300px is the upper, so a tall window
+   does not hand the settings more room than the list they were opened over. */
 .settings__body {
-  max-height: 45vh;
+  max-height: max(88px, min(calc(100vh - 620px), 300px));
   overflow-y: auto;
   overscroll-behavior: contain;
 }
@@ -883,12 +916,23 @@ body {
 }
 
 /* ==========================================================================
-   Wide viewport: the same page opened in a TAB instead of the toolbar popup
-   (chrome-extension://<id>/popup.html). The popup sizing above is deliberately
-   narrow; here the layout becomes a comfortable full-height reading column.
+   The same page opened as a real page instead of the toolbar popup:
+   chrome-extension://<id>/popup.html as a desktop tab, or the popup opened from
+   a phone's extension menu.
+
+   The signal is HEIGHT, not width. A Chromium toolbar popup is capped at 600px
+   tall, so a viewport taller than that is not a popup — that holds on a phone as
+   much as on a desktop. Width cannot tell the two apart, and keying off it left
+   a phone tab stuck at the 440x600 popup size: most of the screen wasted, and
+   the list held against the 600px ceiling the popup cap imposes.
+
+   610 rather than 601: a popup cannot reach it, and the ten pixels of margin
+   keep a laptop tab out of the popup branch — a 1366x768 screen leaves about
+   628px of viewport once the browser's own chrome is taken, which is close
+   enough to the cap that the two must not be allowed to meet.
    ========================================================================== */
 
-@media (min-width: 700px) {
+@media (min-height: 610px) {
   html,
   body {
     height: 100%;
@@ -898,12 +942,23 @@ body {
     width: auto;
     max-height: none;
     height: 100%;
-    font-size: 14px;
   }
 
   .app {
     height: 100%;
     max-height: none;
+  }
+}
+
+/* A wide viewport gets the comfortable reading column on top of that. Both
+   conditions, because this part is about line length: a short wide window is
+   still a popup-shaped space and keeps the popup's compact type. */
+@media (min-width: 700px) and (min-height: 610px) {
+  body {
+    font-size: 14px;
+  }
+
+  .app {
     max-width: 880px;
     margin: 0 auto;
     border-left: 1px solid var(--border);

@@ -313,6 +313,26 @@ function hasSaveFilePicker() {
 }
 
 /**
+ * Whether this page is the toolbar popup rather than a page of its own.
+ *
+ * A Chromium popup is capped at 800x600, so a viewport taller than that is not
+ * one — that holds on a phone exactly as it does on a desktop. The old test here
+ * asked only for `innerWidth >= 700` to mean "already a tab", and a phone's tab
+ * is around 400px wide, so the "open in a tab" button stayed on screen and could
+ * not do anything useful: it opened a second copy of a page that was already a
+ * tab, and `window.close()` — refused for a window this script did not open —
+ * left the first copy sitting there.
+ *
+ * The numbers match the media queries in popup.css, and they have to: the layout
+ * and this button are answering the same question, and a window where they
+ * disagree is a window showing the page layout with a button offering to open
+ * the page it is already on.
+ */
+function isToolbarPopup() {
+  return window.innerWidth < 700 && window.innerHeight < 610;
+}
+
+/**
  * Ask the user where the export should go.
  *
  * MUST run before anything is built. Chrome only honours the picker while the
@@ -1989,9 +2009,9 @@ async function init() {
   applyStaticText();
   bindEvents();
 
-  // Already a full-width tab rather than the toolbar popup: the button would
-  // just open a duplicate.
-  if (window.innerWidth >= 700) els.tab.hidden = true;
+  // Already a page rather than the toolbar popup: the button would open a
+  // duplicate of the page it is already on, and could not close this one.
+  if (!isToolbarPopup()) els.tab.hidden = true;
 
   try {
     state.db = await openDB();
