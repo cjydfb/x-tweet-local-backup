@@ -520,11 +520,18 @@ function renderDiagnostics() {
     [t('diagDeleteMarked'), String(page.deleted || 0), ''],
     [t('diagTimelineSeen'), String(page.timelineSeen || 0), ''],
     [t('diagTimelineKept'), String(page.timelineKept || 0), ''],
+    // The same idea one post at a time: a swept record's timeline response
+    // often carries no link targets, and opening the post itself is what fills
+    // them back in.
+    [t('diagDetailSeen'), String(page.detailSeen || 0), ''],
+    [t('diagDetailKept'), String(page.detailKept || 0), ''],
     [t('diagReceived'), String(lifetime.received || 0), ''],
     [t('diagMarkedDeleted'), String(lifetime.deletedMarked || 0), ''],
     [t('diagUnmatchedDelete'), String(lifetime.deletedUnmatched || 0), ''],
     [t('diagBackfilled'), String(lifetime.backfilled || 0), lifetime.backfilled ? 'is-good' : ''],
     [t('diagBackfillSkipped'), String(lifetime.backfillSkipped || 0), ''],
+    [t('diagLinksFilled'), String(lifetime.linksFilled || 0), lifetime.linksFilled ? 'is-good' : ''],
+    [t('diagLinksUnmatched'), String(lifetime.linksUnmatched || 0), ''],
     [t('diagUpsertOk'), String(lifetime.upsertOk || 0), lifetime.upsertOk ? 'is-good' : ''],
     [t('diagUpsertFailed'), String(lifetime.upsertFailed || 0), lifetime.upsertFailed ? 'is-bad' : ''],
     [t('diagRejected'), String(lifetime.rejected || 0), lifetime.rejected ? 'is-bad' : ''],

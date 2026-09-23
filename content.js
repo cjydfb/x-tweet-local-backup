@@ -257,6 +257,39 @@
     return { records: records };
   }
 
+  /** How many link targets one post can have. X's own cap; the page applies it too. */
+  const MAX_LINK_ENTRIES = 64;
+
+  /**
+   * A focal-tweet response carries link targets and nothing else, so it is
+   * validated on its own narrow terms — like a deletion — rather than through
+   * the capture path, which would demand text, author and media it never has.
+   *
+   * All this side checks is that the message could be one: an id, a non-empty
+   * list of entries, and a size that a real response could produce. Every field
+   * inside those entries is rebuilt from a whitelist in background.js, which is
+   * where the real validation lives — this is only the gate that keeps an
+   * obvious forgery from being relayed at all.
+   */
+  function validateLinks(raw) {
+    if (!isObject(raw)) return null;
+    if (!isObject(raw.payload)) return null;
+
+    const payload = raw.payload;
+    if (!isTweetId(payload.id)) return null;
+    if (!Array.isArray(payload.urls)) return null;
+    if (payload.urls.length === 0 || payload.urls.length > MAX_LINK_ENTRIES) return null;
+
+    let serialized;
+    try {
+      serialized = JSON.stringify(payload);
+    } catch (_) {
+      return null;
+    }
+    if (typeof serialized !== 'string' || serialized.length > MAX_INBOUND_BYTES) return null;
+    return payload;
+  }
+
   /**
    * The extension was reloaded or updated while this tab stayed open. Chrome
    * tears down the extension APIs of the already-injected content script, so
@@ -429,6 +462,23 @@
         return;
       }
 
+      if (data.type === 'X_TWEET_LINKS') {
+        // One post's link targets, read from its own page. It can only ever
+        // fill an empty list on a record that is already archived — it creates
+        // nothing and replaces nothing — which is why it needs no setting of
+        // its own (see handleLinks in background.js).
+        const payload = validateLinks(data);
+        if (payload === null) {
+          log('rejected malformed link payload');
+          return;
+        }
+        forwardToBackground({
+          type: 'X_TWEET_LINKS',
+          payload: payload
+        });
+        return;
+      }
+
       if (data.type === 'XTB_DIAG') {
         if (!isObject(data.payload)) return;
         forwardToBackground({
@@ -444,6 +494,8 @@
             deleted: data.payload.deleted,
             timelineSeen: data.payload.timelineSeen,
             timelineKept: data.payload.timelineKept,
+            detailSeen: data.payload.detailSeen,
+            detailKept: data.payload.detailKept,
             requestBodyRead: data.payload.requestBodyRead,
             requestBodyFailed: data.payload.requestBodyFailed,
             responseCloneFailed: data.payload.responseCloneFailed,

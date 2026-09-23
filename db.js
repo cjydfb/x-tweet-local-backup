@@ -385,6 +385,121 @@ export function upsertTweet(db, record) {
 }
 
 /**
+ * Fill in the link targets of a record that is already archived.
+ *
+ * A post recovered by a profile sweep can arrive with no `entities.urls`,
+ * because the sweep response frequently does not carry them: measured over the
+ * real response used to build the sweep, 22 of its 24 tweets had no `urls` at
+ * all and 15 had an `entities` object with no keys in it. The text still holds
+ * the t.co shortlink — nothing rewrites it — but nothing says where it pointed,
+ * and t.co stops resolving once the post ages, so the address is lost for good.
+ * Opening the post's own page makes X fetch the full entity set, and this is
+ * where that lands.
+ *
+ * Three rules, and they are the whole function:
+ *
+ *   - It may only FILL A GAP. A non-empty stored `entities.urls` is never
+ *     replaced, whatever arrives: the publish path captured it from the
+ *     response that created the post, which is the better record, and this path
+ *     exists because the sweep had LESS, never because it has more. Nothing is
+ *     merged into a non-empty list either — same reason, one rule, no exception.
+ *   - It touches nothing else. `capturedAt`, `firstCapturedAt`, `updatedAt` and
+ *     every mark (`deletedAt`, `supersededBy`) are archive history rather than
+ *     capture data, and are left exactly as they are — the same property
+ *     upsertTweet had to be taught, after it erased them once. `entities` is
+ *     rebuilt as a copy, so hashtags and mentions survive untouched too.
+ *   - It never creates a record. A tweet this machine never archived has no row
+ *     to fill; inventing one is what the deletion path also refuses to do, and
+ *     for the same reason — a content-free row in the archive is worse than a
+ *     missing one, because it looks like data.
+ *
+ * Resolves ONCE THE TRANSACTION HAS COMMITTED, with `{ ok: true, updated,
+ * found }`: `updated` says a write happened, `found` says a record was there to
+ * write to. When there is nothing to do — no record, no links to add, or links
+ * already stored — NO WRITE IS ISSUED AT ALL and the row is left byte-identical.
+ */
+export function mergeLinkEntities(db, id, urls) {
+  return new Promise((resolve, reject) => {
+    const nothing = () => resolve({ ok: true, updated: false, found: false });
+
+    // Nothing to fill is not a reason to open a transaction.
+    if (typeof id !== 'string' || id.length === 0) {
+      nothing();
+      return;
+    }
+    if (!Array.isArray(urls) || urls.length === 0) {
+      nothing();
+      return;
+    }
+
+    let tx;
+    try {
+      tx = db.transaction(STORE_TWEETS, 'readwrite');
+    } catch (err) {
+      reject(err);
+      return;
+    }
+
+    const store = tx.objectStore(STORE_TWEETS);
+    let updated = false;
+    let found = false;
+    let failure = null;
+
+    const done = transactionDone(tx);
+    done.then(
+      () => {
+        if (failure !== null) reject(failure);
+        else resolve({ ok: true, updated: updated, found: found });
+      },
+      (err) => {
+        if (failure !== null) reject(failure);
+        else reject(err);
+      }
+    );
+
+    try {
+      const getRequest = store.get(id);
+      getRequest.onsuccess = () => {
+        const record = getRequest.result;
+        if (!record || typeof record !== 'object') return;
+        found = true;
+
+        const current = record.entities;
+        if (current !== undefined && current !== null) {
+          // A container that is not an object is malformed rather than a gap,
+          // and there is no way to fill it without destroying whatever it is.
+          if (typeof current !== 'object' || Array.isArray(current)) return;
+          if (Array.isArray(current.urls) && current.urls.length > 0) {
+            return; // already has its links: this path may only fill a gap
+          }
+        }
+
+        // A MISSING list is materialised as empty, so that a record whose whole
+        // `entities` container was absent — one written under schema v1, which
+        // predates the field — still ends up in the shape every other writer
+        // produces and every reader expects. An existing list, of whatever
+        // shape, is copied through untouched; only `urls` is given a value.
+        const merged = Object.assign({}, current || {});
+        merged.urls = urls;
+        if (merged.hashtags === undefined) merged.hashtags = [];
+        if (merged.mentions === undefined) merged.mentions = [];
+
+        try {
+          store.put(Object.assign({}, record, { entities: merged }));
+          updated = true;
+        } catch (err) {
+          failure = err;
+          try { tx.abort(); } catch (_) { /* ignore */ }
+        }
+      };
+    } catch (err) {
+      failure = err;
+      try { tx.abort(); } catch (_) { /* ignore */ }
+    }
+  });
+}
+
+/**
  * An edit is published as a NEW tweet, so the previous version stays in the
  * archive as its own row. Writing the forward pointer here — rather than
  * deriving it in the UI — is what lets a card say "已有新版本" without scanning

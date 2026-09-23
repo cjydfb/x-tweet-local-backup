@@ -6,7 +6,8 @@
  * answers the popup.
  *
  * Message surface (strict whitelist, nothing else is accepted):
- *   from content.js : X_TWEET_CAPTURE, XTB_DIAG
+ *   from content.js : X_TWEET_CAPTURE, X_TWEET_BACKFILL, X_TWEET_DELETE,
+ *                     X_TWEET_LINKS, XTB_DIAG
  *   from popup      : XTB_GET_STATE, XTB_SET_SETTINGS, XTB_DELETE_TWEET,
  *                     XTB_CLEAR_ALL, XTB_RESET_STATS, XTB_SYNC_MEDIA_PERMISSION
  *
@@ -19,6 +20,7 @@ import {
   openDB,
   upsertTweet,
   upsertBackfill,
+  mergeLinkEntities,
   markSuperseded,
   markDeleted,
   recordDeletion,
@@ -282,6 +284,32 @@ function sanitizeHttpUrl(value) {
 }
 
 /**
+ * Rebuild one `entities.urls` list field by field.
+ *
+ * Shared by the capture sanitizer and the link fill, so that there is exactly
+ * one definition of a stored link entity: a URL whose scheme is not http(s) is
+ * dropped, and an entry left with nothing usable is dropped whole.
+ */
+function sanitizeEntityUrls(rawUrls) {
+  const out = [];
+  if (!Array.isArray(rawUrls)) return out;
+  const limit = Math.min(rawUrls.length, MAX_ENTITY_URLS);
+  for (let i = 0; i < limit; i++) {
+    const item = rawUrls[i];
+    if (!isObject(item)) continue;
+    const url = sanitizeHttpUrl(item.url);
+    const expandedUrl = sanitizeHttpUrl(item.expandedUrl);
+    if (url === null && expandedUrl === null) continue;
+    out.push({
+      url: url,
+      expandedUrl: expandedUrl,
+      displayUrl: asNonEmptyString(item.displayUrl, 500)
+    });
+  }
+  return out;
+}
+
+/**
  * Rebuild the link / hashtag / mention lists field by field. The expanded URL
  * is the whole point: X stores only a t.co shortlink in the text, and that
  * shortlink stops resolving through anyone but X.
@@ -289,22 +317,7 @@ function sanitizeHttpUrl(value) {
 function sanitizeEntities(rawEntities) {
   const src = isObject(rawEntities) ? rawEntities : {};
 
-  const urls = [];
-  if (Array.isArray(src.urls)) {
-    const limit = Math.min(src.urls.length, MAX_ENTITY_URLS);
-    for (let i = 0; i < limit; i++) {
-      const item = src.urls[i];
-      if (!isObject(item)) continue;
-      const url = sanitizeHttpUrl(item.url);
-      const expandedUrl = sanitizeHttpUrl(item.expandedUrl);
-      if (url === null && expandedUrl === null) continue;
-      urls.push({
-        url: url,
-        expandedUrl: expandedUrl,
-        displayUrl: asNonEmptyString(item.displayUrl, 500)
-      });
-    }
-  }
+  const urls = sanitizeEntityUrls(src.urls);
 
   const hashtags = [];
   if (Array.isArray(src.hashtags)) {
@@ -456,6 +469,30 @@ function sanitizeRecord(raw) {
     source: sanitizeSource(raw.source),
     schemaVersion: SCHEMA_VERSION
   };
+}
+
+/**
+ * Rebuild a link-fill payload — an id plus link entities — from a whitelist.
+ *
+ * It deliberately does NOT go through sanitizeRecord. There is no text, author
+ * or media in a focal-tweet message to validate, and accepting a capture-shaped
+ * payload here would invite a forged one to be treated as a capture. Two fields
+ * come out, both already existing concepts; nothing else survives by
+ * construction.
+ *
+ * Returns null when the payload cannot be one, which includes "nothing to add" —
+ * an empty list can only ever make the write path do nothing.
+ */
+function sanitizeLinkFill(raw) {
+  if (!isObject(raw)) return null;
+
+  const id = normalizeId(raw.id);
+  if (id === null) return null;
+
+  const urls = sanitizeEntityUrls(raw.urls);
+  if (urls.length === 0) return null;
+
+  return { id: id, urls: urls };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1084,6 +1121,56 @@ async function handleDeletion(payload) {
   }
 }
 
+/**
+ * Fill in the link targets of a record that is already archived.
+ *
+ * A swept record often has an empty `entities.urls`, so a post whose text holds
+ * a t.co shortlink has no stored record of where that link pointed — and the
+ * shortlink dies long before the archive does. Opening the post's own page
+ * makes X fetch the full entity set, and this reads it back out of a response
+ * that already happened.
+ *
+ * There is no setting for this, unlike backfillMedia and captureReplies, and it
+ * needs none. Those two each add something with a cost: media files to
+ * download, or a large number of conversation rows to store. This path issues
+ * no request of its own, can only ADD a value that is missing, and can replace
+ * none of the values already there — the worst it can do to the archive is
+ * leave it exactly as it was. Nothing is decided by the user here, so there is
+ * no moment at which to ask them.
+ */
+async function handleLinks(payload) {
+  const fill = sanitizeLinkFill(payload);
+  if (fill === null) {
+    await bumpLifetime({ rejected: 1 }, 'rejected a link fill payload that failed validation');
+    return { ok: false, error: 'invalid payload' };
+  }
+
+  let db;
+  try {
+    db = await openDB();
+  } catch (err) {
+    await bumpLifetime({ upsertFailed: 1 }, 'IndexedDB open failed: ' + describe(err));
+    return { ok: false, error: 'database unavailable' };
+  }
+
+  try {
+    const result = await mergeLinkEntities(db, fill.id, fill.urls);
+    // Counted apart from one another, like the two deletion outcomes: a tweet
+    // this machine never archived has nothing to fill, which is normal and not
+    // a failure, while a fill that wrote nothing when a record WAS there would
+    // be worth noticing.
+    await bumpLifetime({
+      linksFilled: result.updated ? 1 : 0,
+      linksUnmatched: result.found ? 0 : 1
+    });
+    log('link targets', fill.id, result.updated ? '(added)' : '(left as it was)');
+    return { ok: true, updated: result.updated };
+  } catch (err) {
+    await bumpLifetime({ upsertFailed: 1 }, 'link fill write failed: ' + describe(err));
+    return { ok: false, error: 'write failed' };
+  }
+}
+
 async function handleMessage(message, sender) {
   if (!isObject(message) || typeof message.type !== 'string') {
     return { ok: false, error: 'malformed message' };
@@ -1111,6 +1198,11 @@ async function handleMessage(message, sender) {
     case 'X_TWEET_DELETE': {
       if (!isTrustedPageSender(sender)) return { ok: false, error: 'untrusted sender' };
       return handleDeletion(message.payload);
+    }
+
+    case 'X_TWEET_LINKS': {
+      if (!isTrustedPageSender(sender)) return { ok: false, error: 'untrusted sender' };
+      return handleLinks(message.payload);
     }
 
     case 'XTB_DIAG': {

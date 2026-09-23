@@ -125,6 +125,26 @@
    */
   const REPLY_TIMELINE_OPERATIONS = ['userrepliestimeline'];
 
+  /* The focal tweet's own page.
+   *
+   * Opening https://x.com/<user>/status/<id> makes X fetch that one post with
+   * its FULL entity set, which is exactly what a swept record is missing:
+   * measured on the real sweep response next to this, 22 of its 24 tweets carry
+   * no `urls` at all and 15 carry an `entities` object with no keys in it. The
+   * post's text keeps the t.co shortlink, but nothing says where that shortlink
+   * pointed — and t.co stops resolving once the post ages, so the address is
+   * gone for good. This reads it back while the page is showing it anyway.
+   *
+   * Same principle as the timeline sweep, and it is safe for the same reason:
+   * the page was making this request on its own, so the extension issues
+   * nothing, adds no traffic and touches no credential.
+   *
+   * `TweetDetail` fires on the same page and carries the same tweet, but also a
+   * whole conversation — `TweetResultByRestId` is one tweet with nothing to
+   * filter, so it is the one read here.
+   */
+  const DETAIL_OPERATIONS = ['tweetresultbyrestid'];
+
   /** Guard against a pathological response; no real timeline page approaches this. */
   const MAX_TIMELINE_NODES = 200000;
   const MAX_TIMELINE_TWEETS = 500;
@@ -146,6 +166,10 @@
     // publish, and folding the two together would report one publish as several.
     timelineSeen: 0,
     timelineKept: 0,
+    // And apart from the timeline pair again: opening one post is not a sweep,
+    // and a detail page reports nothing about the profile it was opened from.
+    detailSeen: 0,
+    detailKept: 0,
     requestBodyRead: 0,
     requestBodyFailed: 0,
     responseCloneFailed: 0,
@@ -198,6 +222,8 @@
       deleted: diag.deleted,
       timelineSeen: diag.timelineSeen,
       timelineKept: diag.timelineKept,
+      detailSeen: diag.detailSeen,
+      detailKept: diag.detailKept,
       requestBodyRead: diag.requestBodyRead,
       requestBodyFailed: diag.requestBodyFailed,
       responseCloneFailed: diag.responseCloneFailed,
@@ -323,7 +349,8 @@
         if (typeof data.captureReplies === 'boolean') captureReplies = data.captureReplies;
         post('XTB_READY', {
           hookInstalled: diag.hookInstalled,
-          operations: ALL_OPERATIONS.concat(TIMELINE_OPERATIONS).concat(REPLY_TIMELINE_OPERATIONS)
+          operations: ALL_OPERATIONS.concat(TIMELINE_OPERATIONS)
+            .concat(REPLY_TIMELINE_OPERATIONS).concat(DETAIL_OPERATIONS)
         });
         flushQueue();
         return;
@@ -493,11 +520,12 @@
     const isReplyTimeline = REPLY_TIMELINE_OPERATIONS.indexOf(lower) !== -1;
     if (isReplyTimeline && !captureReplies) return null;
     const isTimeline = TIMELINE_OPERATIONS.indexOf(lower) !== -1 || isReplyTimeline;
+    const isDetail = DETAIL_OPERATIONS.indexOf(lower) !== -1;
 
     // A publish or a delete is always a POST. Matching those names on a GET
     // would mean the operation is not what we think it is, so they are kept
-    // strictly POST-only; the timeline query is the one GET that is wanted.
-    if (isTimeline) {
+    // strictly POST-only; the two queries are the GETs that are wanted.
+    if (isTimeline || isDetail) {
       if (upperMethod !== 'GET') return null;
     } else if (upperMethod !== 'POST' || ALL_OPERATIONS.indexOf(lower) === -1) {
       return null;
@@ -507,7 +535,8 @@
       queryId: queryId,
       operationName: operationName,
       isDelete: DELETE_OPERATIONS.indexOf(lower) !== -1,
-      isTimeline: isTimeline
+      isTimeline: isTimeline,
+      isDetail: isDetail
     };
   }
 
@@ -526,6 +555,7 @@
     const info = {
       isCreateTweet: false,
       isDelete: false,
+      isDetail: false,
       url: null,
       method: 'GET',
       queryId: null,
@@ -560,6 +590,7 @@
 
       info.isCreateTweet = true;
       info.isDelete = analysis.isDelete === true;
+      info.isDetail = analysis.isDetail === true;
       info.queryId = analysis.queryId;
       info.operationName = analysis.operationName;
 
@@ -989,6 +1020,26 @@
   ];
 
   /**
+   * One entry of an entity container's `urls` list, or null when it carries
+   * nothing usable. The single definition of what a stored link entity looks
+   * like — the focal-tweet reader below builds the same shape through it, so a
+   * record filled from a detail page and one captured at publish time stay
+   * indistinguishable to every reader.
+   */
+  function normalizeEntityUrl(raw) {
+    const item = asObject(raw);
+    if (item === null) return null;
+    const shortUrl = nonEmptyString(item.url);
+    const expandedUrl = nonEmptyString(item.expanded_url);
+    if (shortUrl === null && expandedUrl === null) return null;
+    return {
+      url: shortUrl,
+      expandedUrl: expandedUrl,
+      displayUrl: nonEmptyString(item.display_url)
+    };
+  }
+
+  /**
    * X rewrites every link in the text to a t.co shortlink and puts the real
    * destination only in entities.urls. The shortlink resolves through X's own
    * service, so once it dies the text alone no longer says where it pointed —
@@ -1010,16 +1061,8 @@
     if (rawUrls !== null) {
       const limit = Math.min(rawUrls.length, MAX_ENTITY_URLS);
       for (let i = 0; i < limit; i++) {
-        const item = asObject(rawUrls[i]);
-        if (item === null) continue;
-        const shortUrl = nonEmptyString(item.url);
-        const expandedUrl = nonEmptyString(item.expanded_url);
-        if (shortUrl === null && expandedUrl === null) continue;
-        urls.push({
-          url: shortUrl,
-          expandedUrl: expandedUrl,
-          displayUrl: nonEmptyString(item.display_url)
-        });
+        const entry = normalizeEntityUrl(rawUrls[i]);
+        if (entry !== null) urls.push(entry);
       }
     }
 
@@ -1855,6 +1898,141 @@
     scheduleDiag();
   }
 
+  /* ------------------------------------------------------- focal tweet detail */
+
+  /**
+   * The one tweet in a TweetResultByRestId response.
+   *
+   * The timeline walker cannot be reused for this, and the reason is in the
+   * shape: that walker matches on a `tweet_results` object, and this response
+   * contains none — its tweet sits at `data.tweetResult` (singular, no
+   * underscore) with the tweet node directly under `result`. There is nothing
+   * to search for either: one fixed path, one tweet, no conversation, which is
+   * exactly why this operation was chosen over TweetDetail.
+   */
+  function findDetailTweet(json) {
+    const result = asObject(walk(json, ['data', 'tweetResult', 'result'])) ||
+                   asObject(walk(json, ['data', 'tweet_result', 'result']));
+    if (result === null) return null;
+    // A visibility wrapper sits between: {result: {tweet: {...}}}
+    return asObject(result.tweet) || result;
+  }
+
+  /**
+   * Where a tweet's link entities live.
+   *
+   * Every container is read, not just the first one that exists — which is what
+   * extractEntities does, and precisely how a swept record ended up with no
+   * link targets at all. On a long-form post the two disagree: `legacy.entities`
+   * carries the media attachments while the note_tweet `entity_set` carries the
+   * links. The real capture this was written against has exactly that shape.
+   *
+   * This reader is used on the detail page only. The publish path is untouched:
+   * a record captured at publish time keeps whatever it captured.
+   */
+  const DETAIL_URL_PATHS = [
+    ['legacy', 'entities', 'urls'],
+    ['note_tweet', 'note_tweet_results', 'result', 'entity_set', 'urls'],
+    ['legacy', 'note_tweet', 'note_tweet_results', 'result', 'entity_set', 'urls'],
+    ['note_tweet_results', 'result', 'entity_set', 'urls'],
+    ['entities', 'urls']
+  ];
+
+  /**
+   * The links this post's text points at, deduplicated by shortlink: the same
+   * target can appear in more than one container, and the popup renders this
+   * list verbatim, so a duplicate would show up as a repeated line.
+   */
+  function extractLinkUrls(result) {
+    const out = [];
+    const seen = new Set();
+
+    for (let p = 0; p < DETAIL_URL_PATHS.length && out.length < MAX_ENTITY_URLS; p++) {
+      const list = asArray(walk(result, DETAIL_URL_PATHS[p]));
+      if (list === null) continue;
+
+      const limit = Math.min(list.length, MAX_ENTITY_URLS);
+      for (let i = 0; i < limit && out.length < MAX_ENTITY_URLS; i++) {
+        const entry = normalizeEntityUrl(list[i]);
+        if (entry === null) continue;
+        const key = entry.url !== null ? entry.url : entry.expandedUrl;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(entry);
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Turn one detail-page response into a link-fill message, or null.
+   *
+   * The author filter is the safety property here even more than on a profile
+   * sweep: this operation fires for ANY post the user opens, most of which are
+   * somebody else's, and a detail response can also carry the conversation
+   * around the focal tweet. Nothing but the focal tweet is ever looked at, and
+   * only when its author id is one this browser has published from.
+   *
+   * No record is created by this path and no existing value is replaced — it
+   * can only fill a gap (see mergeLinkEntities in db.js) — so a post that is not
+   * archived here yet simply has nothing to fill, and that is not an error.
+   */
+  function buildDetailLinks(json, requestInfo, capturedVia) {
+    if (ownAuthorIds.size === 0) {
+      // Same as the sweep: with no known own author id there is no way to tell
+      // whose post this is, and guessing would archive a stranger's links.
+      if (debugEnabled) warn('a post page was seen, but no own author id is known yet — skipping');
+      return null;
+    }
+
+    const tweet = findDetailTweet(json);
+    if (tweet === null) return null;
+
+    const author = extractAuthor(tweet);
+    if (author.id === null || !ownAuthorIds.has(author.id)) return null;
+
+    const id = extractTweetId(tweet);
+    if (id === null) return null;
+
+    const urls = extractLinkUrls(tweet);
+    // A post with no links, or whose links are already archived, is the normal
+    // case; sending an empty list would only make the extension write nothing.
+    if (urls.length === 0) return null;
+
+    return {
+      id: id,
+      urls: urls,
+      source: {
+        operationName: requestInfo.operationName,
+        queryId: requestInfo.queryId,
+        capturedVia: capturedVia === 'xhr' ? 'xhr' : 'fetch'
+      }
+    };
+  }
+
+  function handleDetailJson(json, requestInfo, capturedVia) {
+    diag.detailSeen++;
+    if (json === null || typeof json !== 'object') {
+      // Counted, not swallowed: a detail page whose body could not be read is
+      // exactly the case where a link stays missing with no other trace.
+      diag.responseJsonFailed++;
+      scheduleDiag();
+      return;
+    }
+    let payload = null;
+    try {
+      payload = buildDetailLinks(json, requestInfo, capturedVia);
+    } catch (err) {
+      recordError('buildDetailLinks', err);
+      scheduleDiag();
+      return;
+    }
+    // Counted only once the message actually left the page, like the sweep: a
+    // payload post() refused must not be reported as recovered.
+    if (payload !== null && post('X_TWEET_LINKS', payload)) diag.detailKept++;
+    scheduleDiag();
+  }
+
   async function handleResponse(response, requestInfo, variablesPromise) {
     try {
       if (!response || typeof response !== 'object') return;
@@ -1883,6 +2061,29 @@
           return;
         }
         handleTimelineJson(timelineJson, requestInfo, status, 'fetch');
+        return;
+      }
+
+      // A post's own page is a query too, and it is read for the link targets
+      // the sweep left empty. Nothing here is a publish either.
+      if (requestInfo.isDetail === true) {
+        let detailClone;
+        try {
+          detailClone = response.clone();
+        } catch (err) {
+          diag.responseCloneFailed++;
+          recordError('response.clone (detail)', err);
+          return;
+        }
+        let detailJson = null;
+        try {
+          detailJson = await detailClone.json();
+        } catch (err) {
+          diag.responseJsonFailed++;
+          recordError('clone.json (detail)', err);
+          return;
+        }
+        handleDetailJson(detailJson, requestInfo, 'fetch');
         return;
       }
 
@@ -2061,6 +2262,11 @@
         return;
       }
 
+      if (info.isDetail === true) {
+        handleDetailJson(readXhrResponseJson(xhr), info, 'xhr');
+        return;
+      }
+
       // A delete marks an existing record instead of writing a new one.
       // (deleteSeen was already counted when the request went out.)
       if (info.isDelete === true) {
@@ -2170,7 +2376,8 @@
               queryId: analysis.queryId,
               operationName: analysis.operationName,
               isDelete: analysis.isDelete,
-              isTimeline: analysis.isTimeline
+              isTimeline: analysis.isTimeline,
+              isDetail: analysis.isDetail
             });
           } else {
             // The same XHR object can be reused via open(); never let stale
@@ -2192,6 +2399,9 @@
           if (info !== undefined) {
             if (info.isDelete === true) diag.deleteSeen++;
             else if (info.isTimeline === true) { /* counted when the body arrives */ }
+            // A post's own page is a read as well, so it is counted when its
+            // body arrives, never as a publish.
+            else if (info.isDetail === true) { /* counted when the body arrives */ }
             else diag.createTweetSeen++;
             // The body is handed to us as-is; we only read it when it is a
             // string, and we never modify or replace it.
@@ -2276,6 +2486,7 @@
             // A timeline GET is a query, not a publish — it is counted when the
             // body arrives (handleTimelineJson), exactly as on the XHR path.
             else if (requestInfo.isTimeline === true) { /* counted when the body arrives */ }
+            else if (requestInfo.isDetail === true) { /* counted when the body arrives */ }
             else diag.createTweetSeen++;
             observeResponse(originalPromise, requestInfo);
             scheduleDiag();

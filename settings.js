@@ -89,7 +89,20 @@ export const DEFAULT_STATS = {
     /** Rows recovered from a profile timeline sweep — posts made elsewhere. */
     backfilled: 0,
     /** Swept rows whose id was already archived, so deliberately left untouched. */
-    backfillSkipped: 0
+    backfillSkipped: 0,
+    /**
+     * Archived records that gained their link targets from a post's own page.
+     * A swept record often has an empty `entities.urls`, which loses the only
+     * record of where its t.co links pointed; this counts how many were filled.
+     */
+    linksFilled: 0,
+    /**
+     * Link fills that found no record to fill — a tweet this machine never
+     * archived. Counted apart from linksFilled because "there was nothing here"
+     * and "the write did nothing" look identical in the archive, and the second
+     * one would be a real failure.
+     */
+    linksUnmatched: 0
   },
   /** Latest snapshot reported by the page realm (per page load, not lifetime). */
   page: {
@@ -104,6 +117,10 @@ export const DEFAULT_STATS = {
     timelineSeen: 0,
     /** Tweets in those responses that belonged to this account and were kept. */
     timelineKept: 0,
+    /** Post-detail responses read on this page (opening one of your own posts). */
+    detailSeen: 0,
+    /** Link target lists sent from them for posts that are this account's own. */
+    detailKept: 0,
     requestBodyRead: 0,
     requestBodyFailed: 0,
     responseCloneFailed: 0,
@@ -357,7 +374,7 @@ async function mergePageDiagInternal(diag) {
   const numericKeys = [
     'createTweetSeen', 'deleteSeen', 'deleted', 'requestBodyRead', 'requestBodyFailed',
     'responseCloneFailed', 'responseJsonFailed', 'parseFailed', 'parsed',
-    'posted', 'postFailed', 'timelineSeen', 'timelineKept'
+    'posted', 'postFailed', 'timelineSeen', 'timelineKept', 'detailSeen', 'detailKept'
   ];
   // A new document means a new session token: start the page counters over so
   // the popup never shows a stale maximum from a previous tab or reload.
