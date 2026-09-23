@@ -54,6 +54,9 @@
   "pollCloses": { "message": "Poll closes " },
   "pollNoChoices": { "message": "Poll: the choices were not returned with the publish response, so only the card id was archived" },
 
+  "linksLabel": { "message": "Links point to" },
+  "linkTargetTitle": { "message": "Real destination behind the t.co shortlink: $1" },
+
   "cardId": { "message": "ID $1 · saved $2" },
   "cardIdTitle": { "message": "Tweet ID $1\nSaved $2" },
   "cardIdTitleUpdated": { "message": "\nUpdated $1" },

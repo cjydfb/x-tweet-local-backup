@@ -219,6 +219,20 @@ function safeMediaUrl(url) {
   return isAllowedMediaUrl(url) ? url : null;
 }
 
+/**
+ * A link the user typed can point anywhere, so only the scheme is constrained —
+ * the same rule background.js applies before storing it.
+ */
+function safeExternalUrl(url) {
+  try {
+    const parsed = new URL(String(url));
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return null;
+    return parsed.href;
+  } catch (_) {
+    return null;
+  }
+}
+
 function safeTweetUrl(url, fallbackId) {
   try {
     const parsed = new URL(String(url));
@@ -645,6 +659,64 @@ function renderCard(record) {
     syncExpandVisibility(card);
   });
   card.appendChild(expand);
+
+  /* ---- where the links actually point ---- */
+  //
+  // The text above keeps the t.co shortlink exactly as it was published, so on
+  // its own it never says where a link goes — and following a t.co link would
+  // tell X that this archive was opened. The real destination is stored
+  // separately, and this is the only place it is safe to click.
+  const linkEntities = record.entities && Array.isArray(record.entities.urls)
+    ? record.entities.urls
+    : [];
+
+  // Built as pairs rather than by filtering twice: an entity whose expansion
+  // was rejected would otherwise shift every later entry's label onto the
+  // wrong link.
+  const resolvableLinks = [];
+  for (const item of linkEntities) {
+    if (!item) continue;
+    const href = safeExternalUrl(item.expandedUrl);
+    if (href === null) continue;
+    resolvableLinks.push({ href: href, display: item.displayUrl });
+  }
+
+  if (resolvableLinks.length > 0) {
+    const linksEl = document.createElement('div');
+    linksEl.className = 'card__links';
+
+    const label = document.createElement('span');
+    label.className = 'card__links-label';
+    label.textContent = t('linksLabel');
+    linksEl.appendChild(label);
+
+    const shown = Math.min(resolvableLinks.length, 5);
+    for (let i = 0; i < shown; i++) {
+      const link = resolvableLinks[i];
+      const anchor = document.createElement('a');
+      anchor.className = 'card__link';
+      anchor.href = link.href;
+      anchor.target = '_blank';
+      anchor.rel = 'noopener noreferrer';
+      anchor.title = t('linkTargetTitle', [link.href]);
+      // X's own display form when it exists, otherwise the host — a raw URL can
+      // be long enough to wreck the card layout.
+      let display = typeof link.display === 'string' && link.display.length > 0 ? link.display : null;
+      if (display === null) {
+        try { display = new URL(link.href).hostname; } catch (_) { display = link.href; }
+      }
+      anchor.textContent = display;
+      linksEl.appendChild(anchor);
+    }
+    if (resolvableLinks.length > shown) {
+      const more = document.createElement('span');
+      more.className = 'card__links-more';
+      more.textContent = '+' + (resolvableLinks.length - shown);
+      linksEl.appendChild(more);
+    }
+
+    card.appendChild(linksEl);
+  }
 
   /* ---- poll ---- */
   const poll = record.poll !== null && typeof record.poll === 'object' ? record.poll : null;

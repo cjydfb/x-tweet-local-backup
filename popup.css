@@ -340,6 +340,39 @@ body {
   border-color: color-mix(in srgb, var(--danger) 40%, var(--border));
 }
 
+/* ---------------------------------------------------- resolved link targets */
+
+/* The text keeps the t.co shortlink as published, so this line is the only
+   place the real destination is visible — and the only link worth clicking. */
+.card__links {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  margin-top: 5px;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.card__links-label {
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
+.card__link {
+  color: var(--accent);
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+
+.card__link:hover {
+  text-decoration: underline;
+}
+
+.card__links-more {
+  color: var(--text-faint);
+}
+
 /* ------------------------------------------------------------------- poll */
 
 .card__poll {

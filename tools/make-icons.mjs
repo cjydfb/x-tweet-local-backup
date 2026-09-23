@@ -428,6 +428,22 @@ if (mode === 'emit') {
     fs.writeFileSync(path.join(target, 'icon' + size + '.png'), png);
     console.log('wrote icons/icon' + size + '.png  (' + png.length + ' bytes)');
   }
+} else if (mode === 'store') {
+  // The store asks for a 300x300 logo. The 128 that ships in the extension is
+  // the minimum and would be upscaled and soft, so it is rendered at the size
+  // the listing actually wants.
+  const chosen = process.argv[3] || 'solid-hollow-tuned';
+  const cand = CANDIDATES.find((c) => c.key === chosen);
+  if (!cand) {
+    console.error('unknown icon "' + chosen + '"; options: ' + CANDIDATES.map((c) => c.key).join(', '));
+    process.exit(1);
+  }
+  const target = path.join(OUT_DIR, 'tools');
+  fs.mkdirSync(target, { recursive: true });
+  const png = encodePng(300, 300, renderIcon(cand.paint, 300));
+  const file = path.join(target, 'store-logo-300.png');
+  fs.writeFileSync(file, png);
+  console.log('wrote ' + file + '  (300x300, ' + png.length + ' bytes)');
 } else {
   const { png, w, h } = contactSheet();
   // The previous sheet may still be open in an image viewer, which locks it.

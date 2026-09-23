@@ -54,6 +54,9 @@
   "pollCloses": { "message": "投票截止 " },
   "pollNoChoices": { "message": "投票：选项没有随发布响应返回，本次只归档到投票卡片标识" },
 
+  "linksLabel": { "message": "链接指向" },
+  "linkTargetTitle": { "message": "t.co 短链的真实目标：$1" },
+
   "cardId": { "message": "ID $1 · 备份 $2" },
   "cardIdTitle": { "message": "Tweet ID $1\n备份时间 $2" },
   "cardIdTitleUpdated": { "message": "\n最近更新 $1" },
