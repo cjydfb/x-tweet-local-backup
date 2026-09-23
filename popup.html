@@ -84,10 +84,12 @@
              settings may scroll, but they do not get to take the whole window. -->
         <div class="settings__body">
 
-        <label class="toggle">
-          <input type="checkbox" id="opt-debug">
-          <span data-i18n="optDebug"></span>
-        </label>
+        <!-- The four that decide what gets kept, in the order the first-run
+             panel asks them, then the debug switch. Debug was first here for a
+             long time and it was the wrong place for it: it is not a preference
+             about the archive at all, only a switch for the panel that explains
+             the machinery, so it was the first thing read and the last thing
+             wanted. -->
         <label class="toggle">
           <input type="checkbox" id="opt-thumbs">
           <span data-i18n="optThumbs"></span>
@@ -103,6 +105,10 @@
         <label class="toggle">
           <input type="checkbox" id="opt-capture-replies">
           <span data-i18n="optCaptureReplies"></span>
+        </label>
+        <label class="toggle">
+          <input type="checkbox" id="opt-debug">
+          <span data-i18n="optDebug"></span>
         </label>
 
         <!-- The first-run panel, read again. A one-time dialog with no way back

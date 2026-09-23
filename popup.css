@@ -619,7 +619,12 @@ body {
 
 .list-hint {
   margin: 6px 0 0;
-  font-size: 10px;
+  /* Was 10px. These three — the list hint, the cleanup note and the four notes
+     at the foot of Settings — are the only prose in the popup a user is meant
+     to read rather than scan, and 10px is a caption size. They are set at the
+     same 12px as the settings labels now. Badges and the card's id/action row
+     stay at 10px: those are labels inside a card whose compactness matters. */
+  font-size: 12px;
   color: var(--text-faint);
   text-align: center;
   min-height: 12px;
@@ -776,7 +781,7 @@ body {
 
 .cleanup__note {
   margin: 7px 0 8px;
-  font-size: 10px;
+  font-size: 12px;
   line-height: 1.6;
   color: var(--text-faint);
 }
@@ -811,7 +816,7 @@ body {
 
 .footer__note {
   margin: 8px 0 0;
-  font-size: 10px;
+  font-size: 12px;
   line-height: 1.6;
   color: var(--text-faint);
 }
@@ -1010,7 +1015,12 @@ body {
   }
 
   .footer__note {
-    font-size: 11px;
+    font-size: 13px;
+  }
+
+  .list-hint,
+  .cleanup__note {
+    font-size: 13px;
   }
 
   .card {
