@@ -59,7 +59,7 @@ Any change to this policy will be published at this URL, with the date above upd
 
 ## Contact
 
-<YOUR EMAIL HERE>
+ab3468256122@outlook.com
 
 ---
 
@@ -124,4 +124,4 @@ X Tweet Local Backup 不收集、不传输、不出售、不共享任何数据�
 
 ## 联系方式
 
-<在此填入你的邮箱>
+ab3468256122@outlook.com
