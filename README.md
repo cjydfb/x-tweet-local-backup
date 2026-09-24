@@ -1,36 +1,34 @@
 # X Tweet Local Backup
 
-**中文** ｜ [English ↓](#english)
+中文｜ [English ↓](#english)
 
-在浏览器里正常发帖、回复、引用时，自动把内容存到本地。**纯本地，不上传任何数据。**
+在浏览器里正常发帖、回复、引用时，自动把内容存到本地。纯本地
 
-它不是导出工具，是持续记录：你在 x.com 发的每一条，扩展从页面**本来就在收发**的网络响应里读一份，存进扩展自己的 IndexedDB。
+它不是导出工具，是持续记录：你在 x.com 发的每一条，扩展从页面本来就在收发的网络响应里读一份，存进扩展自己的 IndexedDB。
 
 ## 它不做什么
 
-- **不自动发帖、回复、点赞、关注、转发。** 没有任何自动化操作。
-- **不模拟点击和键盘输入。**
-- **不读 DOM。** 没有 `querySelector`、没有 `MutationObserver`、不读输入框。推文内容只来自网络响应。
-- **不发起任何自己的网络请求**——唯一例外是你主动开启并授权后的媒体下载（`pbs.twimg.com` / `video.twimg.com`）。
-- **不碰 cookie、token、`auth_token`、`ct0`、`Authorization`、CSRF**——不读取、不存储、不导出，连调试面板里都没有。
+- 不自动发帖、回复、点赞、关注、转发。没有任何自动化操作。
+- 
+- 发起任何自己的网络请求——唯一例外是你主动开启并授权后的媒体下载（`pbs.twimg.com` / `video.twimg.com`）。
 
 ## 手机发的帖也能补回来
 
-以前只有在这个浏览器里发布的推文才会被记录，**手机 App 发的一条都看不到**。
+1.0等早期版本只有在这个浏览器里发布的推文才会被记录，手机 App 发的一条都看不到。
 
-现在打开你自己的主页往下滑，X 会去拉你的时间线——那个响应里就是你的推文，**跟从哪台设备发的无关**。扩展读它，**只保留作者 ID 是自己账号的行**，不额外发请求、不碰凭据。
+现在打开你自己的主页往下滑，X 会去拉你的时间线——那个响应里就是你的推文，跟从哪台设备发的无关。扩展读它，只保留作者 ID 是自己账号的行，不额外发请求。
 
-实测一次扫描补回 24 条，其中 8 条藏在线程模块里——只读最明显的路径会漏掉三分之一。
+测试是一次扫描补回 24 条，其中 8 条藏在线程模块里——只读最明显的路径会漏掉三分之一。往下滑会拉取到更多的数据进行补录
 
 主页的「回复」栏同理，默认关闭（一次可能新增很多行）。
 
 ## 安装
 
-**从商店安装（推荐）** —— [Edge Add-ons](https://microsoftedge.microsoft.com/addons/detail/x-tweet-local-backup/cgomddpedljmgbdcmiiemiaanejaaohe)
+从商店安装（推荐） —— [Edge Add-ons](https://microsoftedge.microsoft.com/addons/detail/x-tweet-local-backup/cgomddpedljmgbdcmiiemiaanejaaohe)
 
 > 商店会自动更新到最新版。新功能通常先在这个仓库里，过审后才到商店。
 
-**手动安装：**
+**手动安装**：
 
 1. 在 [Releases](../../releases) 里下载最新的 `x-tweet-backup-<版本>.zip` 并解压
 2. 打开 `chrome://extensions`
@@ -43,7 +41,9 @@
 
 ## 手机
 
-**安卓上可以用edge浏览器扩展插件处搜索并下载此项目或 [Quetta 浏览器](https://www.quetta.net/)** —— 它支持 Chrome / Edge 扩展，本扩展在它上面实测可正常运行
+安卓上可以用edge浏览器扩展插件处搜索并下载此项目或点击直链（https://microsoftedge.microsoft.com/addons/detail/x-tweet-local-backup/cgomddpedljmgbdcmiiemiaanejaaohe）
+
+或 [Quetta 浏览器](https://www.quetta.net/) —— 它支持 Chrome / Edge 扩展，本扩展在它上面实测可正常运行
 
 装法：在 Quetta 的扩展页开启开发者模式，直接装本仓库 Releases 里的 ZIP；或者从 Edge 加载项安装。
 
@@ -59,12 +59,12 @@
 
 **清理浏览器数据、卸载扩展、删除配置文件，都会让它消失且无法恢复。** 请定期手动导出：
 
-- **导出 JSON** —— 小、好搜、纯文本
+- **导出 JSON** —— 纯文本
 - **导出归档 ZIP** —— 包含全部已缓存的媒体文件
 
 ## 已知边界
 
-- 发布时页面必须是开着的，否则那一条不会被当场记录（手机发的事后可以补录）
+- 发布时页面必须是开着的，否则那一条不会被当场记录（其他设备发的事后可以补录）
 - 时间线补录只覆盖主页的「帖子」和「回复」两栏，收藏和关注列表还没有
 - 归档里的正文**保持原样**，t.co 短链不会改写成真实地址；真实地址单独存在 `entities.urls[].expandedUrl`，显示在卡片下方的「链接指向」里
 
