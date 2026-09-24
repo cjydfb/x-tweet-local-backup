@@ -689,12 +689,24 @@ async function buildIndex(source, sourceLabel) {
     });
   }
 
+  /* The follow roster rides AFTER the tweets array, which puts it outside the
+     head probe above and outside everything this reader displays. Saying so is
+     not a nicety: this file is opened by someone whose account is gone, and a
+     reader that showed only posts would leave them believing the file never had
+     their follow lists. Presence is all that is reported — counting the rows
+     would mean scanning them, and the useful message is "it is in here, another
+     tool reads it". */
+  var tailFrom = Math.min(scanner.pos, source.size);
+  var tailProbe = new Uint8Array(await source.slice(tailFrom, Math.min(tailFrom + 262144, source.size)).arrayBuffer());
+  var hasRoster = /"connections"\s*:\s*\[/.test(decodeHead(tailProbe));
+
   state.ranges = scanner.elements;
   state.envelope = {
     count: expectedCount,
     schemaVersion: readEnvelopeNumber(source, headerProbe, 'schemaVersion'),
     generatorVersion: readEnvelopeString(source, headerProbe, 'generatorVersion'),
-    exportedAt: readEnvelopeString(source, headerProbe, 'exportedAt')
+    exportedAt: readEnvelopeString(source, headerProbe, 'exportedAt'),
+    hasRoster: hasRoster
   };
 
   renderStats(sourceLabel2, elapsed, problems);
@@ -756,6 +768,13 @@ function renderStats(sourceLabel, elapsed, problems) {
   } else {
     say('<div class="box ok">索引建立完成：<b>' + n + ' 条</b>记录全部定位，与信封计数一致，' +
         '没有发现截断或漏读。正文没有载入内存——滚动到哪一条才读哪一条。</div>', 'ok');
+  }
+
+  if (env.hasRoster) {
+    say('<div class="box"><b>这个文件里还有一份关注/粉丝名单</b>（<code>connections</code> 数组）。' +
+        '本阅读器不显示它——名单不是帖子，而且可能有好几千行。ZIP 归档里的 ' +
+        '<code>CONNECTIONS.csv</code> 用表格软件打开就能看，JSON 里的 ' +
+        '<code>connections</code> 字段是同一份数据的完整版本。</div>', 'ok');
   }
 }
 

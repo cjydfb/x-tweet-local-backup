@@ -21,6 +21,16 @@ When you publish a post, reply or quote on x.com, the extension reads that post 
 
 It also records which of your posts you later edited or deleted, so the archive can show that.
 
+## The follow lists (optional, off by default)
+
+There is one feature that saves information about **other people**, and it does nothing until you switch it on.
+
+If you enable "record your follow lists" and then open your own Following or Followers page, the extension saves the same public profile information the page itself displays for each account: numeric user id, @username, display name, bio and its links, location, website, avatar URL, language, verification flag, and follower/following/post counts. It saves these only from lists that belong to an account this browser has seen you publish from — browsing anyone else's followers saves nothing.
+
+- It is stored in the same local database as everything else, and exported the same way.
+- Nothing is inferred from absence: a person missing from a list has simply not been scrolled past yet.
+- Turning the setting off stops it immediately; the rows already saved stay until you delete them.
+
 ## Where it is stored
 
 Entirely in your browser's local storage for this extension. Nothing is sent anywhere. The extension makes no requests of its own to X or to any other server, with the single optional exception described below.
@@ -85,6 +95,16 @@ X Tweet Local Backup 不收集、不传输、不出售、不共享任何数据�
 - 互动计数（点赞、转推、回复、浏览量）
 
 它还会记录你后来**编辑或删除**了哪些帖子，以便归档能反映这些变化。
+
+## 关注和粉丝名单（可选，默认关闭）
+
+有且只有一个功能会保存**别人的**信息，而且在你手动打开之前它什么都不会做。
+
+如果你开启「记录关注和粉丝名单」，然后打开自己的「关注」或「粉丝」页面，扩展会保存页面本身就已经显示出来的公开资料：数字用户 ID、@用户名、昵称、简介及其中的链接、所在地、网站、头像地址、语言、认证标记，以及粉丝数／关注数／帖子数。**只有属于你自己账号的名单会被保存** —— 翻别人的粉丝列表什么都不会存。判断依据是这个浏览器亲眼看你发过帖的那个账号 ID。
+
+- 和其它数据存在同一个本地数据库里，导出方式也一样。
+- **不会从"名单里没有"推断任何事**：没有的人只代表你还没滚到那里。
+- 关掉开关立即停止记录；已经存下来的行会保留到你主动删除为止。
 
 ## 数据存在哪里
 

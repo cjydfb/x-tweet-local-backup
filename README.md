@@ -53,6 +53,18 @@
 
 > 其他安卓浏览器未经验证（Edge 安卓的扩展功能还在分批推送）。如果你在别的浏览器上试过，欢迎开 issue 说一声结果。
 
+## 关注和粉丝名单（可选，默认关闭）
+
+**为什么要有这个**：X 封号或锁号之后，关注和粉丝列表就再也打不开了；官方数据归档里**确实有**这两个列表，但**只能在还能登录的时候申请下载**。所以这份数据只在你还进得去的时候拿得到，之后窗口就关了。
+
+打开设置里的「记录关注和粉丝名单」，然后在**自己的主页**打开「关注」或「粉丝」往下滑 —— 滚到哪记到哪，扩展只是读页面本来就收到的响应，从不自己发请求。
+
+- **它记的是「见过谁」，永远不记「谁不在了」。** 分不清"他取关了"和"我这次没滚到"，所以干脆不写 —— 不写就不会错。名单里没有的人，只代表你还没滚到那里
+- **以数字 ID 为准**，不以用户名为准。用户名会改，改过名的人会自动合并成同一行
+- **只在你自己的名单里抓。** 请求里带着 `userId`，只有它属于扩展见过的你自己的账号时才记录 —— 翻别人的关注列表什么都不会存
+- **全新安装需要先发一条帖**：在扩展见过你发帖之前，它不知道哪个账号是你的，这时设置里会写明"还没生效"
+- 名单**只在标签页或手机里能看**（弹窗太小，装不下第二个列表）。导出的 ZIP 里多一个 `CONNECTIONS.csv`，用表格软件直接打开
+
 ## 数据存在哪里
 
 在**扩展自己的 IndexedDB** 里，跟着浏览器配置文件走。
@@ -65,7 +77,7 @@
 ## 已知边界
 
 - 发布时页面必须是开着的，否则那一条不会被当场记录（其他设备发的事后可以补录）
-- 时间线补录只覆盖主页的「帖子」和「回复」两栏，收藏和关注列表还没有
+- 时间线补录只覆盖主页的「帖子」和「回复」两栏；**关注和粉丝名单要单独打开开关**，并且需要你手动打开那个页面往下滑
 - 归档里的正文**保持原样**，t.co 短链不会改写成真实地址；真实地址单独存在 `entities.urls[].expandedUrl`，显示在卡片下方的「链接指向」里
 
 ---
@@ -370,7 +382,7 @@ Two consequences worth knowing:
 
 ```json
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "tweets":    [ /* full records */ ],
   "deletions": [ { "id": "…", "deletedAt": "2026-09-23T08:05:19.840Z" } ]
 }
@@ -390,6 +402,56 @@ Two things a merge has to get right beyond a plain union:
   the `editedFrom` links rather than trusting the field as merged.
 - **`capturedAt` and `firstCapturedAt` may differ per machine.** Keep the
   earliest `capturedAt` so list ordering stays stable.
+
+## The follow roster (opt-in, off by default)
+
+A third array may appear, **after `deletions`**:
+
+```json
+{
+  "connections": [
+    {
+      "list": "following",
+      "userId": "2090325165590876160",
+      "screenName": "hoshino_Fuji",
+      "screenNameLower": "hoshino_fuji",
+      "name": "听风藤",
+      "bio": "…",
+      "followersCount": 662,
+      "followingCount": 354,
+      "tweetCount": 199,
+      "firstSeenAt": "2026-09-20T10:00:00.000Z",
+      "lastSeenAt": "2026-09-21T10:00:00.000Z",
+      "ownerIds": ["2032037309219315712"],
+      "source": { "operationName": "Following", "capturedVia": "xhr" },
+      "schemaVersion": 3
+    }
+  ]
+}
+```
+
+It is **omitted entirely when empty**, so an archive from someone who never
+switched the feature on is byte-for-byte what earlier versions wrote. The field
+is `tweetCount`, never `tweets` — the standalone reader locates the tweet array
+by scanning the raw bytes for that key, and a second one would be found first.
+
+**This is a roster, not a change log.** A person is in the array because they
+were *seen*, and absence means only that the page was not scrolled that far. X
+gives no way to tell "they left" apart from "I did not look", so no removal is
+ever recorded, and a merge should union these rows by `[list, userId]` and take
+the newest `lastSeenAt`.
+
+`userId` is the identity and `screenName` is a label that can change. Two
+archives merged on the handle would split one person across two rows — or, worse,
+merge two people if a released handle was taken.
+
+**Nothing is captured from anyone else's list.** A `Following` response does not
+say whose list it is, so the extension checks the `userId` the page itself put in
+the request against the accounts it has watched publish from. Browsing somebody
+else's followers stores nothing at all.
+
+The ZIP adds `CONNECTIONS.csv` when the roster is non-empty — the same rows, with
+stable English headers, for a spreadsheet.
 
 ## Link expansions are archived, because t.co is not yours
 

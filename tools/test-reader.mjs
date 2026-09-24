@@ -47,6 +47,8 @@ const M = new Function(core + `
   return { findTweetsArray, createArrayScanner, scanChunk, readRecordAt, crc32, utf8Length, safeExternalUrl, BYTE };
 `)();
 
+const { findTweetsArray } = M;
+
 /* --------------------------------------------------------------- harness -- */
 
 let passed = 0;
@@ -165,9 +167,9 @@ const OBJECTS = [
 
 function envelope(records, countOverride) {
   return JSON.stringify({
-    schemaVersion: 2,
+    schemaVersion: 3,
     generator: 'x-tweet-backup',
-    generatorVersion: '1.1.0',
+    generatorVersion: '1.4.0',
     exportedAt: '2026-09-23T00:00:00.000Z',
     timezone: { name: 'Asia/Shanghai', offsetMinutes: 480, note: 'x' },
     tweets: records,
@@ -176,10 +178,71 @@ function envelope(records, countOverride) {
   });
 }
 
+/* The roster section 1.4.0 appends after `deletions`. It is last for a reason
+   the scanner depends on: the tweet array is found by searching the raw bytes
+   for the literal "tweets" key, so a section placed BEFORE it that grew large
+   enough would push the key out of the probe window and the archive would stop
+   opening. These two cases hold that arrangement still. */
+function envelopeWithRoster(records, rosterRows) {
+  return JSON.stringify({
+    schemaVersion: 3,
+    generator: 'x-tweet-backup',
+    generatorVersion: '1.4.0',
+    exportedAt: '2026-09-23T00:00:00.000Z',
+    timezone: { name: 'Asia/Shanghai', offsetMinutes: 480, note: 'x' },
+    tweets: records,
+    count: records.length,
+    deletions: [],
+    connections: rosterRows
+  });
+}
+
+function rosterRow(i) {
+  return {
+    list: 'following',
+    userId: '2090325165590876' + String(100 + i),
+    screenName: 'person_' + i,
+    screenNameLower: 'person_' + i,
+    name: 'Person ' + i,
+    // A bio is free text and is where a stray `"tweets"` would come from if it
+    // were going to come from anywhere.
+    bio: 'a bio mentioning tweets and connections and "quotes"',
+    bioUrls: [],
+    firstSeenAt: '2026-09-20T10:00:00.000Z',
+    lastSeenAt: '2026-09-21T10:00:00.000Z',
+    ownerIds: ['2032037309219315712']
+  };
+}
+
 check('finds exactly one range per record', () => {
   const st = scanAll(toBytes(envelope(OBJECTS)));
   assertEqual(st.elements.length, OBJECTS.length);
   assert(st.closed, 'array never closed');
+});
+
+check('a roster section after the tweets array leaves the scan alone', () => {
+  const rows = [];
+  for (let i = 0; i < 200; i++) rows.push(rosterRow(i));
+  const bytes = toBytes(envelopeWithRoster(OBJECTS, rows));
+  const st = scanAll(bytes);
+  assertEqual(st.elements.length, OBJECTS.length);
+  assert(st.closed, 'array never closed');
+  const first = JSON.parse(new TextDecoder().decode(
+    bytes.subarray(st.elements[0].start, st.elements[0].end)));
+  assertEqual(first.id, '1');
+});
+
+check('the byte scan finds the tweets KEY, not the word in somebody\'s bio', () => {
+  // Every roster row's bio contains the words "tweets" and "connections". If the
+  // scan matched a bare word rather than the quoted key followed by an array,
+  // the roster would be read as the tweet list and the archive would open empty.
+  const rows = [];
+  for (let i = 0; i < 20; i++) rows.push(rosterRow(i));
+  const bytes = toBytes(envelopeWithRoster(OBJECTS, rows));
+  const start = findTweetsArray(bytes, 0, bytes.length);
+  assert(start >= 0, 'no array found at all');
+  const after = new TextDecoder().decode(bytes.subarray(start, start + 64)).trimStart();
+  assertEqual(after.charAt(0), '{');
 });
 
 check('every range parses back to the original object', () => {
