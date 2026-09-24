@@ -169,7 +169,7 @@ function envelope(records, countOverride) {
   return JSON.stringify({
     schemaVersion: 3,
     generator: 'x-tweet-backup',
-    generatorVersion: '1.4.0',
+    generatorVersion: '2.1.0',
     exportedAt: '2026-09-23T00:00:00.000Z',
     timezone: { name: 'Asia/Shanghai', offsetMinutes: 480, note: 'x' },
     tweets: records,
@@ -187,7 +187,7 @@ function envelopeWithRoster(records, rosterRows) {
   return JSON.stringify({
     schemaVersion: 3,
     generator: 'x-tweet-backup',
-    generatorVersion: '1.4.0',
+    generatorVersion: '2.1.0',
     exportedAt: '2026-09-23T00:00:00.000Z',
     timezone: { name: 'Asia/Shanghai', offsetMinutes: 480, note: 'x' },
     tweets: records,
