@@ -216,5 +216,38 @@
   "okExportStarted": { "message": "已开始下载：$1 条记录到 $2。此浏览器无法确认下载是否完成——在依赖该文件之前，请先确认它确实已保存" },
   "okArchiveStarted": { "message": "已开始下载：$1 条记录 + $2 个媒体文件（$3）。此浏览器无法确认下载是否完成——在依赖该文件之前，请先确认它确实已保存" },
 
+  "optCaptureConnections": { "message": "记录关注和粉丝名单" },
+  "okCaptureConnectionsOn": { "message": "已开启名单记录：打开自己主页的「关注」或「粉丝」栏向下滚动即可" },
+  "okCaptureConnectionsOff": { "message": "已关闭名单记录" },
+  "noteConnections": { "message": "你自己主页「关注」和「粉丝」栏里的每个账号，都会在你滚动时被记下来 —— 用户名、昵称、简介和几个计数。别人的名单永远不会被读取。用户名会改，所以归档以数字 ID 为准。**这份名单只记「见过谁」，永远不记「谁不在了」** —— 名单里没有的人，只代表你还没滚到那里。" },
+  "noteConnectionsInactive": { "message": "还没生效：这个浏览器还没见你发过帖，不知道哪个账号是你的。先在 x.com 上发一条或回复一条，它就会开始工作。" },
+
+  "viewSwitchAria": { "message": "切换要看的列表" },
+  "viewTweets": { "message": "帖子" },
+  "viewFollowing": { "message": "关注" },
+  "viewFollowers": { "message": "粉丝" },
+  "connectionsAria": { "message": "关注名单" },
+  "searchPlaceholderConnections": { "message": "搜索用户名 / 昵称 / 简介 / ID" },
+  "emptyConnections": { "message": "还没有记录。打开自己主页的「关注」或「粉丝」栏向下滑动，每加载一页就会记进来。" },
+  "emptyConnectionsNoMatch": { "message": "没有匹配「$1」的人。" },
+  "listShownConnections": { "message": "已显示 $1 人" },
+  "listShownConnectionsMore": { "message": "已显示 $1 人（还有更多）" },
+  "connFollowers": { "message": "$1 粉丝" },
+  "connFollowing": { "message": "$1 关注" },
+  "connPosts": { "message": "$1 帖子" },
+  "connSeen": { "message": "最后见到 $1" },
+  "connSeenTitle": { "message": "第一次见到 $1\n最后一次见到 $2" },
+  "badgeVerified": { "message": "认证" },
+  "openProfile": { "message": "主页" },
+
+  "errConnectionsUnreadable": { "message": "无法读取关注名单（$1），因此中止导出，而不是写出一个看似完整、却缺失你所有关注对象名单的文件" },
+  "errPageOutdated": { "message": "这个页面是旧版扩展加载的（$1）。刷新一下就能继续。" },
+
+  "diagConnectionsSeen": { "message": "本页读到的关注名单数" },
+  "diagConnectionsKept": { "message": "本页从名单里记下的人数" },
+  "diagConnectionsNoOwner": { "message": "名单被丢弃（不是你的账号）" },
+  "diagConnectionsAdded": { "message": "名单写入（新的人）" },
+  "diagConnectionsRefreshed": { "message": "名单刷新（已知的人）" },
+
   "tzNote": { "message": "时间戳均为 UTC。本地时间 = UTC + offsetMinutes 分钟。" }
 }

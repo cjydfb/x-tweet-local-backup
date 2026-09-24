@@ -643,6 +643,131 @@ body {
   min-height: 12px;
 }
 
+/* `.list` is display:flex, which beats the user agent's own `[hidden]` rule —
+   the same trap the .choice overlay documents. Spelled out so the post list and
+   the roster can take turns occupying the same slot. */
+.list[hidden] {
+  display: none;
+}
+
+/* ------------------------------------------------------------ view switch */
+
+/* Hidden unless the full-page layout applies. The roster is a long list of
+   people, which wants a page; the toolbar popup has one list and 600px of
+   carefully budgeted height, and nothing here is worth taking any of it.
+
+   CSS is the only thing that decides this, deliberately. A JS predicate that
+   disagreed could then never show the switch in a popup — it could only fail to
+   hide it in a page, which is the harmless direction for the two to be wrong in. */
+.viewswitch {
+  display: none;
+  gap: 4px;
+}
+
+.viewswitch__tab {
+  flex: 1;
+  border: 1px solid var(--border);
+  background: var(--bg-soft);
+  color: var(--text-soft);
+  border-radius: var(--radius);
+  padding: 5px 8px;
+  font-size: 12px;
+  font-family: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.viewswitch__tab:hover:not(.is-active) {
+  border-color: var(--accent);
+}
+
+.viewswitch__tab.is-active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-text);
+  font-weight: 600;
+}
+
+/* ------------------------------------------------------------- roster row */
+
+/* A person is not a post: no body text to clamp, no media, and the numbers that
+   matter are counts rather than prose. Kept short so a page of them is readable
+   at a glance, which is the whole point of a roster. */
+.conn {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-raised);
+  padding: 7px 10px;
+  box-shadow: var(--shadow);
+}
+
+.conn__head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+
+.conn__name {
+  font-weight: 650;
+  font-size: 12.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conn__handle {
+  color: var(--text-faint);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conn__badge {
+  flex-shrink: 0;
+  font-size: 9px;
+  padding: 0 5px;
+  border-radius: 20px;
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border));
+  color: var(--accent);
+  background: var(--bg-soft);
+}
+
+.conn__bio {
+  margin: 3px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-soft);
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.conn__meta {
+  margin-top: 4px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 3px 10px;
+  font-size: 10px;
+  color: var(--text-faint);
+}
+
+.conn__link {
+  color: var(--accent);
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+
+.conn__link:hover {
+  text-decoration: underline;
+}
+
 /* ----------------------------------------------------------- diagnostics */
 
 .diagnostics {
@@ -775,6 +900,21 @@ body {
    those four behaviours will already be looking. */
 .settings__action {
   margin-top: 7px;
+}
+
+/* A caveat belonging to the toggle above it rather than to the foot of the
+   panel, so it sits indented under the switch it is about instead of a screen
+   away with the general notes. Same size as those notes, which are the other
+   place this extension writes a caveat down. */
+.settings__note {
+  margin: 0 0 6px 22px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-faint);
+}
+
+.settings__note:empty {
+  display: none;
 }
 
 /* --------------------------------------------------------------- cleanup */
@@ -968,6 +1108,12 @@ body {
     height: 100%;
     max-height: none;
   }
+
+  /* The one thing the page layout adds: the roster becomes reachable. See the
+     base rule for why this is decided here and nowhere else. */
+  .viewswitch {
+    display: flex;
+  }
 }
 
 /* A wide viewport gets the comfortable reading column on top of that. Both
@@ -1004,6 +1150,32 @@ body {
 
   .toolbar {
     padding: 0 22px 12px;
+  }
+
+  .viewswitch {
+    padding: 0 22px 12px;
+  }
+
+  .viewswitch__tab {
+    font-size: 13px;
+    padding: 6px 10px;
+  }
+
+  .conn {
+    padding: 10px 14px;
+  }
+
+  .conn__name {
+    font-size: 14px;
+  }
+
+  .conn__handle,
+  .conn__bio {
+    font-size: 12.5px;
+  }
+
+  .conn__meta {
+    font-size: 11px;
   }
 
   .notice {

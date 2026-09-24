@@ -50,7 +50,24 @@
       <button id="btn-export" class="button button--primary" type="button" data-i18n="exportJson"></button>
     </section>
 
+    <!-- Posts / Following / Followers. Always in the markup, visible only in the
+         full-page layout — CSS owns that decision (see .viewswitch in popup.css),
+         so a wrong guess in JS cannot put it in front of a 440px popup. The JS
+         predicate is only used to leave the roster view when the layout
+         collapses under it. -->
+    <nav class="viewswitch" id="viewswitch" data-i18n-aria-label="viewSwitchAria">
+      <button type="button" class="viewswitch__tab" id="view-tweets" data-i18n="viewTweets"></button>
+      <button type="button" class="viewswitch__tab" id="view-following" data-i18n="viewFollowing"></button>
+      <button type="button" class="viewswitch__tab" id="view-followers" data-i18n="viewFollowers"></button>
+    </nav>
+
     <main id="list" class="list" data-i18n-aria-label="listAria"></main>
+
+    <!-- The roster. A SIBLING of #list, never a child: reload() and
+         showEmptyState() empty their container's children on every search and
+         refresh, so anything living inside #list is destroyed on the first
+         keystroke. Only one of the two is ever shown. -->
+    <main id="connections" class="list" hidden data-i18n-aria-label="connectionsAria"></main>
 
     <div class="list-footer">
       <button id="btn-more" class="button button--wide" type="button" data-i18n="loadMore" hidden></button>
@@ -106,6 +123,16 @@
           <input type="checkbox" id="opt-capture-replies">
           <span data-i18n="optCaptureReplies"></span>
         </label>
+        <label class="toggle">
+          <input type="checkbox" id="opt-capture-connections">
+          <span data-i18n="optCaptureConnections"></span>
+        </label>
+        <!-- Two states, chosen at render time: what it does, or why it is not
+             doing anything yet. A fresh install cannot know which account is
+             yours until it has seen you publish, and a switch that silently
+             stores nothing is indistinguishable from a broken one. -->
+        <p class="settings__note" id="note-connections"></p>
+
         <label class="toggle">
           <input type="checkbox" id="opt-debug">
           <span data-i18n="optDebug"></span>

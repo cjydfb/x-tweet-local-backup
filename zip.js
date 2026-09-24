@@ -176,6 +176,9 @@ export function describeMediaArchive(rows, meta) {
   lines.push('                     reply/quote links, media metadata)');
   lines.push('  media/             the media files themselves, as ordinary files');
   lines.push('  MEDIA-INDEX.json   the same mapping as this file, machine-readable');
+  if (meta && typeof meta.connections === 'number' && meta.connections > 0) {
+    lines.push('  CONNECTIONS.csv    the follow / follower roster, for a spreadsheet');
+  }
   lines.push('');
   lines.push('File names are <tweetId>_<mediaId>.<ext>. Join them to tweets.json:');
   lines.push('the leading number is tweet.id, the second is tweet.media[].id.');
@@ -220,6 +223,75 @@ export function buildMediaIndexJson(rows, meta) {
       bytes: typeof row.bytes === 'number' ? row.bytes : null
     }))
   }, null, 2) + '\n';
+}
+
+/**
+ * One CSV field, quoted per RFC 4180 only when it has to be.
+ *
+ * A bio is free text and routinely holds commas, quotes and newlines. Quoting
+ * exactly when the format demands it keeps the common case — a handle, a count —
+ * readable in a plain text editor, and the rule for when it is demanded is the
+ * one every spreadsheet already implements.
+ *
+ * A field starting with = + - or @ is prefixed with an apostrophe. That is the
+ * accepted defence against CSV injection: a spreadsheet would otherwise try to
+ * evaluate somebody's bio as a formula, and this file is a list of OTHER
+ * people's text, which this extension has no business executing on the reader's
+ * machine. The apostrophe is the conventional marker and is stripped on display.
+ */
+function csvCell(value) {
+  if (value === null || value === undefined) return '';
+  let text = String(value);
+  if (/^[=+\-@\t\r]/.test(text)) text = "'" + text;
+  if (text.indexOf('"') === -1 && text.indexOf(',') === -1 &&
+      text.indexOf('\n') === -1 && text.indexOf('\r') === -1) {
+    return text;
+  }
+  return '"' + text.split('"').join('""') + '"';
+}
+
+/**
+ * The follow roster as a spreadsheet.
+ *
+ * CSV rather than a second JSON index, because the export envelope already
+ * carries these rows in this order and a second copy would only be redundant —
+ * while the one thing a JSON array is bad at is the thing this feature exists
+ * for: being read by a person, years later, with no account left to log into. A
+ * spreadsheet opens on any machine.
+ *
+ * Headers are English and stable, following MEDIA-INDEX.json's precedent. This
+ * is a machine-readable artefact that happens to be readable by people, and a
+ * localized header would break anything that ever parses it.
+ *
+ * The profile link is built from the numeric id, never the handle: the whole
+ * point of the file is the day the handle stops resolving.
+ */
+export function buildConnectionsCsv(rows) {
+  const header = [
+    'list', 'userId', 'screenName', 'name', 'bio', 'location', 'website',
+    'followers', 'following', 'posts', 'firstSeenAt', 'lastSeenAt',
+    'profileUrl', 'lastSeenBy'
+  ];
+  const lines = [header.join(',')];
+  for (const row of rows) {
+    lines.push([
+      row.list,
+      row.userId,
+      row.screenName,
+      row.name,
+      row.bio,
+      row.location,
+      row.websiteUrl,
+      row.followersCount,
+      row.followingCount,
+      row.tweetCount,
+      row.firstSeenAt,
+      row.lastSeenAt,
+      'https://x.com/i/user/' + row.userId,
+      Array.isArray(row.ownerIds) ? row.ownerIds.join(' ') : ''
+    ].map(csvCell).join(','));
+  }
+  return lines.join('\r\n') + '\r\n';
 }
 
 /* Kept for callers that want to sanity-check a name before using it. */

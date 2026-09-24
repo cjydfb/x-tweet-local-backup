@@ -19,6 +19,8 @@ import {
   getMediaRecord,
   listAllMedia,
   listDeletions,
+  queryConnections,
+  listConnections,
   sameKey,
   SCHEMA_VERSION
 } from './db.js';
@@ -27,7 +29,7 @@ import { DEFAULT_SETTINGS } from './settings.js';
 
 import { requestMediaPermission, isAllowedMediaUrl } from './media-cache.js';
 
-import { buildZip, describeMediaArchive, buildMediaIndexJson } from './zip.js';
+import { buildZip, describeMediaArchive, buildMediaIndexJson, buildConnectionsCsv } from './zip.js';
 
 /* -------------------------------------------------------------------------- */
 /* Localisation                                                               */
@@ -86,18 +88,32 @@ const state = {
   db: null,
   settings: Object.assign({}, DEFAULT_SETTINGS),
   stats: null,
-  counts: { tweets: null, media: null },
+  counts: { tweets: null, media: null, following: null, followers: null },
   purgeCounts: { superseded: 0, deleted: 0 },
   mediaPermission: false,
+  /** How many of this account's own ids this browser has learned. 0 means the
+   *  roster line cannot be working yet, and the note under its switch says so. */
+  ownAuthorCount: 0,
   armedPurge: null,
   savingChoices: false,
-  query: '',
-  nextKey: null,
-  hasMore: false,
+  /** Which list is on screen: 'tweets', 'following' or 'followers'. */
+  view: 'tweets',
+  /**
+   * Paging state, one set per view, INCLUDING the search term.
+   *
+   * A single shared term would be actively hostile: type a handle under Posts,
+   * switch to the roster, and it renders empty with nothing on screen to say
+   * why. A resume key is a fresh array each time it comes back from IndexedDB,
+   * so callers compare it by value through sameKey.
+   */
+  paging: {
+    tweets: { query: '', nextKey: null, hasMore: false, rendered: new Set() },
+    following: { query: '', nextKey: null, hasMore: false, rendered: new Set() },
+    followers: { query: '', nextKey: null, hasMore: false, rendered: new Set() }
+  },
   loading: false,
   exporting: false,
   exportingMedia: false,
-  renderedIds: new Set(),
   objectUrls: [],
   expanded: new Set(),
   armedDeleteId: null,
@@ -116,6 +132,11 @@ const els = {
   export: document.getElementById('btn-export'),
   notice: document.getElementById('notice'),
   list: document.getElementById('list'),
+  connections: document.getElementById('connections'),
+  viewswitch: document.getElementById('viewswitch'),
+  viewTweets: document.getElementById('view-tweets'),
+  viewFollowing: document.getElementById('view-following'),
+  viewFollowers: document.getElementById('view-followers'),
   more: document.getElementById('btn-more'),
   listHint: document.getElementById('list-hint'),
   diagnostics: document.getElementById('diagnostics'),
@@ -127,6 +148,8 @@ const els = {
   optBackfillMedia: document.getElementById('opt-backfill-media'),
   fillMedia: document.getElementById('btn-fill-media'),
   optCaptureReplies: document.getElementById('opt-capture-replies'),
+  optCaptureConnections: document.getElementById('opt-capture-connections'),
+  noteConnections: document.getElementById('note-connections'),
   cleanup: document.getElementById('cleanup'),
   purgeSuperseded: document.getElementById('btn-purge-superseded'),
   purgeDeleted: document.getElementById('btn-purge-deleted'),
@@ -397,16 +420,19 @@ async function refreshState() {
   }
   state.settings = Object.assign({}, DEFAULT_SETTINGS, response.settings || {});
   state.stats = response.stats || null;
-  state.counts = response.counts || { tweets: null, media: null };
+  state.counts = response.counts || { tweets: null, media: null, following: null, followers: null };
   state.purgeCounts = Object.assign({ superseded: 0, deleted: 0 }, response.purgeCounts || {});
   state.mediaPermission = response.mediaPermission === true;
+  state.ownAuthorCount = Number.isInteger(response.ownAuthorCount) ? response.ownAuthorCount : 0;
   renderCleanup();
+  renderConnectionsNote();
 
   els.optDebug.checked = state.settings.debug === true;
   els.optThumbs.checked = state.settings.showRemoteThumbnails === true;
   els.optMedia.checked = state.settings.mediaCache === true;
   els.optBackfillMedia.checked = state.settings.backfillMedia === true;
   els.optCaptureReplies.checked = state.settings.captureReplies === true;
+  els.optCaptureConnections.checked = state.settings.captureConnections === true;
   // Meaningless without the master switch, so it says so rather than looking
   // like a setting that does nothing.
   els.optBackfillMedia.disabled = state.settings.mediaCache !== true;
@@ -545,6 +571,13 @@ function renderDiagnostics() {
     // them back in.
     [t('diagDetailSeen'), String(page.detailSeen || 0), ''],
     [t('diagDetailKept'), String(page.detailKept || 0), ''],
+    // The follow lists, counted on their own for the same reason: a page read is
+    // not a post kept, and the third row is the one that explains an empty
+    // roster — a list seen and refused because the request did not name an
+    // account this browser knows is its own.
+    [t('diagConnectionsSeen'), String(page.connectionsSeen || 0), ''],
+    [t('diagConnectionsKept'), String(page.connectionsKept || 0), ''],
+    [t('diagConnectionsNoOwner'), String(page.connectionsNoOwner || 0), ''],
     [t('diagReceived'), String(lifetime.received || 0), ''],
     [t('diagMarkedDeleted'), String(lifetime.deletedMarked || 0), ''],
     [t('diagUnmatchedDelete'), String(lifetime.deletedUnmatched || 0), ''],
@@ -552,6 +585,11 @@ function renderDiagnostics() {
     [t('diagBackfillSkipped'), String(lifetime.backfillSkipped || 0), ''],
     [t('diagLinksFilled'), String(lifetime.linksFilled || 0), lifetime.linksFilled ? 'is-good' : ''],
     [t('diagLinksUnmatched'), String(lifetime.linksUnmatched || 0), ''],
+    // New people written against people already known. One counter could not
+    // tell a roster that has stopped growing from one being written to
+    // constantly, and those want opposite investigations.
+    [t('diagConnectionsAdded'), String(lifetime.connectionsAdded || 0), lifetime.connectionsAdded ? 'is-good' : ''],
+    [t('diagConnectionsRefreshed'), String(lifetime.connectionsRefreshed || 0), ''],
     [t('diagUpsertOk'), String(lifetime.upsertOk || 0), lifetime.upsertOk ? 'is-good' : ''],
     [t('diagUpsertFailed'), String(lifetime.upsertFailed || 0), lifetime.upsertFailed ? 'is-bad' : ''],
     [t('diagRejected'), String(lifetime.rejected || 0), lifetime.rejected ? 'is-bad' : ''],
@@ -574,28 +612,250 @@ function renderDiagnostics() {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Which list is on screen                                                    */
+/* -------------------------------------------------------------------------- */
+
+/* Three views, two kinds of list. The roster's two share everything — same
+   query function, same row renderer, same empty state, same paging loop — and
+   differ only in which store list they ask for, which rides in the paging
+   options rather than in a second code path. */
+
+function isRosterView() {
+  return state.view !== 'tweets';
+}
+
+/** The paging record for the view on screen. */
+function paging() {
+  return state.paging[state.view];
+}
+
+/** The scroll container for the view on screen. */
+function viewElement() {
+  return isRosterView() ? els.connections : els.list;
+}
+
+/** What identifies a row, for the "already drawn" set. */
+function rowKey(record) {
+  return isRosterView() ? record.list + ':' + record.userId : record.id;
+}
+
+/** One page of the view on screen, from the database. */
+function queryView(options) {
+  if (!isRosterView()) return queryTweets(state.db, options);
+  return queryConnections(state.db, Object.assign({ list: state.view }, options));
+}
+
+/**
+ * The layout the roster view needs, as a media query string.
+ *
+ * The same 610 popup.css uses to decide whether this page is a toolbar popup or
+ * a real page, and the two have to mean the same thing. They are not two
+ * sources of truth for one decision: CSS hides the switch, and this read only
+ * decides whether the roster is reachable at all. If they ever disagreed the
+ * failure is one-directional — a view hidden with its switch still on screen —
+ * which is why CSS is the thing that actually enforces visibility.
+ */
+const PAGE_LAYOUT_QUERY = '(min-height: 610px)';
+
+function pageLayoutMatches() {
+  try {
+    return window.matchMedia(PAGE_LAYOUT_QUERY).matches;
+  } catch (_) {
+    return false;
+  }
+}
+
+function renderViewTabs() {
+  els.viewTweets.classList.toggle('is-active', state.view === 'tweets');
+  els.viewFollowing.classList.toggle('is-active', state.view === 'following');
+  els.viewFollowers.classList.toggle('is-active', state.view === 'followers');
+}
+
+/**
+ * Show one of the three lists.
+ *
+ * Switching back to a view that is already drawn costs nothing: its container is
+ * left alone, its blob URLs stay alive, and its paging state still says where it
+ * got to. Nothing is re-fetched, so moving between Posts and the roster does not
+ * lose the reader's place in either.
+ */
+async function setView(next) {
+  if (!Object.prototype.hasOwnProperty.call(state.paging, next)) return;
+  if (next === state.view) return;
+
+  state.view = next;
+  renderViewTabs();
+
+  els.list.hidden = next !== 'tweets';
+  els.connections.hidden = next === 'tweets';
+
+  // The search box is one element serving both lists, so its contents have to be
+  // swapped with the view rather than left behind — see the input handler.
+  els.search.value = paging().query;
+  els.search.placeholder = next === 'tweets'
+    ? t('searchPlaceholder')
+    : t('searchPlaceholderConnections');
+
+  if (paging().rendered.size > 0 || viewElement().firstChild !== null) {
+    updateListFooter();
+    return;
+  }
+  await reload();
+}
+
+/**
+ * The line under the follow-list switch.
+ *
+ * Two states, because "on and working" and "on but it cannot possibly store
+ * anything yet" are identical from the outside otherwise — and the second is not
+ * an error, it is a browser that has never seen this account publish. A switch
+ * that silently does nothing is indistinguishable from a broken one, so it says
+ * which it is. Deliberately NOT disabled in that state: the dependency is a fact
+ * about history rather than another setting, and a disabled box with nothing to
+ * fix reads as a broken control.
+ */
+function renderConnectionsNote() {
+  els.noteConnections.textContent = state.ownAuthorCount > 0
+    ? t('noteConnections')
+    : t('noteConnectionsInactive');
+}
+
+/** Thousands separators, in whatever locale the browser is set to. */
+function formatCount(value) {
+  try {
+    return Number(value).toLocaleString();
+  } catch (_) {
+    return String(value);
+  }
+}
+
+/**
+ * One person in the roster.
+ *
+ * Built with createElement and textContent like every other row in this file: a
+ * handle and a bio are other people's text and are never markup.
+ *
+ * The profile link is built from the NUMERIC ID rather than the handle, because
+ * the whole reason a roster exists is the day the handle no longer resolves —
+ * `x.com/i/user/<id>` survives a rename, and a link built from a handle that has
+ * since been taken would point at somebody else.
+ */
+function renderConnection(record) {
+  const article = document.createElement('article');
+  article.className = 'conn';
+  article.dataset.id = record.userId;
+
+  const head = document.createElement('div');
+  head.className = 'conn__head';
+
+  const name = document.createElement('span');
+  name.className = 'conn__name';
+  name.textContent = (typeof record.name === 'string' && record.name.length > 0)
+    ? record.name
+    : t('unknownAuthor');
+  head.appendChild(name);
+
+  if (typeof record.screenName === 'string' && record.screenName.length > 0) {
+    const handle = document.createElement('span');
+    handle.className = 'conn__handle';
+    handle.textContent = '@' + record.screenName;
+    head.appendChild(handle);
+  }
+
+  if (record.blueVerified === true || record.verified === true) {
+    const badge = document.createElement('span');
+    badge.className = 'conn__badge';
+    badge.textContent = t('badgeVerified');
+    head.appendChild(badge);
+  }
+
+  article.appendChild(head);
+
+  if (typeof record.bio === 'string' && record.bio.length > 0) {
+    const bio = document.createElement('p');
+    bio.className = 'conn__bio';
+    bio.textContent = record.bio;
+    article.appendChild(bio);
+  }
+
+  const meta = document.createElement('div');
+  meta.className = 'conn__meta';
+
+  const numbers = [];
+  if (typeof record.followersCount === 'number') {
+    numbers.push(t('connFollowers', [formatCount(record.followersCount)]));
+  }
+  if (typeof record.followingCount === 'number') {
+    numbers.push(t('connFollowing', [formatCount(record.followingCount)]));
+  }
+  if (typeof record.tweetCount === 'number') {
+    numbers.push(t('connPosts', [formatCount(record.tweetCount)]));
+  }
+  for (const text of numbers) {
+    const span = document.createElement('span');
+    span.textContent = text;
+    meta.appendChild(span);
+  }
+
+  if (typeof record.location === 'string' && record.location.length > 0) {
+    const place = document.createElement('span');
+    place.textContent = record.location;
+    meta.appendChild(place);
+  }
+
+  const seen = document.createElement('span');
+  seen.textContent = t('connSeen', [formatRelative(record.lastSeenAt)]);
+  seen.title = t('connSeenTitle', [String(record.firstSeenAt || ''), String(record.lastSeenAt || '')]);
+  meta.appendChild(seen);
+
+  const open = document.createElement('a');
+  open.className = 'conn__link';
+  open.href = 'https://x.com/i/user/' + record.userId;
+  open.target = '_blank';
+  open.rel = 'noopener noreferrer';
+  open.textContent = t('openProfile');
+  meta.appendChild(open);
+
+  article.appendChild(meta);
+  return article;
+}
+
+/* -------------------------------------------------------------------------- */
 /* List rendering                                                             */
 /* -------------------------------------------------------------------------- */
 
 function listIsEmpty() {
-  return els.list.querySelector('.card') === null;
+  return viewElement().querySelector('.card, .conn') === null;
+}
+
+/**
+ * The wording for an empty list.
+ *
+ * Written as explicit branches with literal t() calls, not a lookup keyed by
+ * view. tools/check-i18n.mjs only counts keys it can see written out literally,
+ * so a computed key reads as "defined but unused" and fails the check — and a
+ * typo in one would reach the screen as a raw key name.
+ */
+function emptyStateText() {
+  const term = paging().query;
+  if (!isRosterView()) {
+    return term.length > 0 ? t('emptyNoMatch', [term]) : t('emptyNone');
+  }
+  return term.length > 0 ? t('emptyConnectionsNoMatch', [term]) : t('emptyConnections');
 }
 
 function showEmptyState() {
   if (!listIsEmpty()) return;
-  while (els.list.firstChild) els.list.removeChild(els.list.firstChild);
+  const box = viewElement();
+  while (box.firstChild) box.removeChild(box.firstChild);
   const div = document.createElement('div');
   div.className = 'empty';
-  if (state.query.length > 0) {
-    div.textContent = t('emptyNoMatch', [state.query]);
-  } else {
-    div.textContent = t('emptyNone');
-  }
-  els.list.appendChild(div);
+  div.textContent = emptyStateText();
+  box.appendChild(div);
 }
 
 function clearEmptyState() {
-  const empty = els.list.querySelector('.empty');
+  const empty = viewElement().querySelector('.empty');
   if (empty) empty.remove();
 }
 
@@ -1152,15 +1412,23 @@ function syncExpandVisibility(card) {
 
 function appendItems(items) {
   let appended = 0;
+  const box = viewElement();
+  const drawn = paging().rendered;
   for (const record of items) {
-    if (!record || typeof record.id !== 'string') continue;
-    if (state.renderedIds.has(record.id)) continue;
-    state.renderedIds.add(record.id);
+    if (!record || typeof record !== 'object') continue;
+    const key = rowKey(record);
+    if (typeof key !== 'string' || key.length === 0) continue;
+    if (drawn.has(key)) continue;
+    drawn.add(key);
 
-    const card = renderCard(record);
-    els.list.appendChild(card);
-    // Reading scrollHeight forces layout, so the measurement is valid here.
-    syncExpandVisibility(card);
+    if (isRosterView()) {
+      box.appendChild(renderConnection(record));
+    } else {
+      const card = renderCard(record);
+      box.appendChild(card);
+      // Reading scrollHeight forces layout, so the measurement is valid here.
+      syncExpandVisibility(card);
+    }
     appended++;
   }
   if (appended > 0) clearEmptyState();
@@ -1168,11 +1436,12 @@ function appendItems(items) {
 }
 
 function updateListFooter() {
-  els.more.hidden = state.hasMore !== true;
+  const view = paging();
+  els.more.hidden = view.hasMore !== true;
   els.more.disabled = state.loading === true;
   els.more.textContent = state.loading ? t('loading') : t('loadMore');
 
-  const rendered = state.renderedIds.size;
+  const rendered = view.rendered.size;
   if (rendered === 0) {
     els.listHint.textContent = '';
     return;
@@ -1181,9 +1450,18 @@ function updateListFooter() {
   // almost always, since a normal archive fits in the first page — so the hint
   // permanently claimed something the user could already see for themselves
   // (the 加载更多 button is absent). Only the useful half is kept.
-  els.listHint.textContent = state.hasMore
-    ? t('listShownMore', [String(rendered)])
-    : t('listShown', [String(rendered)]);
+  //
+  // Literal keys, not a table, for the same reason emptyStateText spells its own
+  // out: the i18n checker cannot see a computed one.
+  if (isRosterView()) {
+    els.listHint.textContent = view.hasMore
+      ? t('listShownConnectionsMore', [String(rendered)])
+      : t('listShownConnections', [String(rendered)]);
+  } else {
+    els.listHint.textContent = view.hasMore
+      ? t('listShownMore', [String(rendered)])
+      : t('listShown', [String(rendered)]);
+  }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1192,23 +1470,24 @@ function updateListFooter() {
 
 async function fetchBatch(targetCount) {
   const collected = [];
+  const view = paging();
   let rounds = 0;
 
   while (collected.length < targetCount && rounds < 8) {
     rounds++;
     const remaining = targetCount - collected.length;
-    const previousKey = state.nextKey;
+    const previousKey = view.nextKey;
 
-    const page = await queryTweets(state.db, {
-      query: state.query,
+    const page = await queryView({
+      query: view.query,
       pageSize: remaining,
-      afterKey: state.nextKey,
+      afterKey: view.nextKey,
       scanBudget: 20000
     });
 
     for (const record of page.items) collected.push(record);
-    state.nextKey = page.nextKey;
-    state.hasMore = page.hasMore;
+    view.nextKey = page.nextKey;
+    view.hasMore = page.hasMore;
 
     if (!page.hasMore) break;
     if (page.nextKey === null) break;
@@ -1216,7 +1495,7 @@ async function fetchBatch(targetCount) {
     // sameKey comes from db.js — the same rule queryTweets itself applies, so
     // the two cannot drift apart.
     if (page.items.length === 0 && sameKey(page.nextKey, previousKey)) {
-      state.hasMore = false;
+      view.hasMore = false;
       break;
     }
   }
@@ -1229,11 +1508,18 @@ async function reload() {
   state.loading = true;
   setNotice('');
   try {
-    while (els.list.firstChild) els.list.removeChild(els.list.firstChild);
-    revokeObjectUrls();
-    state.renderedIds = new Set();
-    state.nextKey = null;
-    state.hasMore = false;
+    const box = viewElement();
+    while (box.firstChild) box.removeChild(box.firstChild);
+    // Only the post list holds blob: URLs, and clearing it here is the only
+    // thing that discards the cards using them. Revoking while the roster is on
+    // screen would break the pictures on the hidden post cards — which are still
+    // in the DOM, and are meant to come back untouched when the view switches.
+    if (!isRosterView()) revokeObjectUrls();
+
+    const view = paging();
+    view.rendered = new Set();
+    view.nextKey = null;
+    view.hasMore = false;
 
     const batch = await fetchBatch(state.settings.pageSize);
     appendItems(batch);
@@ -1247,13 +1533,13 @@ async function reload() {
 }
 
 async function loadMore() {
-  if (state.db === null || state.loading || state.hasMore !== true) return;
+  if (state.db === null || state.loading || paging().hasMore !== true) return;
   state.loading = true;
   updateListFooter();
   try {
     const batch = await fetchBatch(state.settings.pageSize);
     const appended = appendItems(batch);
-    if (appended === 0 && state.hasMore === false) {
+    if (appended === 0 && paging().hasMore === false) {
       showEmptyState();
     }
   } catch (err) {
@@ -1486,9 +1772,40 @@ async function buildTweetsJson() {
   } catch (err) {
     throw new Error(t('errDeletionsUnreadable', [describe(err)]));
   }
-  chunks.push('  "deletions": ' + JSON.stringify(deletions) + '\n}\n');
+  chunks.push('  "deletions": ' + JSON.stringify(deletions));
 
-  return { text: chunks.join(''), count: count, deletions: deletions.length };
+  // The follow roster rides LAST, and that position is load-bearing rather than
+  // tidy. reader.html does not parse this file: it finds the tweet array by
+  // scanning the raw bytes for the literal "tweets" key inside a probe whose
+  // window is measured in kilobytes. Anything placed before that key which grew
+  // large enough to push it past the window would stop the archive opening at
+  // all. Nothing after `count` is read by that scanner, so this section can be
+  // any size it likes.
+  //
+  // A failed read STOPS the export, for the same reason the deletion log does: a
+  // file that looks complete while silently omitting everyone you follow is
+  // worse than no file at all.
+  let connections;
+  try {
+    connections = await listConnections(state.db);
+  } catch (err) {
+    throw new Error(t('errConnectionsUnreadable', [describe(err)]));
+  }
+
+  // Omitted entirely when empty, so an archive belonging to someone who never
+  // switched the feature on is byte-for-byte what earlier versions wrote.
+  if (connections.length > 0) {
+    chunks.push(',\n  "connections": ' + JSON.stringify(connections) + '\n}\n');
+  } else {
+    chunks.push('\n}\n');
+  }
+
+  return {
+    text: chunks.join(''),
+    count: count,
+    deletions: deletions.length,
+    connections: connections.length
+  };
 }
 
 async function exportAll() {
@@ -1623,15 +1940,25 @@ async function exportArchive() {
     const generatedAt = new Date().toISOString();
     setNotice(t('busyPacking', [String(built.count), String(rows.length)]));
 
+    const extraFiles = [
+      { name: 'tweets.json', text: built.text, date: new Date() },
+      { name: 'MEDIA-INDEX.txt', text: describeMediaArchive(rows, { generatedAt: generatedAt, skipped: skipped, connections: built.connections }), date: new Date() },
+      { name: 'MEDIA-INDEX.json', text: buildMediaIndexJson(rows, { generatedAt: generatedAt, skipped: skipped, schemaVersion: SCHEMA_VERSION, version: extensionVersion() }), date: new Date() }
+    ];
+
+    // Only when there is a roster to write. An archive from someone who never
+    // switched the feature on gets exactly the file list it always got.
+    if (built.connections > 0) {
+      extraFiles.push({
+        name: 'CONNECTIONS.csv',
+        text: buildConnectionsCsv(await listConnections(state.db)),
+        date: new Date()
+      });
+    }
+
     const zip = await buildZip(
       rows.map((row) => ({ name: row.fileName, blob: row.blob, date: row.date })),
-      {
-        extraFiles: [
-          { name: 'tweets.json', text: built.text, date: new Date() },
-          { name: 'MEDIA-INDEX.txt', text: describeMediaArchive(rows, { generatedAt: generatedAt, skipped: skipped }), date: new Date() },
-          { name: 'MEDIA-INDEX.json', text: buildMediaIndexJson(rows, { generatedAt: generatedAt, skipped: skipped, schemaVersion: SCHEMA_VERSION, version: extensionVersion() }), date: new Date() }
-        ]
-      }
+      { extraFiles: extraFiles }
     );
 
     let message;
@@ -1845,7 +2172,10 @@ function bindEvents() {
     if (state.searchTimer !== null) clearTimeout(state.searchTimer);
     state.searchTimer = setTimeout(() => {
       state.searchTimer = null;
-      state.query = els.search.value.trim();
+      // The term belongs to the view it was typed in. One shared term would
+      // empty the other list the moment you switched, with nothing on screen to
+      // say the filter had followed you.
+      paging().query = els.search.value.trim();
       void reload();
     }, 250);
   });
@@ -1853,10 +2183,16 @@ function bindEvents() {
   els.search.addEventListener('keydown', (event) => {
     if (event.key === 'Escape') {
       els.search.value = '';
-      state.query = '';
+      paging().query = '';
       void reload();
     }
   });
+
+  for (const name of ['tweets', 'following', 'followers']) {
+    const button = name === 'tweets' ? els.viewTweets
+      : (name === 'following' ? els.viewFollowing : els.viewFollowers);
+    button.addEventListener('click', () => { void setView(name); });
+  }
 
   els.export.addEventListener('click', () => {
     void exportAll();
@@ -1943,6 +2279,15 @@ function bindEvents() {
     })();
   });
 
+  els.optCaptureConnections.addEventListener('change', () => {
+    void (async () => {
+      const on = els.optCaptureConnections.checked;
+      const ok = await applySettings({ captureConnections: on });
+      if (ok) setNotice(on ? t('okCaptureConnectionsOn') : t('okCaptureConnectionsOff'), 'ok');
+      renderConnectionsNote();
+    })();
+  });
+
   // Only ever shows what is stored, so this is the way back to the panel for
   // anyone who answered it before understanding one of the costs.
   els.choiceShow.addEventListener('click', () => openChoicePanel());
@@ -1988,6 +2333,19 @@ function bindEvents() {
     }, 150);
   });
 
+  // The switch's visibility is CSS's decision, but WHICH VIEW is up is state,
+  // and the two can come apart: a phone's bottom sheet resized under the page,
+  // a window dragged shorter — the switch disappears and the roster would be
+  // stranded with no way back to the posts. So the layout is re-derived here and
+  // the view is sent home when it stops being reachable.
+  try {
+    const layout = window.matchMedia(PAGE_LAYOUT_QUERY);
+    const onLayoutChange = () => {
+      if (!pageLayoutMatches() && isRosterView()) void setView('tweets');
+    };
+    if (typeof layout.addEventListener === 'function') layout.addEventListener('change', onLayoutChange);
+  } catch (_) { /* the switch is hidden by CSS regardless, so this is belt only */ }
+
   els.resetStats.addEventListener('click', () => {
     void (async () => {
       const response = await send({ type: 'XTB_RESET_STATS' });
@@ -2016,7 +2374,15 @@ async function init() {
   try {
     state.db = await openDB();
   } catch (err) {
-    setNotice(t('errOpenDb', [describe(err)]), 'error');
+    // A popup (or tab) left open across an extension update opens the database
+    // at the version ITS copy of db.js knows, and gets a VersionError whose raw
+    // text — "The requested version (3) is less than the existing version (4)" —
+    // explains nothing to anyone. The fix is one reload, so say that instead.
+    if (err && err.name === 'VersionError') {
+      setNotice(t('errPageOutdated', [describe(err)]), 'error');
+    } else {
+      setNotice(t('errOpenDb', [describe(err)]), 'error');
+    }
     state.db = null;
     return;
   }
@@ -2045,6 +2411,7 @@ async function init() {
   // same schedule whether the panel is up or has been answered for months.
   if (state.settings.choicePanelAnswered !== true) openChoicePanel();
 
+  renderViewTabs();
   await reload();
 }
 

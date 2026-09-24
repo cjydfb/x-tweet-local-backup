@@ -216,5 +216,38 @@
   "okExportStarted": { "message": "Download started: $1 records to $2. This browser cannot confirm the download finished — check that the file arrived before relying on it" },
   "okArchiveStarted": { "message": "Download started: $1 records + $2 media files ($3). This browser cannot confirm the download finished — check that the file arrived before relying on it" },
 
+  "optCaptureConnections": { "message": "Record your follow lists (Following and Followers)" },
+  "okCaptureConnectionsOn": { "message": "Follow lists on — open your own Following or Followers page and scroll" },
+  "okCaptureConnectionsOff": { "message": "Follow lists off" },
+  "noteConnections": { "message": "Every account on your own Following and Followers pages is saved as you scroll them — handle, name, bio and counts. Nothing is ever read from anyone else's list. Handles change, so the numeric id is what this archive keys on. Absence is never recorded: someone missing from the list has simply not been scrolled past yet." },
+  "noteConnectionsInactive": { "message": "Not active yet: this browser has not seen you publish, so it does not know which account is yours. Post or reply once on x.com and it starts working." },
+
+  "viewSwitchAria": { "message": "Which list to show" },
+  "viewTweets": { "message": "Posts" },
+  "viewFollowing": { "message": "Following" },
+  "viewFollowers": { "message": "Followers" },
+  "connectionsAria": { "message": "Follow list" },
+  "searchPlaceholderConnections": { "message": "Search handle, name, bio or id" },
+  "emptyConnections": { "message": "Nobody recorded yet. Open your own Following or Followers page and scroll down — every page you load is added here." },
+  "emptyConnectionsNoMatch": { "message": "Nobody matches \"$1\"." },
+  "listShownConnections": { "message": "Showing $1" },
+  "listShownConnectionsMore": { "message": "Showing $1 (more below)" },
+  "connFollowers": { "message": "$1 followers" },
+  "connFollowing": { "message": "$1 following" },
+  "connPosts": { "message": "$1 posts" },
+  "connSeen": { "message": "seen $1" },
+  "connSeenTitle": { "message": "First seen $1\nLast seen $2" },
+  "badgeVerified": { "message": "Verified" },
+  "openProfile": { "message": "Profile" },
+
+  "errConnectionsUnreadable": { "message": "the follow lists could not be read ($1), so the export was stopped rather than writing a file that looks complete but is missing everyone you follow" },
+  "errPageOutdated": { "message": "This page was loaded by an older version of the extension ($1). Reload it to continue." },
+
+  "diagConnectionsSeen": { "message": "Follow lists read on this page" },
+  "diagConnectionsKept": { "message": "People recorded from them" },
+  "diagConnectionsNoOwner": { "message": "Follow lists dropped — not your account" },
+  "diagConnectionsAdded": { "message": "Roster rows written (someone new)" },
+  "diagConnectionsRefreshed": { "message": "Roster rows refreshed (already known)" },
+
   "tzNote": { "message": "All timestamps are UTC. Local time = UTC + offsetMinutes." }
 }
