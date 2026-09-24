@@ -110,7 +110,8 @@
       // Sent on every handshake, not only on change: the page realm needs these
       // before it can decide whether a profile timeline belongs to its owner.
       ownAuthorIds: ownAuthorIds,
-      captureReplies: captureReplies
+      captureReplies: captureReplies,
+      captureConnections: captureConnections
     });
 
     if (handshakeIndex < HANDSHAKE_RETRY_MS.length - 1) {
@@ -255,6 +256,71 @@
 
     if (records.length === 0) return null;
     return { records: records };
+  }
+
+  /** A follow list is fifty rows a page; the page caps itself at the same number. */
+  const MAX_CONNECTION_RECORDS = 200;
+  const MAX_CONNECTION_BYTES = 1024 * 1024;
+
+  /**
+   * A follow-list batch: rows about other people, from a page that already
+   * decided they belong to one of this account's own lists.
+   *
+   * `list` and `ownerId` are required on the MESSAGE and are not read from the
+   * rows. One response is one list belonging to one account, so hoisting them
+   * removes a whole class of forgery — a row claiming a different list than the
+   * batch it arrived in — and it is also what background.js uses to build the
+   * record's primary key, which must not be something a row can assert.
+   *
+   * Row checks are deliberately minimal here: the fields are rebuilt from a
+   * whitelist in background.js, so all this side has to establish is that each
+   * row is an object with a numeric id. Anything else it demanded would be a
+   * second, weaker copy of the whitelist.
+   */
+  function validateConnections(raw) {
+    if (!isObject(raw)) return null;
+    if (!isObject(raw.payload)) return null;
+
+    const payload = raw.payload;
+    if (payload.list !== 'following' && payload.list !== 'followers') return null;
+    if (!isTweetId(payload.ownerId)) return null;
+    if (!Array.isArray(payload.records)) return null;
+    if (payload.records.length === 0) return null;
+
+    const incoming = payload.records;
+    const limit = Math.min(incoming.length, MAX_CONNECTION_RECORDS);
+    const overCap = incoming.length - limit;
+    const records = [];
+    let dropped = 0;
+
+    for (let i = 0; i < limit; i++) {
+      const record = incoming[i];
+      if (!isObject(record) || !isTweetId(record.userId)) {
+        dropped++;
+        continue;
+      }
+      records.push(record);
+    }
+    dropped += overCap;
+
+    let serialized;
+    try {
+      serialized = JSON.stringify(records);
+    } catch (_) {
+      return null;
+    }
+    if (typeof serialized !== 'string' || serialized.length > MAX_CONNECTION_BYTES) {
+      reportRejection('a follow-list batch exceeded ' + MAX_CONNECTION_BYTES + ' bytes');
+      return null;
+    }
+
+    if (dropped > 0) {
+      reportRejection('dropped ' + dropped + ' of ' + incoming.length + ' follow-list rows before storage' +
+        (overCap > 0 ? ' (' + overCap + ' beyond the ' + MAX_CONNECTION_RECORDS + '-row cap)' : ''));
+    }
+
+    if (records.length === 0) return null;
+    return { list: payload.list, ownerId: payload.ownerId, records: records };
   }
 
   /** How many link targets one post can have. X's own cap; the page applies it too. */
@@ -446,6 +512,19 @@
         return;
       }
 
+      if (data.type === 'X_CONNECTIONS_SEEN') {
+        const payload = validateConnections(data);
+        if (payload === null) {
+          log('rejected malformed follow-list payload');
+          return;
+        }
+        forwardToBackground({
+          type: 'X_CONNECTIONS_SEEN',
+          payload: payload
+        });
+        return;
+      }
+
       if (data.type === 'X_TWEET_DELETED') {
         // A delete carries no tweet content — only which id was removed and
         // when — so it gets its own narrow validation rather than reusing the
@@ -530,7 +609,8 @@
       token: sessionToken,
       debug: debugEnabled,
       ownAuthorIds: ownAuthorIds,
-      captureReplies: captureReplies
+      captureReplies: captureReplies,
+      captureConnections: captureConnections
     });
   }
 
@@ -541,6 +621,16 @@
    * read and then thrown away.
    */
   let captureReplies = false;
+
+  /**
+   * Whether the page realm should also read your Following and Followers pages.
+   *
+   * Mirrored for the same reason as captureReplies, and it matters more here:
+   * these are the only responses this extension reads that are about other
+   * people, so a line left switched on by accident is a privacy problem rather
+   * than just a waste.
+   */
+  let captureConnections = false;
 
   /**
    * The account ids learned so far, mirrored into the page realm.
@@ -569,6 +659,10 @@
     }
     if (typeof settings.captureReplies === 'boolean' && settings.captureReplies !== captureReplies) {
       captureReplies = settings.captureReplies;
+      changed = true;
+    }
+    if (typeof settings.captureConnections === 'boolean' && settings.captureConnections !== captureConnections) {
+      captureConnections = settings.captureConnections;
       changed = true;
     }
     if (changed) pushConfig();

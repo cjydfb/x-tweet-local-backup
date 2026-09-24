@@ -33,6 +33,9 @@ import {
   countTweetsByFilter,
   purgeTweets,
   forEachTweet,
+  upsertConnection,
+  countConnections,
+  CONNECTION_LISTS,
   PURGE_FILTERS,
   SCHEMA_VERSION
 } from './db.js';
@@ -493,6 +496,97 @@ function sanitizeLinkFill(raw) {
   if (urls.length === 0) return null;
 
   return { id: id, urls: urls };
+}
+
+/**
+ * A screen name, or an empty string. Never null.
+ *
+ * The empty string is load-bearing: `screenNameLower` is part of the roster's
+ * index key, and IndexedDB writes NO index entry at all for a record whose key
+ * component is invalid. A null there would leave the row in the store but
+ * missing from every listing, which is the silent loss this archive exists to
+ * prevent. An empty string is a valid key that sorts to the top, where a
+ * nameless person is easy to see and fix.
+ */
+function asHandle(value) {
+  const s = asString(value, 20);
+  if (s === null || !/^[A-Za-z0-9_]{1,15}$/.test(s)) return null;
+  return s;
+}
+
+/**
+ * Rebuild one roster row from a whitelist.
+ *
+ * Like sanitizeLinkFill this does NOT go through sanitizeRecord: a person is not
+ * a tweet, and accepting a capture-shaped payload here would invite a forged one
+ * to be stored as one. Every field is either copied through a coercion or
+ * dropped; nothing arrives by default.
+ *
+ * `list` and `ownerId` come from the MESSAGE, not the row — see validateConnections
+ * in content.js. They are the row's primary key, and a key a row could assert
+ * for itself is a key a forged row could pick.
+ */
+function sanitizeConnection(raw, list, ownerId) {
+  if (!isObject(raw)) return null;
+
+  const userId = normalizeId(raw.userId);
+  if (userId === null) return null;
+
+  const handle = asHandle(raw.screenName);
+  const bioUrls = sanitizeEntityUrls(raw.bioUrls);
+
+  return {
+    list: list,
+    userId: userId,
+    screenName: handle,
+    screenNameLower: handle === null ? '' : handle.toLowerCase(),
+    name: asNonEmptyString(raw.name, 200),
+    accountCreatedAt: asIsoString(raw.accountCreatedAt, null),
+    bio: asString(raw.bio, 2000),
+    bioUrls: bioUrls,
+    location: asString(raw.location, 200),
+    websiteUrl: sanitizeHttpUrl(raw.websiteUrl),
+    lang: (() => {
+      const s = asString(raw.lang, 20);
+      return (s !== null && /^[a-zA-Z][a-zA-Z0-9-]{0,19}$/.test(s)) ? s : null;
+    })(),
+    blueVerified: asBooleanOrNull(raw.blueVerified),
+    verified: asBooleanOrNull(raw.verified),
+    followersCount: asNumberOrNull(raw.followersCount),
+    followingCount: asNumberOrNull(raw.followingCount),
+    tweetCount: asNumberOrNull(raw.tweetCount),
+    avatarUrl: sanitizeTwimgUrl(raw.avatarUrl),
+    // The account this was seen through. Part of the row's own history, not the
+    // page's data, so it is stamped here rather than read from the payload.
+    ownerIds: [ownerId],
+    source: {
+      operationName: asString(raw.source && raw.source.operationName, 60),
+      capturedVia: asString(raw.source && raw.source.capturedVia, 10)
+    },
+    schemaVersion: SCHEMA_VERSION
+  };
+}
+
+/** Every usable row in one follow-list message. Returns null if the batch cannot be one. */
+function sanitizeConnections(payload) {
+  if (!isObject(payload)) return null;
+  if (CONNECTION_LISTS.indexOf(payload.list) === -1) return null;
+
+  const ownerId = normalizeId(payload.ownerId);
+  if (ownerId === null) return null;
+  if (!Array.isArray(payload.records) || payload.records.length === 0) return null;
+
+  const records = [];
+  let rejected = 0;
+  for (let i = 0; i < payload.records.length; i++) {
+    const record = sanitizeConnection(payload.records[i], payload.list, ownerId);
+    if (record === null) {
+      rejected++;
+      continue;
+    }
+    records.push(record);
+  }
+  return { records: records, rejected: rejected };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1020,6 +1114,72 @@ async function handleBackfill(payload) {
 }
 
 /**
+ * Store one page of a Following or Followers list.
+ *
+ * The batch's `seenAt` is taken once, here, from this machine's clock. The
+ * page's clock is forgeable and the row's meaning is "when this browser last
+ * saw them", which only this side knows.
+ *
+ * Nothing here queues media. A roster keeps an avatar URL, not the file, and
+ * enqueueMedia takes a tweet — it reads `tweet.media` — so handing it a person
+ * would be an error the language cannot catch.
+ *
+ * `lastCaptureAt` is deliberately NOT moved by this. That figure sits beside a
+ * count of archived posts and is read as "when did I last back something up";
+ * a follow list being paged through is not that, and moving it would make the
+ * number answer a different question than the one it is displayed for.
+ */
+async function handleConnections(payload) {
+  const sanitized = sanitizeConnections(payload);
+  if (sanitized === null) {
+    await bumpLifetime({ rejected: 1 }, 'rejected a follow-list payload that could not be one');
+    return { ok: false, error: 'invalid payload' };
+  }
+
+  let db;
+  try {
+    db = await openDB();
+  } catch (err) {
+    await bumpLifetime({ upsertFailed: 1 }, 'IndexedDB open failed: ' + describe(err));
+    return { ok: false, error: 'database unavailable' };
+  }
+
+  const seenAt = new Date().toISOString();
+  let added = 0;
+  let refreshed = 0;
+  let rejected = sanitized.rejected;
+
+  for (let i = 0; i < sanitized.records.length; i++) {
+    try {
+      const result = await upsertConnection(db, sanitized.records[i], seenAt);
+      if (result.existed) refreshed++;
+      else added++;
+    } catch (err) {
+      // One bad row must not cost the rest of the page.
+      rejected++;
+      log('connection row failed', describe(err));
+    }
+  }
+
+  await bumpLifetime({ connectionsAdded: added, connectionsRefreshed: refreshed, rejected: rejected });
+  log('follow list (' + sanitized.records[0].list + '): ' + added + ' new, ' + refreshed +
+      ' already known, ' + rejected + ' rejected');
+
+  // Nothing written and at least one row refused: the page accomplished nothing,
+  // and saying so is what turns a silent dead capture into something the panel
+  // can show. A page where every person was ALREADY known is a success, not a
+  // failure, and does not land here.
+  if (added === 0 && refreshed === 0 && rejected > 0) {
+    return {
+      ok: false, error: 'every row in the follow list was rejected (' + rejected + ')',
+      added: added, refreshed: refreshed, rejected: rejected
+    };
+  }
+
+  return { ok: true, added: added, refreshed: refreshed, rejected: rejected };
+}
+
+/**
  * Fetch the media files for posts that have a media address but no file.
  *
  * Two ways an archive ends up in that state: it was written before media
@@ -1195,6 +1355,11 @@ async function handleMessage(message, sender) {
       return handleBackfill(message.payload);
     }
 
+    case 'X_CONNECTIONS_SEEN': {
+      if (!isTrustedPageSender(sender)) return { ok: false, error: 'untrusted sender' };
+      return handleConnections(message.payload);
+    }
+
     case 'X_TWEET_DELETE': {
       if (!isTrustedPageSender(sender)) return { ok: false, error: 'untrusted sender' };
       return handleDeletion(message.payload);
@@ -1228,19 +1393,34 @@ async function handleMessage(message, sender) {
       }
       let tweets = null;
       let media = null;
+      let following = null;
+      let followers = null;
       try {
         const db = await openDB();
         tweets = await countTweets(db);
         media = await countMedia(db);
+        following = await countConnections(db, 'following');
+        followers = await countConnections(db, 'followers');
       } catch (err) {
         log('count failed', err);
+      }
+      // The popup cannot learn this any other way from here, and it is what
+      // decides which of the two things the roster note says: an empty roster on
+      // a browser that has never seen you publish is not the same state as an
+      // empty one on a browser that has, and only this count tells them apart.
+      let ownAuthorCount = 0;
+      try {
+        ownAuthorCount = (await getOwnAuthors()).length;
+      } catch (err) {
+        log('own author count failed', err);
       }
       const mediaPermission = await hasMediaPermission();
       return {
         ok: true,
         settings: settings,
         stats: stats,
-        counts: { tweets: tweets, media: media },
+        counts: { tweets: tweets, media: media, following: following, followers: followers },
+        ownAuthorCount: ownAuthorCount,
         purgeCounts: purgeCounts,
         mediaPermission: mediaPermission
       };

@@ -12,12 +12,15 @@ export const DB_NAME = 'xTweetBackup';
 // Bumped only when the OBJECT STORES or INDEXES change; additive record fields
 // do not need a migration.
 //   v2 added the `deletions` store (see below).
-export const DB_VERSION = 3;
+//   v3 added the `createdAtId` compound index on `tweets`.
+//   v4 added the `connections` store (see below).
+export const DB_VERSION = 4;
 // Version of the RECORD/export shape. v2 added `lang` and `entities`
-// (link expansions, hashtags, mentions). Records captured under v1 simply have
-// no such fields — the shape is additive, so readers must tolerate their
+// (link expansions, hashtags, mentions); v3 added the `connections` array to the
+// export envelope. Records and files written under an earlier version simply
+// have no such fields — the shape is additive, so readers must tolerate their
 // absence rather than assume them.
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 export const STORE_TWEETS = 'tweets';
 export const STORE_MEDIA = 'media';
@@ -34,6 +37,32 @@ export const STORE_MEDIA = 'media';
  * deletion to whichever machine did archive the tweet.
  */
 export const STORE_DELETIONS = 'deletions';
+
+/**
+ * The follow / follower roster: one row per person, per list.
+ *
+ *   { list, userId, screenName, screenNameLower, name, accountCreatedAt, bio,
+ *     bioUrls, location, websiteUrl, lang, blueVerified, verified,
+ *     followersCount, followingCount, tweetCount, avatarUrl,
+ *     ownerIds, firstSeenAt, lastSeenAt, source, schemaVersion }
+ *
+ * Keyed by [list, userId] rather than by screen name, because a screen name can
+ * be changed and the numeric id cannot. Someone who renames half way through a
+ * sweep would otherwise appear twice under two handles, and a handle released by
+ * a rename and taken by somebody else would quietly merge two people into one
+ * row — the worst outcome in a store whose only job is to say who someone was.
+ *
+ * This store records who was SEEN, never who is gone. A partial scan and a
+ * complete one are indistinguishable from the extension's side: a page nobody
+ * scrolled looks exactly like a page whose people have all left. A removal mark
+ * written on that evidence would invent history, so no such mark exists, and
+ * nothing here should ever grow one without a way to know a sweep reached the
+ * end.
+ */
+export const STORE_CONNECTIONS = 'connections';
+
+/** The two lists this archive keeps. Part of the primary key, so the set is closed. */
+export const CONNECTION_LISTS = ['following', 'followers'];
 
 export const INDEX_CAPTURED_AT = 'capturedAt';
 export const INDEX_CREATED_AT = 'createdAt';
@@ -52,6 +81,24 @@ export const INDEX_MEDIA_TWEET = 'tweetId';
  * tweet id makes every cursor position unique.
  */
 export const INDEX_CREATED_AT_ID = 'createdAtId';
+
+/**
+ * Orders the roster by handle within its list — which is how it is listed,
+ * searched and exported.
+ *
+ * Not by `firstSeenAt`, which looks like "when I followed them" and is not. A
+ * sweep is partial by nature: scroll the top of a list today and the rest next
+ * week, and ordering by first sighting puts the OLDEST follows at the top of the
+ * list, exactly inverted, with nothing to say so. Handle order is what a roster
+ * is for — looking a person up — and it is stable, so two exports of the same
+ * data can be compared.
+ *
+ * `userId` completes the key because the handle alone is not unique: a row whose
+ * handle was unusable stores an empty string, and a released handle can be taken
+ * by someone else. The cursor resume key has to be unique or paging skips rows —
+ * the same reasoning as INDEX_CREATED_AT_ID above.
+ */
+export const INDEX_CONNECTION_LIST = 'listScreenName';
 
 let dbPromise = null;
 
@@ -158,6 +205,20 @@ export function openDB() {
           if (!stores.indexNames.contains(INDEX_CREATED_AT_ID)) {
             stores.createIndex(INDEX_CREATED_AT_ID, ['createdAt', 'id'], { unique: true });
           }
+        }
+      }
+
+      // v3 -> v4: the follow / follower roster gets its own store.
+      //
+      // A new store is the most additive change there is — nothing that already
+      // exists is opened, read or rewritten, so an upgrade cannot lose a tweet.
+      // The index is created on the store handle directly rather than through
+      // request.transaction, which is only needed for adding an index to a store
+      // that was created by an earlier version (see the step above).
+      if (oldVersion < 4) {
+        if (!db.objectStoreNames.contains(STORE_CONNECTIONS)) {
+          const connections = db.createObjectStore(STORE_CONNECTIONS, { keyPath: ['list', 'userId'] });
+          connections.createIndex(INDEX_CONNECTION_LIST, ['list', 'screenNameLower', 'userId'], { unique: true });
         }
       }
     };
@@ -731,7 +792,7 @@ export function clearAll(db) {
       // and the abort discards the clears already queued on it — so listing one
       // too few here does not partially clear, it clears nothing at all and
       // reports failure.
-      tx = db.transaction([STORE_TWEETS, STORE_MEDIA, STORE_DELETIONS], 'readwrite');
+      tx = db.transaction([STORE_TWEETS, STORE_MEDIA, STORE_DELETIONS, STORE_CONNECTIONS], 'readwrite');
     } catch (err) {
       reject(err);
       return;
@@ -742,6 +803,7 @@ export function clearAll(db) {
       tx.objectStore(STORE_TWEETS).clear();
       tx.objectStore(STORE_MEDIA).clear();
       tx.objectStore(STORE_DELETIONS).clear();
+      tx.objectStore(STORE_CONNECTIONS).clear();
     } catch (err) {
       try {
         tx.abort();
@@ -1123,5 +1185,372 @@ export function listMediaKeysForTweet(db, tweetId) {
       cursor.continue();
     };
     transactionDone(tx).then(() => resolve(keys), reject);
+  });
+}
+
+/* -------------------------------------------------------------------------- */
+/* Connections — the follow / follower roster                                 */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * How many own accounts one roster row may remember having been seen through.
+ *
+ * Matches MAX_OWN_AUTHORS in settings.js, which is the only thing that feeds it.
+ * Not imported: this module has no dependencies, and the number is a ceiling on
+ * a union rather than a value the two modules have to agree on exactly.
+ */
+const CONNECTION_OWNER_LIMIT = 20;
+
+/**
+ * Fields a fresh observation may fill but must never blank.
+ *
+ * Measured over fifty real entries of a Following response, only the id, the
+ * handle, the name and the counts arrive every time: a bio arrives 48 times in
+ * 50, a banner 46, a location 28, a website 21. So a later sweep routinely
+ * carries LESS than an earlier one, and overwriting wholesale would let the
+ * thinner observation destroy the only copy of a bio this archive will ever
+ * hold.
+ */
+const CONNECTION_FILL_ONLY = [
+  'screenName', 'name', 'accountCreatedAt', 'bio', 'location', 'websiteUrl',
+  'lang', 'avatarUrl'
+];
+
+const CONNECTION_COUNTS = ['followersCount', 'followingCount', 'tweetCount'];
+const CONNECTION_FLAGS = ['blueVerified', 'verified'];
+
+/**
+ * The own-account ids a row has been seen through, oldest first, deduplicated.
+ *
+ * One Chrome profile can hold more than one X account and `ownAuthorIds` holds
+ * up to twenty of them. Without this the rosters of two accounts would be one
+ * undifferentiated pile with no way to say which account knew whom — and no way
+ * to add the distinction later except by scanning everything again.
+ */
+function unionOwnerIds(previous, fresh) {
+  const out = [];
+  const add = (value) => {
+    if (typeof value !== 'string' || value.length === 0) return;
+    if (out.indexOf(value) === -1) out.push(value);
+  };
+  if (Array.isArray(previous)) previous.forEach(add);
+  if (Array.isArray(fresh)) fresh.forEach(add);
+  return out.slice(0, CONNECTION_OWNER_LIMIT);
+}
+
+/**
+ * Merge a new sighting of a person into the row already stored.
+ *
+ * The opposite rule to upsertTweet, deliberately. A capture carries every field
+ * it knows about and the newest one wins; a roster observation does not, because
+ * the same person comes back with a different subset each time. So a non-empty
+ * new value wins, an empty one never erases, and the two fields that are this
+ * row's own history rather than the page's data — firstSeenAt and ownerIds — are
+ * merged instead of replaced.
+ *
+ * The same principle as mergeLinkEntities: fill the gaps, never take away.
+ */
+function mergeConnection(previous, fresh, seenAt) {
+  const merged = Object.assign({}, fresh);
+
+  for (const field of CONNECTION_FILL_ONLY) {
+    const next = fresh[field];
+    const before = previous[field];
+    const nextEmpty = next === null || next === undefined || next === '';
+    if (nextEmpty && typeof before === 'string' && before.length > 0) {
+      merged[field] = before;
+    }
+  }
+
+  // The counts are numbers, and 0 is a real answer — "this account has no
+  // followers" is not the same as "this response did not carry the field" — so
+  // only a non-number falls back.
+  for (const field of CONNECTION_COUNTS) {
+    if (typeof fresh[field] !== 'number' && typeof previous[field] === 'number') {
+      merged[field] = previous[field];
+    }
+  }
+
+  for (const field of CONNECTION_FLAGS) {
+    if (typeof fresh[field] !== 'boolean' && typeof previous[field] === 'boolean') {
+      merged[field] = previous[field];
+    }
+  }
+
+  if (Array.isArray(fresh.bioUrls) && fresh.bioUrls.length > 0) {
+    merged.bioUrls = fresh.bioUrls;
+  } else if (Array.isArray(previous.bioUrls)) {
+    merged.bioUrls = previous.bioUrls;
+  }
+
+  merged.firstSeenAt = typeof previous.firstSeenAt === 'string' && previous.firstSeenAt.length > 0
+    ? previous.firstSeenAt
+    : seenAt;
+  merged.lastSeenAt = seenAt;
+  merged.ownerIds = unionOwnerIds(previous.ownerIds, fresh.ownerIds);
+
+  return merged;
+}
+
+/**
+ * Record one sighting of one person in one list.
+ *
+ * `seenAt` is supplied by the caller from its own clock, never from the page:
+ * the page's timestamp is forgeable and the row's meaning is "when this browser
+ * last saw them", which only the browser knows.
+ *
+ * Resolves with { existed }.
+ */
+export function upsertConnection(db, record, seenAt) {
+  return new Promise((resolve, reject) => {
+    let tx;
+    try {
+      tx = db.transaction(STORE_CONNECTIONS, 'readwrite');
+    } catch (err) {
+      reject(err);
+      return;
+    }
+
+    const store = tx.objectStore(STORE_CONNECTIONS);
+    let existed = false;
+    let failure = null;
+
+    const done = transactionDone(tx);
+    done.then(
+      () => { if (failure !== null) reject(failure); else resolve({ existed: existed }); },
+      (err) => { if (failure !== null) reject(failure); else reject(err); }
+    );
+
+    try {
+      const getRequest = store.get([record.list, record.userId]);
+      getRequest.onsuccess = () => {
+        const previous = getRequest.result;
+        let merged;
+        if (previous && typeof previous === 'object') {
+          existed = true;
+          merged = mergeConnection(previous, record, seenAt);
+        } else {
+          merged = Object.assign({}, record, { firstSeenAt: seenAt, lastSeenAt: seenAt });
+        }
+
+        // The index key has to be a string. A row whose screenNameLower is null
+        // or missing gets NO index entry at all — it would still be in the store
+        // but gone from every listing, which is the silent loss this archive
+        // exists to prevent. sanitizeConnection guarantees a string; this is the
+        // last gate before the write.
+        if (typeof merged.screenNameLower !== 'string') merged.screenNameLower = '';
+
+        try {
+          store.put(merged);
+        } catch (err) {
+          failure = err;
+          try {
+            tx.abort();
+          } catch (_) { /* ignore */ }
+        }
+      };
+    } catch (err) {
+      failure = err;
+      try {
+        tx.abort();
+      } catch (_) { /* ignore */ }
+    }
+  });
+}
+
+function connectionMatches(record, term) {
+  if (!record || typeof record !== 'object') return false;
+  if (typeof record.screenNameLower === 'string' && record.screenNameLower.indexOf(term) !== -1) return true;
+  if (typeof record.name === 'string' && record.name.toLowerCase().indexOf(term) !== -1) return true;
+  if (typeof record.userId === 'string' && record.userId.indexOf(term) !== -1) return true;
+  if (typeof record.bio === 'string' && record.bio.toLowerCase().indexOf(term) !== -1) return true;
+  if (typeof record.location === 'string' && record.location.toLowerCase().indexOf(term) !== -1) return true;
+  return false;
+}
+
+/**
+ * Paged, handle-ordered listing of one roster, with the same local keyword
+ * search as queryTweets.
+ *
+ * The cursor walks the [list, screenNameLower, userId] index, which orders by
+ * handle within the list. The range is bounded to the one list at both ends:
+ * IndexedDB sorts key types number < date < string < binary < array, so an array
+ * as the second component is greater than every string — which makes
+ * [list, []] an exclusive upper bound covering every row of that list whatever
+ * its handle.
+ */
+export function queryConnections(db, options) {
+  const opts = options || {};
+  const list = typeof opts.list === 'string' ? opts.list : '';
+  const term = typeof opts.query === 'string' ? opts.query.trim().toLowerCase() : '';
+  const pageSize = Number.isInteger(opts.pageSize) && opts.pageSize > 0 ? opts.pageSize : 50;
+  const scanBudget = Number.isInteger(opts.scanBudget) && opts.scanBudget > 0 ? opts.scanBudget : 20000;
+
+  // A resume key is [list, screenNameLower, userId] — a fresh array each time it
+  // comes back from IndexedDB, so callers compare it by value via sameKey.
+  let afterKey = null;
+  if (Array.isArray(opts.afterKey) && opts.afterKey.length === 3) {
+    afterKey = [String(opts.afterKey[0]), String(opts.afterKey[1]), String(opts.afterKey[2])];
+  }
+
+  return new Promise((resolve, reject) => {
+    if (list.length === 0) {
+      resolve({ items: [], hasMore: false, nextKey: null, scanned: 0, exhaustedScan: false });
+      return;
+    }
+
+    let tx;
+    try {
+      tx = db.transaction(STORE_CONNECTIONS, 'readonly');
+    } catch (err) {
+      reject(err);
+      return;
+    }
+
+    const index = tx.objectStore(STORE_CONNECTIONS).index(INDEX_CONNECTION_LIST);
+
+    let range;
+    try {
+      range = afterKey !== null
+        ? IDBKeyRange.bound([list], afterKey, false, true)
+        : IDBKeyRange.bound([list], [list, []], false, true);
+    } catch (_) {
+      range = IDBKeyRange.bound([list], [list, []], false, true);
+    }
+
+    const items = [];
+    let scanned = 0;
+    let stopReason = 'exhausted';
+    let lastCollectedKey = null;
+    let lastScannedKey = null;
+    let cursorFailed = null;
+
+    const request = index.openCursor(range, 'prev');
+
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (!cursor) {
+        stopReason = 'exhausted';
+        return;
+      }
+
+      const record = cursor.value;
+      lastScannedKey = cursor.key;
+      scanned++;
+
+      if (connectionMatches(record, term)) {
+        items.push(record);
+        lastCollectedKey = cursor.key;
+        if (items.length >= pageSize) {
+          stopReason = 'page-full';
+          return;
+        }
+      }
+
+      if (scanned >= scanBudget) {
+        stopReason = 'scan-budget';
+        return;
+      }
+
+      try {
+        cursor.continue();
+      } catch (err) {
+        cursorFailed = err;
+      }
+    };
+
+    request.onerror = () => {
+      cursorFailed = request.error || new Error('cursor failed');
+    };
+
+    transactionDone(tx).then(
+      () => {
+        if (cursorFailed !== null) {
+          reject(cursorFailed);
+          return;
+        }
+        const hasMore = stopReason !== 'exhausted';
+        let nextKey = null;
+        if (hasMore) {
+          nextKey = stopReason === 'page-full' ? lastCollectedKey : lastScannedKey;
+          if (nextKey === null) nextKey = afterKey;
+        }
+        resolve({
+          items: items,
+          hasMore: hasMore,
+          nextKey: nextKey,
+          scanned: scanned,
+          exhaustedScan: stopReason === 'scan-budget'
+        });
+      },
+      (err) => reject(cursorFailed || err)
+    );
+  });
+}
+
+/**
+ * Every roster row, for the export.
+ *
+ * This walks the STORE, not the index, and sorts afterwards. An index walk would
+ * be one line shorter and would be wrong: a row whose index key was somehow
+ * unusable has no index entry, and a whole-file export that quietly omits a
+ * person is the one failure this feature must not have. Sorting after the
+ * transaction resolves is the same shape as listDeletions.
+ */
+export function listConnections(db) {
+  return new Promise((resolve, reject) => {
+    let tx;
+    try {
+      tx = db.transaction(STORE_CONNECTIONS, 'readonly');
+    } catch (err) {
+      reject(err);
+      return;
+    }
+    const out = [];
+    const request = tx.objectStore(STORE_CONNECTIONS).openCursor();
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (!cursor) return;
+      out.push(cursor.value);
+      cursor.continue();
+    };
+    transactionDone(tx).then(() => {
+      out.sort((a, b) => {
+        const byList = String(a.list).localeCompare(String(b.list));
+        if (byList !== 0) return byList;
+        const byHandle = String(a.screenNameLower).localeCompare(String(b.screenNameLower));
+        if (byHandle !== 0) return byHandle;
+        return String(a.userId).localeCompare(String(b.userId));
+      });
+      resolve(out);
+    }, reject);
+  });
+}
+
+/**
+ * How many rows one list holds, or the whole roster when `list` is omitted.
+ *
+ * A bare count on the index rather than a scan: the figures are shown beside the
+ * list and refreshed on every open of the popup.
+ */
+export function countConnections(db, list) {
+  return new Promise((resolve, reject) => {
+    let tx;
+    try {
+      tx = db.transaction(STORE_CONNECTIONS, 'readonly');
+    } catch (err) {
+      reject(err);
+      return;
+    }
+    const index = tx.objectStore(STORE_CONNECTIONS).index(INDEX_CONNECTION_LIST);
+    let range = null;
+    if (typeof list === 'string' && list.length > 0) {
+      try {
+        range = IDBKeyRange.bound([list], [list, []], false, true);
+      } catch (_) {
+        range = null;
+      }
+    }
+    requestToPromise(index.count(range)).then(resolve, reject);
   });
 }

@@ -145,6 +145,28 @@
    */
   const DETAIL_OPERATIONS = ['tweetresultbyrestid'];
 
+  /* Your own Following and Followers pages.
+   *
+   * Kept as a ROSTER — who has been seen — and never as a record of who left.
+   * The two are indistinguishable from here: a page nobody scrolled looks
+   * exactly like a page whose people have all gone, so a removal mark written on
+   * this evidence would be an invention rather than an observation. See
+   * STORE_CONNECTIONS in db.js.
+   *
+   * These are the only responses this extension reads that are ABOUT OTHER
+   * PEOPLE, and that is why the guard sits on the request rather than on the
+   * response. A Following response does not say whose list it is — measured
+   * against a real one, `data.user.result` carries a `__typename` and a
+   * `timeline` and nothing else. The only thing that distinguishes your page
+   * from a stranger's is the `userId` the page put in its own query string, and
+   * that is checked against the accounts this browser has been seen to publish
+   * from. Nothing here may ever add to that set: see handleConnectionsJson.
+   */
+  const CONNECTION_OPERATIONS = ['following', 'followers'];
+
+  /** Guard against a pathological response; a real page of this list is fifty rows. */
+  const MAX_CONNECTION_USERS = 200;
+
   /** Guard against a pathological response; no real timeline page approaches this. */
   const MAX_TIMELINE_NODES = 200000;
   const MAX_TIMELINE_TWEETS = 500;
@@ -170,6 +192,15 @@
     // and a detail page reports nothing about the profile it was opened from.
     detailSeen: 0,
     detailKept: 0,
+    // And apart from those again: a Following page is neither a publish nor a
+    // profile timeline, and it is the only read whose rows are other people.
+    connectionsSeen: 0,
+    connectionsKept: 0,
+    // Responses recognised as a follow list but dropped because the request did
+    // not name one of this account's own ids. Not an error: it is what browsing
+    // somebody else looks like, and a rise here with kept flat is what a fresh
+    // install looks like before it has seen you publish anything.
+    connectionsNoOwner: 0,
     requestBodyRead: 0,
     requestBodyFailed: 0,
     responseCloneFailed: 0,
@@ -224,6 +255,9 @@
       timelineKept: diag.timelineKept,
       detailSeen: diag.detailSeen,
       detailKept: diag.detailKept,
+      connectionsSeen: diag.connectionsSeen,
+      connectionsKept: diag.connectionsKept,
+      connectionsNoOwner: diag.connectionsNoOwner,
       requestBodyRead: diag.requestBodyRead,
       requestBodyFailed: diag.requestBodyFailed,
       responseCloneFailed: diag.responseCloneFailed,
@@ -347,10 +381,12 @@
         if (typeof data.debug === 'boolean') debugEnabled = data.debug;
         adoptOwnAuthors(data.ownAuthorIds);
         if (typeof data.captureReplies === 'boolean') captureReplies = data.captureReplies;
+        if (typeof data.captureConnections === 'boolean') captureConnections = data.captureConnections;
         post('XTB_READY', {
           hookInstalled: diag.hookInstalled,
           operations: ALL_OPERATIONS.concat(TIMELINE_OPERATIONS)
             .concat(REPLY_TIMELINE_OPERATIONS).concat(DETAIL_OPERATIONS)
+            .concat(CONNECTION_OPERATIONS)
         });
         flushQueue();
         return;
@@ -360,6 +396,7 @@
         if (typeof data.debug === 'boolean') debugEnabled = data.debug;
         adoptOwnAuthors(data.ownAuthorIds);
         if (typeof data.captureReplies === 'boolean') captureReplies = data.captureReplies;
+        if (typeof data.captureConnections === 'boolean') captureConnections = data.captureConnections;
         return;
       }
 
@@ -487,6 +524,28 @@
   }
 
   /**
+   * One field out of a GraphQL request's `variables`, read from the QUERY STRING.
+   *
+   * readRequestVariables reads the request BODY, which a Following request does
+   * not have: it is a GET whose whole payload is in the URL. Measured on a real
+   * one, the query string carries `{"userId":"...","count":20,...}` plus the
+   * feature flags — no body at all. Purely auxiliary, exactly like the body
+   * reader: request-side data can never trigger a save on its own.
+   */
+  function readUrlVariablesField(url, key) {
+    try {
+      const raw = url.searchParams.get('variables');
+      if (typeof raw !== 'string' || raw.length === 0) return null;
+      const parsed = JSON.parse(raw);
+      if (!isObject(parsed)) return null;
+      const value = parsed[key];
+      return value === undefined ? null : value;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /**
    * Decide whether a request is a CreateTweet POST.
    * Parses the URL properly instead of substring-matching the whole string,
    * and never looks at a hardcoded queryId.
@@ -519,13 +578,17 @@
     const lower = operationName.toLowerCase();
     const isReplyTimeline = REPLY_TIMELINE_OPERATIONS.indexOf(lower) !== -1;
     if (isReplyTimeline && !captureReplies) return null;
+    // Gated here, at the request, so a disabled line costs nothing at all: no
+    // clone, no body read, no listener, no entry in xhrInfoMap.
+    const isConnections = CONNECTION_OPERATIONS.indexOf(lower) !== -1;
+    if (isConnections && !captureConnections) return null;
     const isTimeline = TIMELINE_OPERATIONS.indexOf(lower) !== -1 || isReplyTimeline;
     const isDetail = DETAIL_OPERATIONS.indexOf(lower) !== -1;
 
     // A publish or a delete is always a POST. Matching those names on a GET
     // would mean the operation is not what we think it is, so they are kept
-    // strictly POST-only; the two queries are the GETs that are wanted.
-    if (isTimeline || isDetail) {
+    // strictly POST-only; the queries are the GETs that are wanted.
+    if (isTimeline || isDetail || isConnections) {
       if (upperMethod !== 'GET') return null;
     } else if (upperMethod !== 'POST' || ALL_OPERATIONS.indexOf(lower) === -1) {
       return null;
@@ -536,7 +599,13 @@
       operationName: operationName,
       isDelete: DELETE_OPERATIONS.indexOf(lower) !== -1,
       isTimeline: isTimeline,
-      isDetail: isDetail
+      isDetail: isDetail,
+      isConnections: isConnections,
+      connectionList: isConnections ? lower : null,
+      // Whose list this is, read from the request's own query string. Null is a
+      // real answer — it means the page did not say, and handleConnectionsJson
+      // drops the response rather than guessing which side it is looking at.
+      ownerUserId: isConnections ? normalizeTweetId(readUrlVariablesField(url, 'userId')) : null
     };
   }
 
@@ -591,6 +660,15 @@
       info.isCreateTweet = true;
       info.isDelete = analysis.isDelete === true;
       info.isDetail = analysis.isDetail === true;
+      // `isTimeline` was never copied onto this object, so the fetch path could
+      // not recognise a profile sweep and would have counted one as a publish.
+      // X sends these over XHR, which is the only reason nobody noticed. The
+      // connection line below copies its own flag, and leaving this one out
+      // would reproduce exactly that mistake for exactly that reason.
+      info.isTimeline = analysis.isTimeline === true;
+      info.isConnections = analysis.isConnections === true;
+      info.connectionList = analysis.connectionList;
+      info.ownerUserId = analysis.ownerUserId;
       info.queryId = analysis.queryId;
       info.operationName = analysis.operationName;
 
@@ -1681,6 +1759,9 @@
   /** Whether the Replies tab is read as well. Off until the user turns it on. */
   let captureReplies = false;
 
+  /** Whether the follow / follower roster is recorded. Off until asked for. */
+  let captureConnections = false;
+
   function noteOwnAuthor(record) {
     try {
       if (record !== null && record.author !== null && record.author.id !== null) {
@@ -1787,7 +1868,7 @@
   }
 
   /**
-   * Send a sweep's records in as few messages as the bridge limit allows.
+   * Send a batch of records in as few messages as the bridge limit allows.
    *
    * A whole timeline page routinely serializes past MAX_BRIDGE_BYTES, and post()
    * refuses an oversized message outright — which discarded the ENTIRE sweep,
@@ -1795,11 +1876,22 @@
    * by measuring real serializations rather than by guessing a record count: one
    * long-form post can weigh more than a hundred short ones.
    *
+   * Shared by the timeline sweep and the connection roster rather than copied
+   * for the second one. "Measure, do not guess" is the whole point of this
+   * function, and a second copy would be the first place that stopped being
+   * true — the two would drift the moment either was touched.
+   *
    * Returns how many records actually left the page. A record that cannot fit in
    * a message even on its own is skipped and named in the diagnostics — one
    * oversized row must never cost the rest of the page.
    */
-  function postBackfillRecords(records) {
+  function postRecordBatches(messageType, records, basePayload) {
+    // Fields that belong to the whole batch rather than to any row — a follow
+    // list's name and owner. Merged into every payload so the measured overhead
+    // below accounts for them.
+    const envelope = isObject(basePayload) ? basePayload : {};
+    const payloadFor = (batch) => Object.assign({}, envelope, { records: batch });
+
     // Fixed per-message cost: the envelope (source/type/token) plus the empty
     // records array. Measured, not assumed, and measured against the same token
     // post() will send. If it cannot be measured, 0 makes the chunks look
@@ -1807,7 +1899,7 @@
     // and the refusal shows up in the diagnostics instead of vanishing.
     let overhead = 0;
     try {
-      overhead = JSON.stringify(bridgeMessage('X_TWEET_BACKFILL', { records: [] })).length;
+      overhead = JSON.stringify(bridgeMessage(messageType, payloadFor([]))).length;
     } catch (_) { /* fall through: post() is the backstop */ }
 
     let chunk = [];
@@ -1820,12 +1912,12 @@
       const batchBytes = chunkBytes;
       chunk = [];
       chunkBytes = 0;
-      const delivered = post('X_TWEET_BACKFILL', { records: batch });
+      const delivered = post(messageType, payloadFor(batch));
       if (delivered) {
         posted += batch.length;
         diag.posted++;
       }
-      log('timeline chunk: ' + batch.length + ' records, ' + (overhead + batchBytes) +
+      log(messageType + ' chunk: ' + batch.length + ' records, ' + (overhead + batchBytes) +
           ' bytes, ' + (delivered ? 'delivered' : 'refused'));
     };
 
@@ -1836,7 +1928,7 @@
         recordBytes = JSON.stringify(record).length;
       } catch (err) {
         diag.postFailed++;
-        recordError('timeline serialize', err);
+        recordError(messageType + ' serialize', err);
         continue;
       }
       // JSON.stringify joins an array's elements with ',' — so the running total
@@ -1858,8 +1950,9 @@
       }
 
       diag.postFailed++;
-      recordError('postMessage',
-        'timeline record ' + record.id + ' exceeds the bridge limit on its own and was skipped');
+      recordError('postMessage', messageType + ' record ' +
+        (record.id !== undefined ? record.id : record.userId) +
+        ' exceeds the bridge limit on its own and was skipped');
     }
 
     flush();
@@ -1894,7 +1987,220 @@
 
     // Counted only once a chunk has actually left the page. Incrementing before
     // the post let the panel claim rows were kept that post() had just refused.
-    diag.timelineKept += postBackfillRecords(records);
+    diag.timelineKept += postRecordBatches('X_TWEET_BACKFILL', records);
+    scheduleDiag();
+  }
+
+  /* -------------------------------------------------- follow / follower roster */
+
+  /**
+   * The people in a Following or Followers response.
+   *
+   * This walks the entry types explicitly instead of reaching for every
+   * `user_results` the way collectTimelineTweets reaches for every
+   * `tweet_results`. That blind walk is safe on a timeline because an author
+   * filter decides what survives; there is no such filter here — every entry in
+   * this response is somebody — so a blind walk would collect "who to follow"
+   * suggestion modules and report them as people on the list.
+   *
+   * Only `TimelineAddEntries` is read, and inside it only entries that are a
+   * `TimelineTimelineItem` holding a `TimelineUser`. Measured on a real
+   * response: 50 such entries plus a bottom and a top cursor, alongside a
+   * `TimelineClearCache` and a `TimelineTerminateTimeline`.
+   *
+   * That TerminateTimeline is worth naming, because it reads like the end of the
+   * list and is not. It carries `direction: "Top"` — nothing above this point —
+   * and it arrives on the FIRST page of a list that may have thousands more
+   * behind it. Treating it as a stop condition would end every sweep at the top.
+   */
+  function collectConnectionUsers(json) {
+    const out = [];
+    const seen = new Set();
+
+    let instructions = null;
+    try {
+      instructions = json.data.user.result.timeline.timeline.instructions;
+    } catch (_) {
+      return out;
+    }
+    if (!Array.isArray(instructions)) return out;
+
+    for (let i = 0; i < instructions.length; i++) {
+      const instruction = instructions[i];
+      if (!isObject(instruction) || instruction.type !== 'TimelineAddEntries') continue;
+      const entries = instruction.entries;
+      if (!Array.isArray(entries)) continue;
+
+      for (let j = 0; j < entries.length; j++) {
+        if (out.length >= MAX_CONNECTION_USERS) return out;
+        const entry = entries[j];
+        const content = isObject(entry) ? entry.content : null;
+        if (!isObject(content)) continue;
+        // Everything that is not a person — cursors, modules, whatever X adds
+        // next — is skipped by this test rather than by a list of things to
+        // exclude, so a new entry kind is ignored rather than misread.
+        if (content.entryType !== 'TimelineTimelineItem') continue;
+        const itemContent = content.itemContent;
+        if (!isObject(itemContent) || itemContent.itemType !== 'TimelineUser') continue;
+        const userResults = itemContent.user_results;
+        if (!isObject(userResults) || !isObject(userResults.result)) continue;
+
+        const user = userResults.result;
+        if (seen.has(user)) continue;
+        seen.add(user);
+        out.push(user);
+      }
+    }
+    return out;
+  }
+
+  /**
+   * One person from a follow list, rebuilt from the fields worth keeping.
+   *
+   * The shape is NOT the tweet path's. A tweet's author arrives at
+   * `core.user_results.result.legacy` with the handle at `legacy.screen_name`; a
+   * person in this response has no `legacy` at all — measured against a real
+   * response, 1502 bytes per person and `legacy` is not among the keys. The
+   * fields are flat instead: `core.screen_name`, `profile_bio.description`,
+   * `relationship_counts.followers`, `tweet_counts.tweets`. Reading it the way
+   * the tweet path does would produce a roster of blank names.
+   *
+   * The count field is `tweetCount` and never `tweets`: reader.html locates the
+   * tweet array by scanning the exported bytes for `"tweets"`, so that name
+   * anywhere earlier in the file would be found instead of the array.
+   *
+   * `list` and `ownerId` are deliberately absent — they belong to the message,
+   * not the row, so a single forged row cannot claim to be from the other list.
+   */
+  function buildConnectionRecord(user, requestInfo, capturedVia) {
+    const core = isObject(user.core) ? user.core : {};
+    const bio = isObject(user.profile_bio) ? user.profile_bio : {};
+    const bioEntities = isObject(bio.entities) ? bio.entities : {};
+    const bioDescription = isObject(bioEntities.description) ? bioEntities.description : {};
+    const counts = isObject(user.relationship_counts) ? user.relationship_counts : {};
+    const tweetCounts = isObject(user.tweet_counts) ? user.tweet_counts : {};
+    const avatar = isObject(user.avatar) ? user.avatar : {};
+    const place = isObject(user.location) ? user.location : {};
+    const website = isObject(user.website) ? user.website : {};
+    const verification = isObject(user.verification) ? user.verification : {};
+
+    const userId = normalizeTweetId(user.rest_id);
+    if (userId === null) return null;
+
+    const screenName = nonEmptyString(core.screen_name);
+
+    const bioUrls = [];
+    const rawUrls = Array.isArray(bioDescription.urls) ? bioDescription.urls : [];
+    for (let i = 0; i < rawUrls.length && bioUrls.length < 8; i++) {
+      const item = rawUrls[i];
+      if (!isObject(item)) continue;
+      const expanded = nonEmptyString(item.expanded_url) || nonEmptyString(item.url);
+      if (expanded === null) continue;
+      bioUrls.push({
+        url: nonEmptyString(item.url) || expanded,
+        expandedUrl: expanded,
+        displayUrl: nonEmptyString(item.display_url)
+      });
+    }
+
+    return {
+      userId: userId,
+      // The numeric id is the identity; the handle is a label that can change.
+      // A response that somehow carries no handle still yields a usable row —
+      // sanitizeConnection turns this into '' rather than dropping the person,
+      // because an id with no name is still somebody worth remembering.
+      screenName: screenName,
+      screenNameLower: screenName === null ? '' : screenName.toLowerCase(),
+      name: nonEmptyString(core.name),
+      accountCreatedAt: nonEmptyString(core.created_at),
+      bio: typeof bio.description === 'string' ? bio.description : null,
+      bioUrls: bioUrls,
+      location: typeof place.location === 'string' ? place.location : null,
+      websiteUrl: nonEmptyString(website.expanded_url) || nonEmptyString(website.url),
+      lang: nonEmptyString(user.profile_description_language),
+      blueVerified: user.is_blue_verified === true,
+      verified: verification.verified === true,
+      followersCount: asFiniteNumber(counts.followers),
+      followingCount: asFiniteNumber(counts.following),
+      tweetCount: asFiniteNumber(tweetCounts.tweets),
+      avatarUrl: nonEmptyString(avatar.image_url),
+      source: { operationName: requestInfo.operationName, capturedVia: capturedVia }
+    };
+  }
+
+  /** Every usable row in one follow-list response. */
+  function buildConnectionRecords(json, requestInfo, capturedVia) {
+    const users = collectConnectionUsers(json);
+    const records = [];
+    const seenIds = new Set();
+
+    for (let i = 0; i < users.length; i++) {
+      let record = null;
+      try {
+        record = buildConnectionRecord(users[i], requestInfo, capturedVia);
+      } catch (err) {
+        recordError('buildConnectionRecord', err);
+        continue;
+      }
+      if (record === null) continue;
+      if (seenIds.has(record.userId)) continue;
+      seenIds.add(record.userId);
+      records.push(record);
+    }
+    return records;
+  }
+
+  function handleConnectionsJson(json, requestInfo, capturedVia) {
+    diag.connectionsSeen++;
+
+    if (json === null || typeof json !== 'object') {
+      diag.responseJsonFailed++;
+      diag.lastError = 'follow list response was not a usable object';
+      diag.lastErrorAt = new Date().toISOString();
+      scheduleDiag();
+      return;
+    }
+
+    // The guard that makes this line safe, and the only thing that can.
+    //
+    // A follow-list response does not say whose list it is, so the identity has
+    // to come from the request — and the only thing allowed to settle it is the
+    // set of ids this browser has actually watched publish.
+    //
+    // Deliberately NOT noteOwnAuthor. Adding this request's userId to that set
+    // would make whoever you happen to open into "you": the profile sweep would
+    // then treat their posts as yours and archive them. That set is fed by
+    // CreateTweet responses and by nothing else, and this line must never feed
+    // it — however convenient it looks.
+    //
+    // Checked here rather than in analyzeRequestUrl because this is where the
+    // outcome can be reported. Gating at request time would make a list you own
+    // and a list you do not look identical from the outside, with no counter to
+    // tell them apart and no way to explain an empty roster.
+    const ownerId = normalizeTweetId(requestInfo.ownerUserId);
+    if (ownerId === null || !ownAuthorIds.has(ownerId)) {
+      diag.connectionsNoOwner++;
+      if (debugEnabled) log('follow list seen, but the request named no account of ours — skipping');
+      scheduleDiag();
+      return;
+    }
+
+    let records = [];
+    try {
+      records = buildConnectionRecords(json, requestInfo, capturedVia);
+    } catch (err) {
+      recordError('buildConnectionRecords', err);
+      scheduleDiag();
+      return;
+    }
+
+    // Counted only once a chunk has actually left the page, like the sweep:
+    // incrementing first would let the panel claim people were kept that post()
+    // had just refused.
+    diag.connectionsKept += postRecordBatches('X_CONNECTIONS_SEEN', records, {
+      list: requestInfo.connectionList,
+      ownerId: ownerId
+    });
     scheduleDiag();
   }
 
@@ -2087,6 +2393,29 @@
         return;
       }
 
+      // A follow list is a query as well, and the only read this extension makes
+      // whose rows are other people. Nothing about it is a publish.
+      if (requestInfo.isConnections === true) {
+        let connClone;
+        try {
+          connClone = response.clone();
+        } catch (err) {
+          diag.responseCloneFailed++;
+          recordError('response.clone (connections)', err);
+          return;
+        }
+        let connJson = null;
+        try {
+          connJson = await connClone.json();
+        } catch (err) {
+          diag.responseJsonFailed++;
+          recordError('clone.json (connections)', err);
+          return;
+        }
+        handleConnectionsJson(connJson, requestInfo, 'fetch');
+        return;
+      }
+
       // A delete marks an existing record instead of writing a new one.
       // (deleteSeen was already counted when the request went out.)
       if (requestInfo.isDelete === true) {
@@ -2267,6 +2596,11 @@
         return;
       }
 
+      if (info.isConnections === true) {
+        handleConnectionsJson(readXhrResponseJson(xhr), info, 'xhr');
+        return;
+      }
+
       // A delete marks an existing record instead of writing a new one.
       // (deleteSeen was already counted when the request went out.)
       if (info.isDelete === true) {
@@ -2377,7 +2711,10 @@
               operationName: analysis.operationName,
               isDelete: analysis.isDelete,
               isTimeline: analysis.isTimeline,
-              isDetail: analysis.isDetail
+              isDetail: analysis.isDetail,
+              isConnections: analysis.isConnections,
+              connectionList: analysis.connectionList,
+              ownerUserId: analysis.ownerUserId
             });
           } else {
             // The same XHR object can be reused via open(); never let stale
@@ -2402,6 +2739,10 @@
             // A post's own page is a read as well, so it is counted when its
             // body arrives, never as a publish.
             else if (info.isDetail === true) { /* counted when the body arrives */ }
+            // Nor is a follow list a publish. Missing this branch would add
+            // every page of it to createTweetSeen, which is the one number the
+            // whole diagnostics panel is read for.
+            else if (info.isConnections === true) { /* counted when the body arrives */ }
             else diag.createTweetSeen++;
             // The body is handed to us as-is; we only read it when it is a
             // string, and we never modify or replace it.
@@ -2487,6 +2828,7 @@
             // body arrives (handleTimelineJson), exactly as on the XHR path.
             else if (requestInfo.isTimeline === true) { /* counted when the body arrives */ }
             else if (requestInfo.isDetail === true) { /* counted when the body arrives */ }
+            else if (requestInfo.isConnections === true) { /* counted when the body arrives */ }
             else diag.createTweetSeen++;
             observeResponse(originalPromise, requestInfo);
             scheduleDiag();

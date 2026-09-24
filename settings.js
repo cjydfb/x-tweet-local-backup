@@ -38,6 +38,17 @@ export const DEFAULT_SETTINGS = {
    */
   captureReplies: false,
   /**
+   * Whether the follow / follower roster is recorded.
+   *
+   * Off by default, and different in kind from every switch above it: they
+   * decide how much of YOUR writing to keep, this one decides whether to keep a
+   * list of other people. It is also the only line whose safety rests on a check
+   * that can fail quietly — the roster is stored only when the request says the
+   * list belongs to one of your own accounts — so it stays opt-in rather than
+   * switching itself on the moment the feature exists.
+   */
+  captureConnections: false,
+  /**
    * Whether the first-run choice panel has been answered.
    *
    * The four behaviours above are the reason the panel exists: each one changes
@@ -102,7 +113,17 @@ export const DEFAULT_STATS = {
      * and "the write did nothing" look identical in the archive, and the second
      * one would be a real failure.
      */
-    linksUnmatched: 0
+    linksUnmatched: 0,
+    /**
+     * Roster rows written for the first time, and rows that were already there.
+     *
+     * Apart because those are the only two things a sighting can mean, and one
+     * counter could not say whether a sweep was still finding anybody new — a
+     * roster that has stopped growing looks exactly like one that is being
+     * written to constantly.
+     */
+    connectionsAdded: 0,
+    connectionsRefreshed: 0
   },
   /** Latest snapshot reported by the page realm (per page load, not lifetime). */
   page: {
@@ -121,6 +142,21 @@ export const DEFAULT_STATS = {
     detailSeen: 0,
     /** Link target lists sent from them for posts that are this account's own. */
     detailKept: 0,
+    /** Following / Followers responses seen on this page. */
+    connectionsSeen: 0,
+    /** People in them that were sent on to be stored. */
+    connectionsKept: 0,
+    /**
+     * Responses dropped because the request was not for one of this account's
+     * own lists.
+     *
+     * Its own counter rather than folded into a generic "dropped", because it is
+     * the normal outcome while browsing somebody else and because a rising
+     * seen-with-no-owner alongside a flat kept is exactly what "this browser has
+     * not learned which account is yours yet" looks like. That is the one state
+     * of this feature a person can be in without any error appearing anywhere.
+     */
+    connectionsNoOwner: 0,
     requestBodyRead: 0,
     requestBodyFailed: 0,
     responseCloneFailed: 0,
@@ -186,6 +222,7 @@ export async function getSettings() {
     if (typeof stored.showRemoteThumbnails === 'boolean') merged.showRemoteThumbnails = stored.showRemoteThumbnails;
     if (typeof stored.backfillMedia === 'boolean') merged.backfillMedia = stored.backfillMedia;
     if (typeof stored.captureReplies === 'boolean') merged.captureReplies = stored.captureReplies;
+    if (typeof stored.captureConnections === 'boolean') merged.captureConnections = stored.captureConnections;
     if (typeof stored.choicePanelAnswered === 'boolean') merged.choicePanelAnswered = stored.choicePanelAnswered;
     // A stored `captureRetweets` from an older version is simply ignored — the
     // key is gone, and carrying it forward would suggest a setting that no
@@ -212,6 +249,7 @@ async function saveSettingsInternal(patch) {
     if (typeof patch.showRemoteThumbnails === 'boolean') current.showRemoteThumbnails = patch.showRemoteThumbnails;
     if (typeof patch.backfillMedia === 'boolean') current.backfillMedia = patch.backfillMedia;
     if (typeof patch.captureReplies === 'boolean') current.captureReplies = patch.captureReplies;
+    if (typeof patch.captureConnections === 'boolean') current.captureConnections = patch.captureConnections;
     if (typeof patch.choicePanelAnswered === 'boolean') current.choicePanelAnswered = patch.choicePanelAnswered;
     if (Number.isInteger(patch.pageSize) && patch.pageSize >= 10 && patch.pageSize <= 200) {
       current.pageSize = patch.pageSize;
@@ -374,7 +412,8 @@ async function mergePageDiagInternal(diag) {
   const numericKeys = [
     'createTweetSeen', 'deleteSeen', 'deleted', 'requestBodyRead', 'requestBodyFailed',
     'responseCloneFailed', 'responseJsonFailed', 'parseFailed', 'parsed',
-    'posted', 'postFailed', 'timelineSeen', 'timelineKept', 'detailSeen', 'detailKept'
+    'posted', 'postFailed', 'timelineSeen', 'timelineKept', 'detailSeen', 'detailKept',
+    'connectionsSeen', 'connectionsKept', 'connectionsNoOwner'
   ];
   // A new document means a new session token: start the page counters over so
   // the popup never shows a stale maximum from a previous tab or reload.
