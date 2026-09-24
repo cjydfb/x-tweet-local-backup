@@ -104,7 +104,8 @@ function assertEqual(a, b, msg) {
 }
 
 const BOOLEAN_KEYS = [
-  'debug', 'mediaCache', 'showRemoteThumbnails', 'backfillMedia', 'captureReplies', 'choicePanelAnswered'
+  'debug', 'mediaCache', 'showRemoteThumbnails', 'backfillMedia', 'captureReplies',
+  'captureConnections', 'choicePanelAnswered'
 ];
 
 /* --------------------------------------------------------------- defaults -- */
@@ -123,6 +124,7 @@ await check('DEFAULT_SETTINGS is exactly the documented set of values', () => {
     showRemoteThumbnails: true,
     backfillMedia: true,
     captureReplies: false,
+    captureConnections: false,
     choicePanelAnswered: false,
     pageSize: 30
   });
