@@ -48,7 +48,20 @@ body {
 }
 
 body {
+  /* 440px is what a Chromium toolbar popup gives this page, and the desktop
+     popup depends on it being definite — Chrome sizes the popup window to the
+     document's preferred width, so an auto width here would let it collapse.
+
+     It is not a guarantee about the container, though. Edge for Android opens
+     the same popup.html in a bottom sheet narrower than this, and there the
+     fixed width overflows and the right-hand side is cut off: the export
+     button, the card's action row, the clear button, the timestamps. max-width
+     hands the body the container's width whenever the container is the
+     narrower of the two, which needs no knowledge of how wide any particular
+     host decides to be — and the width stays definite, so the desktop popup is
+     unaffected. */
   width: 440px;
+  max-width: 100%;
   max-height: 600px;
   overflow: hidden;
   background: var(--bg);
