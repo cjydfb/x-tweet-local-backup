@@ -179,6 +179,16 @@ export function describeMediaArchive(rows, meta) {
   if (meta && typeof meta.connections === 'number' && meta.connections > 0) {
     lines.push('  CONNECTIONS.csv    the follow / follower roster, for a spreadsheet');
   }
+  // No PROFILE.json to list: the card is one object and it is already inside
+  // tweets.json, so a second copy would be the same data in the same medium.
+  // CONNECTIONS.csv earns its place because a spreadsheet is a different medium
+  // and there are thousands of rows; one card has no such need. This line exists
+  // so that a person opening the archive in ten years knows the header is in
+  // there rather than wondering why the file has a field nothing explains.
+  if (meta && meta.profile) {
+    lines.push('  (in tweets.json)   "profile": your own profile card — name, bio,');
+    lines.push('                     avatar and banner URLs, follower counts, join date');
+  }
   lines.push('');
   lines.push('File names are <tweetId>_<mediaId>.<ext>. Join them to tweets.json:');
   lines.push('the leading number is tweet.id, the second is tweet.media[].id.');

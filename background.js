@@ -35,6 +35,9 @@ import {
   forEachTweet,
   upsertConnection,
   countConnections,
+  upsertProfile,
+  listProfiles,
+  countProfiles,
   CONNECTION_LISTS,
   PURGE_FILTERS,
   SCHEMA_VERSION
@@ -49,10 +52,23 @@ import {
   mergePageDiag,
   noteCaptureTime,
   getOwnAuthors,
-  rememberOwnAuthors
+  rememberOwnAuthors,
+  forgetOwnAuthor
 } from './settings.js';
 
-import { cacheMediaForTweet, hasMediaPermission } from './media-cache.js';
+import { cacheMediaForTweet, cacheAvatar, hasMediaPermission } from './media-cache.js';
+
+import {
+  getJson,
+  listSnapshots,
+  normalizeSnapshots,
+  sanitizeStoredJob,
+  runImportPass,
+  isHandle,
+  hasWaybackPermission,
+  IMPORT_STOP,
+  WAYBACK_MAX_ROWS
+} from './wayback.js';
 
 /* -------------------------------------------------------------------------- */
 /* Constants                                                                  */
@@ -73,6 +89,13 @@ function isXHostname(hostname) {
          h === 'twitter.com' || h.endsWith('.twitter.com');
 }
 const MAX_TEXT_CHARS = 200000;
+/* The same number inject.js clamps a quoted post's body to, applied again on
+   this side because nothing arriving over the bridge is trusted to have been
+   clamped. X's own long-post ceiling, so the cap can never cut off something
+   X would have let its author write. */
+const MAX_QUOTED_TEXT_CHARS = 25000;
+const MAX_CLIENT_NAME_CHARS = 200;
+const MAX_CLIENT_URL_CHARS = 300;
 const MAX_MEDIA_ITEMS = 64;
 const MAX_VARIANTS_PER_MEDIA = 32;
 const MAX_POLL_CHOICES = 4;
@@ -80,7 +103,15 @@ const MAX_EDIT_VERSIONS = 64;
 const MAX_ENTITY_URLS = 64;
 const MAX_ENTITY_TAGS = 64;
 const MAX_ENTITY_MENTIONS = 64;
+/* The three lists above can hold 64 each, so this is the room for all of them
+   together plus slack — a body cannot legitimately mark up more spans than it
+   has entities to mark. */
+const MAX_ENTITY_SPANS = 256;
 const LANG_PATTERN = /^[A-Za-z0-9-]{1,16}$/;
+/* X's reply settings are short lowercase words — "everyone", "following",
+   "mentioned". A pattern rather than a closed list: a value X adds later should
+   arrive as an unknown-but-well-formed word, not be silently dropped as junk. */
+const REPLY_SETTINGS_PATTERN = /^[a-z][a-z_]{0,31}$/;
 const TWEET_ID_PATTERN = /^[0-9]{1,25}$/;
 const ALLOWED_MEDIA_HOSTS = ['pbs.twimg.com', 'video.twimg.com'];
 const ALLOWED_TWEET_HOSTS = ['x.com', 'www.x.com', 'twitter.com', 'www.twitter.com', 'mobile.x.com'];
@@ -125,6 +156,17 @@ function asNumberOrNull(value) {
 
 function asBooleanOrNull(value) {
   return typeof value === 'boolean' ? value : null;
+}
+
+/**
+ * A whole number, or null. An offset into a string has no meaningful fraction,
+ * and rounding one would move a span to a place the sender never named — so a
+ * fractional value is refused rather than nudged.
+ */
+function asFiniteInteger(value) {
+  const n = asNumberOrNull(value);
+  if (n === null || !Number.isSafeInteger(n)) return null;
+  return n;
 }
 
 function normalizeId(value) {
@@ -262,6 +304,109 @@ function sanitizeReplyTo(rawReplyTo) {
 }
 
 /**
+ * The quoted post's own content, as far as it was captured.
+ *
+ * Rebuilt field by field like everything else here, even though inject.js
+ * produced it a moment ago: the bridge is a boundary, and a value that crossed
+ * it is treated as arriving from the page, not from ourselves. Media, metrics
+ * and entities are deliberately NOT carried — inject.js does not extract them
+ * and this would drop them anyway, so the two ends agree on the same small
+ * shape instead of one of them quietly expecting more.
+ *
+ * `null` when there is no usable id, which is also what a record with no quote
+ * carries. An object with an id and an empty body is a real case — a quoted
+ * post that is only media has no text — and is kept.
+ */
+function sanitizeQuotedTweet(rawQuoted) {
+  if (!isObject(rawQuoted)) return null;
+
+  const tweetId = normalizeId(rawQuoted.tweetId);
+  if (tweetId === null) return null;
+
+  const text = asString(rawQuoted.text, MAX_QUOTED_TEXT_CHARS);
+
+  return {
+    tweetId: tweetId,
+    text: text === null ? '' : text,
+    createdAt: asIsoString(rawQuoted.createdAt, null),
+    createdAtRaw: asNonEmptyString(rawQuoted.createdAtRaw, 100),
+    author: sanitizeAuthor(rawQuoted.author)
+  };
+}
+
+/**
+ * Which client the post was made from.
+ *
+ * The page hands this over as an HTML anchor; inject.js already strips the
+ * markup down to a label and an href, and this is the second pass that decides
+ * what the two are allowed to be. `http`/`https` only, on any host — the label
+ * is a product name X wrote, not a link the archive will ever follow — so
+ * anything else is dropped rather than carried.
+ */
+function sanitizePostedVia(rawPostedVia) {
+  if (!isObject(rawPostedVia)) return null;
+
+  const name = asNonEmptyString(rawPostedVia.name, MAX_CLIENT_NAME_CHARS);
+
+  let url = null;
+  const rawUrl = asString(rawPostedVia.url, MAX_CLIENT_URL_CHARS);
+  if (rawUrl !== null) {
+    try {
+      const parsed = new URL(rawUrl);
+      if (parsed.protocol === 'https:') url = parsed.href;
+    } catch (_) { /* not a URL, so nothing to carry */ }
+  }
+
+  if (name === null && url === null) return null;
+  return { name: name, url: url };
+}
+
+/**
+ * How the account itself had reacted when the post was seen.
+ *
+ * Three booleans, and `=== true` on each rather than coercion: a missing key
+ * and a false one mean the same thing to X here (it did not react), but only
+ * one of them is an answer, and a truthy string must never become a yes.
+ */
+function sanitizeViewerState(rawViewerState) {
+  if (!isObject(rawViewerState)) return null;
+  return {
+    liked: rawViewerState.liked === true,
+    bookmarked: rawViewerState.bookmarked === true,
+    reposted: rawViewerState.reposted === true
+  };
+}
+
+/**
+ * X's sensitive-content mark — true, false, or nothing at all.
+ *
+ * `null` is a third answer here, not a missing one. X omits the field when it
+ * has nothing to say, and writing that omission down as `false` would be
+ * recording an answer nobody gave.
+ */
+function sanitizeSensitive(rawSensitive) {
+  if (rawSensitive === true) return true;
+  if (rawSensitive === false) return false;
+  return null;
+}
+
+/**
+ * Who was allowed to reply — "everyone", "following", "mentioned".
+ *
+ * Only the archive carries this. Measured on two live responses (a focal-tweet
+ * fetch and a twenty-post timeline), `reply_settings` appeared zero times in
+ * both, while the archived copy of the same posts has it. So on a record
+ * captured live this is null and says nothing, and it fills in only when the
+ * post is imported from the archive. `null` therefore means "not known", and
+ * must never be read as "everyone".
+ */
+function sanitizeReplySettings(rawReplySettings) {
+  const s = asNonEmptyString(rawReplySettings, 32);
+  if (s === null || !REPLY_SETTINGS_PATTERN.test(s)) return null;
+  return s;
+}
+
+/**
  * A poll is rebuilt field by field like everything else. `choicesFromResponse`
  * is what makes the archive honest: when X does not inline the poll card in the
  * create response, the record still says "this is a poll" but reports that the
@@ -313,10 +458,81 @@ function sanitizeEntityUrls(rawUrls) {
 }
 
 /**
+ * The accounts named inside a bio, rebuilt field by field.
+ *
+ * Same shape the post text uses for its mentions, and the same reason: a handle
+ * is what a reader can act on and a display name is what a reader recognises,
+ * and the response carries them separately. A handle that is not a handle is
+ * dropped rather than stored — the bio's own text still shows whatever was
+ * written there, so nothing is lost by refusing to call it a username.
+ */
+function sanitizeBioMentions(rawMentions) {
+  const out = [];
+  if (!Array.isArray(rawMentions)) return out;
+  const limit = Math.min(rawMentions.length, MAX_BIO_MENTIONS);
+  for (let i = 0; i < limit; i++) {
+    const item = rawMentions[i];
+    if (!isObject(item)) continue;
+    const handle = asNonEmptyString(item.screenName, 20);
+    if (handle === null || !/^[A-Za-z0-9_]{1,15}$/.test(handle)) continue;
+    out.push({
+      screenName: handle,
+      name: asNonEmptyString(item.name, MAX_SHORT_CHARS)
+    });
+  }
+  return out;
+}
+
+/**
  * Rebuild the link / hashtag / mention lists field by field. The expanded URL
  * is the whole point: X stores only a t.co shortlink in the text, and that
  * shortlink stops resolving through anyone but X.
  */
+/**
+ * Where each link, hashtag and mention sits in the post's text.
+ *
+ * A separate list rather than extra keys on the three existing ones, for two
+ * reasons. `hashtags` is a list of bare strings and turning it into objects
+ * would break every reader that already walks it; and the shape below is the
+ * one the reader builds for itself internally, so the day it trusts stored
+ * positions it can read this straight out instead of translating.
+ *
+ * Only `kind`, `start` and `end` live here. What a span *points at* stays in
+ * the three lists — this says where, not what, and keeping the two apart means
+ * a position never has to be re-validated as a URL.
+ *
+ * Empty is the normal case: X sends no positions in a timeline response, so
+ * anything captured by a profile sweep has none. Absence means "not known",
+ * never "there is nothing here".
+ */
+function sanitizeEntitySpans(rawSpans) {
+  const out = [];
+  if (!Array.isArray(rawSpans)) return out;
+
+  const kinds = ['url', 'tag', 'who'];
+  const limit = Math.min(rawSpans.length, MAX_ENTITY_SPANS);
+
+  for (let i = 0; i < limit; i++) {
+    const item = rawSpans[i];
+    if (!isObject(item)) continue;
+
+    const kind = asNonEmptyString(item.kind, 8);
+    if (kind === null || kinds.indexOf(kind) === -1) continue;
+
+    const start = asFiniteInteger(item.start);
+    const end = asFiniteInteger(item.end);
+    /* `end > start` and both non-negative: a span of zero width marks nothing,
+       and a negative offset cannot be a position in any text. Where it lands
+       relative to the actual body is the reader's business — this side has no
+       text to check it against, and guessing here would only invent a rule the
+       reader would then have to work around. */
+    if (start === null || end === null || start < 0 || end <= start) continue;
+
+    out.push({ kind: kind, start: start, end: end });
+  }
+  return out;
+}
+
 function sanitizeEntities(rawEntities) {
   const src = isObject(rawEntities) ? rawEntities : {};
 
@@ -344,7 +560,12 @@ function sanitizeEntities(rawEntities) {
     }
   }
 
-  return { urls: urls, hashtags: hashtags, mentions: mentions };
+  return {
+    urls: urls,
+    hashtags: hashtags,
+    mentions: mentions,
+    spans: sanitizeEntitySpans(src.spans)
+  };
 }
 
 function sanitizePoll(rawPoll) {
@@ -465,6 +686,11 @@ function sanitizeRecord(raw) {
     conversationId: conversationId,
     conversationIdInferred: conversationIdInferred,
     quoteTweetId: normalizeId(raw.quoteTweetId),
+    quotedTweet: sanitizeQuotedTweet(raw.quotedTweet),
+    postedVia: sanitizePostedVia(raw.postedVia),
+    viewerState: sanitizeViewerState(raw.viewerState),
+    sensitive: sanitizeSensitive(raw.sensitive),
+    replySettings: sanitizeReplySettings(raw.replySettings),
     author: author,
     entities: sanitizeEntities(raw.entities),
     media: media,
@@ -587,6 +813,133 @@ function sanitizeConnections(payload) {
     records.push(record);
   }
   return { records: records, rejected: rejected };
+}
+
+/* ------------------------------------------------------------ own profile */
+
+/** How much bio to keep. The same number inject.js clamps to, applied again. */
+const MAX_PROFILE_BIO = 2000;
+const MAX_BIO_URLS = 8;
+const MAX_BIO_MENTIONS = 8;
+const MAX_TEXT_CHARS_PROFILE = 2000;
+const MAX_SHORT_CHARS = 200;
+
+/**
+ * Rebuild your own profile card from a whitelist.
+ *
+ * Like sanitizeConnection this does NOT go through sanitizeRecord: a person is
+ * not a tweet, and accepting a capture-shaped payload here would invite a forged
+ * one to be treated as a capture. Every field is either copied through a
+ * coercion or dropped; nothing arrives by default.
+ *
+ * It does not take an owner id, unlike sanitizeConnection. That parameter exists
+ * because a roster row's primary key is not something the row may assert; here
+ * the account IS the row, and inject.js has already refused to send any card
+ * whose id is not one this browser has watched publish.
+ */
+function sanitizeProfile(raw) {
+  if (!isObject(raw)) return null;
+
+  const userId = normalizeId(raw.userId);
+  if (userId === null) return null;
+
+  const handle = asNonEmptyString(raw.screenName, 20);
+  const screenName = handle !== null && /^[A-Za-z0-9_]{1,15}$/.test(handle) ? handle : null;
+
+  return {
+    userId: userId,
+    screenName: screenName,
+    // Always a string. `connections` has an index keyed on this and a null there
+    // silently removes a row from every listing; this store has no index, but
+    // the field is the same field and two meanings for one name is how that
+    // hazard gets reintroduced somewhere else.
+    screenNameLower: screenName === null ? '' : screenName.toLowerCase(),
+    name: asNonEmptyString(raw.name, MAX_SHORT_CHARS),
+    accountCreatedAt: asIsoString(raw.accountCreatedAt, null),
+    bio: asString(raw.bio, MAX_PROFILE_BIO),
+    bioUrls: sanitizeEntityUrls(raw.bioUrls).slice(0, MAX_BIO_URLS),
+    /* The accounts named in the bio. The bio TEXT already contains "@name"
+       verbatim — these are the offsets' worth of structure beside it, kept for
+       the same reason the post text keeps its entity lists: the archive is the
+       copy that is supposed to have everything the response carried. */
+    bioMentions: sanitizeBioMentions(raw.bioMentions),
+    location: asString(raw.location, MAX_SHORT_CHARS),
+    websiteUrl: sanitizeHttpUrl(raw.websiteUrl),
+    lang: (() => {
+      const s = asString(raw.lang, 20);
+      return (s !== null && /^[a-zA-Z][a-zA-Z0-9-]{0,19}$/.test(s)) ? s : null;
+    })(),
+    blueVerified: asBooleanOrNull(raw.blueVerified),
+    verified: asBooleanOrNull(raw.verified),
+    followersCount: asNumberOrNull(raw.followersCount),
+    followingCount: asNumberOrNull(raw.followingCount),
+    tweetCount: asNumberOrNull(raw.tweetCount),
+    /* The other three numbers the response carries. `likeCount` here is the
+       account's lifetime likes GIVEN — the same key on a tweet means the likes
+       that post received, which is why this is only ever read off a profile. */
+    listedCount: asNumberOrNull(raw.listedCount),
+    mediaCount: asNumberOrNull(raw.mediaCount),
+    likeCount: asNumberOrNull(raw.likeCount),
+    /* Whether the account is locked. Null, not false, when the response did not
+       say: "not recorded" and "open account" are different answers. */
+    protected: asBooleanOrNull(raw.protected),
+    pinnedTweetId: normalizeId(raw.pinnedTweetId),
+    avatarUrl: sanitizeTwimgUrl(raw.avatarUrl),
+    bannerUrl: sanitizeTwimgUrl(raw.bannerUrl),
+    source: {
+      operationName: asString(raw.source && raw.source.operationName, 60),
+      capturedVia: asString(raw.source && raw.source.capturedVia, 10)
+    },
+    schemaVersion: SCHEMA_VERSION
+  };
+}
+
+/**
+ * Store one sighting of your own profile.
+ *
+ * The timestamp comes from this machine's clock, never from the payload, for the
+ * same reason a roster row's does: the row means "when this browser last saw it",
+ * and only this browser knows that.
+ */
+async function handleProfile(payload) {
+  const record = sanitizeProfile(payload);
+  if (record === null) return { ok: false, error: 'malformed profile payload' };
+
+  let db;
+  try {
+    db = await openDB();
+  } catch (err) {
+    await bumpLifetime({ upsertFailed: 1 }, 'IndexedDB open failed: ' + describe(err));
+    return { ok: false, error: 'database unavailable' };
+  }
+
+  const seenAt = new Date().toISOString();
+  try {
+    const result = await upsertProfile(db, record, seenAt);
+    await bumpLifetime(result.existed ? { profileRefreshed: 1 } : { profileAdded: 1 });
+  } catch (err) {
+    return { ok: false, error: describe(err) };
+  }
+
+  /* And the picture, once. Awaited rather than fired and forgotten: this
+     handler's promise is what keeps the worker alive, and a floating fetch in a
+     service worker is a fetch that may simply never land. It costs one request
+     on the first sighting of a profile and nothing at all afterwards.
+   *
+   * Deliberately not gated on the media-cache switch. That switch is about
+   * downloading hundreds of photographs; this is one small picture of the
+   * account's own face, and a user who granted the host permission for either
+   * reason has already answered. */
+  try {
+    const avatar = await cacheAvatar(db, record);
+    if (avatar.cached) await bumpLifetime({ avatarCached: 1 });
+    else if (avatar.reason !== null) await bumpLifetime({ avatarFailed: 1 });
+  } catch (_) { /* the card is stored; the picture is a bonus */ }
+
+  // Nothing else moves: no media is queued and lastCaptureAt is untouched,
+  // because a profile card is not a post and must not make the popup claim one
+  // was captured.
+  return { ok: true };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -803,7 +1156,11 @@ async function runMediaQueue() {
       try {
         const result = await cacheMediaForTweet(db, tweet, {});
         if (result.cached > 0 || result.failed > 0) {
-          await bumpLifetime({ mediaCached: result.cached, mediaFailed: result.failed });
+          await bumpLifetime({
+            mediaCached: result.cached,
+            mediaFailed: result.failed,
+            mediaFromArchive: result.fromArchive
+          });
         }
         log('media cache', tweet.id, result);
       } catch (err) {
@@ -894,6 +1251,461 @@ async function restoreMediaQueueInternal() {
   if (restored > 0) {
     log('media queue restored: ' + restored + ' of ' + ids.length + ' pending tweets re-queued');
   }
+  return true;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Internet Archive import                                                    */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The same shape as the media queue above, for the same reason, one step up.
+ *
+ *   `xtbWaybackRows` holds the snapshot list one run is working through — the
+ *   addresses of the archived copies of one account's posts. It is written once
+ *   per run, because it does not change while a run is going.
+ *
+ *   `xtbWaybackJob` holds the position: which row is being worked on and what
+ *   has happened so far. It is written AFTER EVERY ITEM, because that is the
+ *   only thing standing between a browser that kills an idle worker and a run
+ *   that silently starts over — or worse, one that skips whatever it was
+ *   holding when it died.
+ *
+ * Both are complete snapshots written through one chain, so two writes
+ * completing out of order can leave a stale value but never a torn one. A stale
+ * value is safe: the engine re-reads the database before it writes anything.
+ */
+const WAYBACK_ROWS_KEY = 'xtbWaybackRows';
+const WAYBACK_JOB_KEY = 'xtbWaybackJob';
+
+/**
+ * The alarm that keeps a run moving when nothing else is happening.
+ *
+ * MV3 ends an idle service worker after about thirty seconds and a pending
+ * `await fetch()` does not hold it open. The media queue gets its wake-ups for
+ * free — the user is browsing x.com, so something is always arriving — but a
+ * three-minute import runs while the user is doing something else entirely, and
+ * without this the run would stall until they next opened a tab. Nothing wakes
+ * a dead worker on its own; an alarm is the one thing that does.
+ */
+const WAYBACK_ALARM = 'xtbWayback';
+const WAYBACK_ALARM_MINUTES = 1;
+
+let waybackRows = [];
+let waybackRowsHandle = null;
+let waybackJob = null;
+let waybackWorkerRunning = false;
+let waybackWriteChain = Promise.resolve();
+let waybackRestoreSettled = false;
+
+/** What the popup shows when a run has just finished, before it polls again. */
+let waybackLastResult = null;
+
+function persistWaybackRows() {
+  const payload = {
+    v: 1,
+    handle: waybackRowsHandle,
+    rows: waybackRows.map((snapshot) => ({ timestamp: snapshot.timestamp, original: snapshot.original }))
+  };
+  waybackWriteChain = waybackWriteChain.then(
+    () => writeStoredWayback(WAYBACK_ROWS_KEY, payload),
+    () => writeStoredWayback(WAYBACK_ROWS_KEY, payload)
+  );
+}
+
+function persistWaybackJob() {
+  const payload = waybackJob === null ? null : Object.assign({}, waybackJob);
+  waybackWriteChain = waybackWriteChain.then(
+    () => writeStoredWayback(WAYBACK_JOB_KEY, payload),
+    () => writeStoredWayback(WAYBACK_JOB_KEY, payload)
+  );
+}
+
+/** One write. Never rejects: losing the mirror is not losing the archive. */
+function writeStoredWayback(key, value) {
+  return new Promise((resolve) => {
+    try {
+      if (!chrome || !chrome.storage || !chrome.storage.local) {
+        resolve();
+        return;
+      }
+      const result = chrome.storage.local.set({ [key]: value });
+      if (result && typeof result.then === 'function') result.then(resolve, resolve);
+      else resolve();
+    } catch (_) {
+      resolve();
+    }
+  });
+}
+
+function readStoredWayback(key) {
+  return new Promise((resolve) => {
+    try {
+      if (!chrome || !chrome.storage || !chrome.storage.local) {
+        resolve(undefined);
+        return;
+      }
+      const result = chrome.storage.local.get({ [key]: null });
+      if (result && typeof result.then === 'function') {
+        result.then((got) => resolve(got ? got[key] : undefined), () => resolve(undefined));
+      } else {
+        resolve(undefined);
+      }
+    } catch (_) {
+      resolve(undefined);
+    }
+  });
+}
+
+/** Drop the wake-up alarm: see the end of runWaybackJob for when and why. */
+function clearWaybackAlarm() {
+  try {
+    if (chrome && chrome.alarms) chrome.alarms.clear(WAYBACK_ALARM);
+  } catch (_) { /* an alarm that will not clear is not worth failing a run over */ }
+}
+
+/** Put the alarm in step with whether a run is live. */
+function syncWaybackAlarm() {
+  try {
+    if (!chrome || !chrome.alarms) return;
+    if (waybackJob !== null && !waybackJob.cancelRequested && waybackJob.pauseReason === null) {
+      chrome.alarms.create(WAYBACK_ALARM, { periodInMinutes: WAYBACK_ALARM_MINUTES });
+    } else {
+      chrome.alarms.clear(WAYBACK_ALARM);
+    }
+  } catch (_) { /* an alarm that will not arm is not a reason to stop the run */ }
+}
+
+/** Stop for a reason the user should see: off, or no permission. */
+function pauseWayback(reason) {
+  if (waybackJob === null) return;
+  // 'stopped' is the user's own decision, and it outranks a reason the code
+  // worked out by itself. Without this, pressing Stop and then having a
+  // permission revoked would replace the marker — and a job with a reason the
+  // code can satisfy on its own is one the next worker start is allowed to
+  // pick back up, which is exactly what Stop promised would not happen.
+  if (waybackJob.pauseReason !== 'stopped') waybackJob.pauseReason = reason;
+  persistWaybackJob();
+  syncWaybackAlarm();
+}
+
+/**
+ * Why the run may not proceed, or null.
+ *
+ * Read fresh on every item rather than once at the start: the switch can be
+ * turned off and the permission can be revoked from chrome://extensions while a
+ * three-minute run is in the middle of its batch, and the answer to "may I make
+ * one more request to somebody else's server" has to be the answer NOW.
+ */
+async function waybackBlockedReason() {
+  const settings = await getSettings();
+  if (settings.waybackEnabled !== true) return 'off';
+  if (!(await hasWaybackPermission())) return 'permission';
+  return null;
+}
+
+/**
+ * Do one pass. Returns the engine's summary, or null when there was nothing to
+ * do because another pass is already running.
+ */
+async function runWaybackJob() {
+  if (waybackWorkerRunning) return null;
+  if (waybackJob === null) return null;
+  // A paused job does not move. `chrome.alarms.clear` is asynchronous, so an
+  // alarm that had already been delivered — but not yet dispatched — when the
+  // pause was written will still arrive here afterwards, and without this it
+  // would start the very run the pause exists to hold. Worse for 'stopped',
+  // where the whole promise is that nothing but a press brings it back.
+  // Every legitimate caller clears the pause first, so this refuses nothing.
+  if (waybackJob.pauseReason !== null) return null;
+
+  waybackWorkerRunning = true;
+  syncWaybackAlarm();
+
+  try {
+    let db;
+    try {
+      db = await openDB();
+    } catch (err) {
+      // Not fatal and not counted as a failure: the archive is fine, this
+      // browser is not. Leaving the job untouched means the next wake retries
+      // it from exactly where it stopped.
+      log('wayback: database unavailable, run left where it stands', err);
+      return null;
+    }
+
+    const job = waybackJob;
+    const result = await runImportPass({
+      job: job,
+      rows: waybackRows,
+      deps: {
+        blockedReason: waybackBlockedReason,
+        readRecord: async (id) => {
+          try {
+            const row = await getTweet(db, id);
+            return row === undefined || row === null ? null : row;
+          } catch (_) {
+            return null;
+          }
+        },
+        fetchJson: (url) => getJson(url),
+        writeRecord: async (record) => {
+          // The same trust boundary every other writer goes through: these
+          // bytes came off the network, whoever is holding the other end.
+          const clean = sanitizeRecord(record);
+          if (clean === null) throw new Error('the archived record failed validation');
+          return upsertTweet(db, clean);
+        },
+        /* The account's own card, which the archived payloads carry and the
+           import used to drop — see toProfile. Same trust boundary as a record:
+           these bytes came off the network, so they go through sanitizeProfile
+           and then the same store the live capture writes to. */
+        saveProfile: async (card) => {
+          const clean = sanitizeProfile(card);
+          if (clean === null) throw new Error('the archived profile failed validation');
+
+          /* Refuse to overwrite a card this browser actually SAW.
+           *
+           * mergeProfile applies "the newest answer wins" by arrival order, and
+           * an imported card arrives now — so a snapshot of the account from
+           * years ago would take the place of today's bio, follower count and
+           * banner, and stamp `lastSeenAt` with the import time as if the
+           * browser had just looked. The card carries no crawl timestamp, so
+           * there is nothing here to compare against; the one thing that IS
+           * known is where the stored card came from.
+           *
+           * So an import may fill the gap when there is no card, and may
+           * improve another import's card — the engine already takes the newest
+           * crawl of a run. Anything the browser captured itself stays, because
+           * a live capture is by definition what the account looks like now.
+           * The reverse is not blocked: handleProfile has no such guard, so a
+           * later visit to the account's own page refreshes an imported card. */
+          try {
+            const existing = await listProfiles(db);
+            for (const row of existing) {
+              if (String(row.userId) !== String(clean.userId)) continue;
+              const via = row.source && typeof row.source.operationName === 'string'
+                ? row.source.operationName : '';
+              if (via !== 'WaybackImport') return;
+              break;
+            }
+          } catch (_) {
+            /* A read that failed means "cannot tell whether a card is there",
+               and the two ways to be wrong are not equally bad: skipping the
+               write loses nothing that is not in the archive to fetch again,
+               while writing over a card the browser captured live loses it for
+               good. So a failed read skips. */
+            return;
+          }
+
+          await upsertProfile(db, clean, job.seenAt);
+        },
+        save: async () => { persistWaybackJob(); },
+        bump: (bumps, error) => { void bumpLifetime(bumps, error || undefined); },
+        // A quarter of a second between requests, which is the same politeness
+        // the command-line tool shows. The engine takes this as an argument so
+        // that its tests do not spend three minutes asleep.
+        sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+      }
+    });
+
+    waybackLastResult = result;
+
+    if (result.reason === IMPORT_STOP.DONE) {
+      log('wayback: finished', result);
+      waybackJob = null;
+      waybackRows = [];
+      waybackRowsHandle = null;
+      await writeStoredWayback(WAYBACK_JOB_KEY, null);
+    } else if (result.reason === IMPORT_STOP.BATCH) {
+      log('wayback: batch finished, position kept', result);
+    } else if (result.reason === IMPORT_STOP.CANCELLED) {
+      // Stopped by the user, and the position STAYS. Clearing it was the one
+      // case where "it picks up where it left off" was not true, and it was not
+      // true in the one situation where the user is most likely to look: they
+      // watched it stop on purpose.
+      //
+      // What keeps this from turning into an auto-resume is `pauseReason`. A
+      // job carrying one is never started by anything except a press — not by
+      // the alarm, not by a worker restart — so "I stopped it" survives having
+      // the browser closed and reopened underneath it.
+      log('wayback: stopped by the user, position kept', result);
+      if (waybackJob === job) {
+        waybackJob.pauseReason = 'stopped';
+        // The request is served. Leaving it set would make the next press look
+        // like a run that had already been told to stop.
+        waybackJob.cancelRequested = false;
+      }
+      persistWaybackJob();
+    }
+
+    /* The alarm exists to wake a worker the browser KILLED mid-pass. A batch
+       that finished did not die — it stopped, which is the whole contract of
+       "run in batches, keep the position" — so nothing should keep waking to
+       continue it. Leaving the alarm armed here meant a service-worker start
+       and a storage read every minute, for ever, each one calling
+       runImportPass and returning BATCH on its first check because
+       `fetched === batch`; and the Stop button is not even offered in that
+       state. Clearing it costs one more wake at most, since the alarm's own
+       handler lands here too. */
+    if (result.reason === IMPORT_STOP.BATCH) clearWaybackAlarm();
+    else syncWaybackAlarm();
+    return result;
+  } finally {
+    waybackWorkerRunning = false;
+  }
+}
+
+/** Start a run, or resume the one already on disk. */
+async function startWayback(handle, batch, mode) {
+  if (waybackWorkerRunning) {
+    return { ok: false, error: 'already running', wayback: waybackSummary() };
+  }
+
+  const resuming = waybackJob !== null && waybackJob.handle === handle && waybackJob.mode === mode;
+  if (!resuming) {
+    if (waybackJob !== null) {
+      // A different handle or a different mode: the stored position describes a
+      // list that is no longer the one being worked on, so it goes.
+      waybackJob = null;
+      waybackRows = [];
+      waybackRowsHandle = null;
+      await writeStoredWayback(WAYBACK_JOB_KEY, null);
+    }
+
+    const listed = await listSnapshots(handle);
+    const rows = normalizeSnapshots(listed);
+    if (rows.length === 0) {
+      return { ok: false, error: 'no snapshots for that handle' };
+    }
+
+    waybackRows = rows;
+    waybackRowsHandle = handle;
+    persistWaybackRows();
+
+    waybackJob = {
+      v: 1,
+      mode: mode,
+      handle: handle,
+      batch: batch,
+      // One clock reading for the whole run, so every record it writes carries
+      // the same capturedAt and the list stays ordered by publish time under it.
+      seenAt: new Date().toISOString(),
+      startedAt: new Date().toISOString(),
+      cursor: 0,
+      fetched: 0,
+      imported: 0,
+      enriched: 0,
+      skipped: 0,
+      failed: 0,
+      consecutiveFailures: 0,
+      cancelRequested: false,
+      pauseReason: null
+    };
+  } else {
+    // A new press. The batch is counted per press, so this is what makes the
+    // second press do anything at all.
+    waybackJob.batch = batch;
+    waybackJob.fetched = 0;
+    waybackJob.cancelRequested = false;
+    waybackJob.pauseReason = null;
+  }
+
+  persistWaybackJob();
+  syncWaybackAlarm();
+  void runWaybackJob();
+  return { ok: true, wayback: waybackSummary() };
+}
+
+/** What the popup shows. Never touches the database. */
+function waybackSummary() {
+  if (waybackJob === null) {
+    return waybackLastResult === null
+      ? { running: false, job: null, total: 0, last: null }
+      : { running: false, job: null, total: 0, last: waybackLastResult };
+  }
+  return {
+    running: waybackWorkerRunning,
+    job: Object.assign({}, waybackJob),
+    total: waybackRows.length,
+    last: waybackLastResult
+  };
+}
+
+/** Ask the run to stop. The flag goes to disk BEFORE this returns. */
+async function cancelWayback() {
+  if (waybackJob === null) return { ok: true, wayback: waybackSummary() };
+  waybackJob.cancelRequested = true;
+  persistWaybackJob();
+  syncWaybackAlarm();
+  // Deliberately does not wait for the loop: the request in flight is allowed
+  // to finish, and the loop is what will notice. The flag is already on disk,
+  // so a worker that dies before that still comes back cancelled.
+  return { ok: true, wayback: waybackSummary() };
+}
+
+/**
+ * Pick up a run the previous worker life left behind.
+ *
+ * Called from initialize() alongside the media queue's restore, and for the
+ * same reason: this is the only thing that makes "kept running after the popup
+ * closed" true rather than aspirational.
+ */
+async function restoreWaybackJob() {
+  if (waybackRestoreSettled) return false;
+  waybackRestoreSettled = true;
+
+  const storedJob = sanitizeStoredJob(await readStoredWayback(WAYBACK_JOB_KEY));
+  if (storedJob === null) {
+    await writeStoredWayback(WAYBACK_JOB_KEY, null);
+    return false;
+  }
+
+  const storedRows = await readStoredWayback(WAYBACK_ROWS_KEY);
+  if (!storedRows || typeof storedRows !== 'object' || storedRows.handle !== storedJob.handle ||
+      !Array.isArray(storedRows.rows)) {
+    // The position without its list is not a job; it is half of one. Dropping
+    // both is the only honest move — resuming against the wrong list would
+    // import from somewhere the user never asked about.
+    log('wayback: a stored position had no matching snapshot list; both dropped');
+    await writeStoredWayback(WAYBACK_JOB_KEY, null);
+    return false;
+  }
+
+  // A stop request that reached the disk but never reached the loop — the
+  // worker died in between — means the same thing as a stop the loop did act
+  // on. Both become the same pause, so the question later is only ever "is
+  // there a pause on this job", not "which of two ways did it stop".
+  if (storedJob.cancelRequested) {
+    storedJob.cancelRequested = false;
+    storedJob.pauseReason = 'stopped';
+    log('wayback: a stop that arrived too late to be acted on is now a pause');
+  }
+
+  waybackJob = storedJob;
+  waybackRows = storedRows.rows;
+  waybackRowsHandle = storedRows.handle;
+
+  if (storedJob.pauseReason === 'stopped') {
+    // Loaded, so the popup can say where it stopped, and deliberately NOT
+    // started. Every other pause here means "the code is waiting for a
+    // condition" and is allowed to lift itself; this one means "the user said
+    // stop", and only a press may lift it.
+    persistWaybackJob();
+    syncWaybackAlarm();
+    return false;
+  }
+
+  if ((await waybackBlockedReason()) !== null) {
+    // Off, or no permission. Nothing was lost: the position and the list stay
+    // on disk, and re-granting plus a press continues from the same cursor.
+    syncWaybackAlarm();
+    return false;
+  }
+
+  log('wayback: resuming at ' + storedJob.cursor + ' of ' + waybackRows.length);
+  syncWaybackAlarm();
+  void runWaybackJob();
   return true;
 }
 
@@ -1370,6 +2182,11 @@ async function handleMessage(message, sender) {
       return handleLinks(message.payload);
     }
 
+    case 'X_PROFILE_SEEN': {
+      if (!isTrustedPageSender(sender)) return { ok: false, error: 'untrusted sender' };
+      return handleProfile(message.payload);
+    }
+
     case 'XTB_DIAG': {
       if (!isTrustedPageSender(sender)) return { ok: false, error: 'untrusted sender' };
       await mergePageDiag(message.payload);
@@ -1395,12 +2212,17 @@ async function handleMessage(message, sender) {
       let media = null;
       let following = null;
       let followers = null;
+      let profiles = null;
       try {
         const db = await openDB();
         tweets = await countTweets(db);
         media = await countMedia(db);
         following = await countConnections(db, 'following');
         followers = await countConnections(db, 'followers');
+        // Reported so the popup can tell "you have not opened your profile yet"
+        // apart from "the card is here and the reader will draw it". Those two
+        // states look identical from an empty archive otherwise.
+        profiles = await countProfiles(db);
       } catch (err) {
         log('count failed', err);
       }
@@ -1408,21 +2230,29 @@ async function handleMessage(message, sender) {
       // decides which of the two things the roster note says: an empty roster on
       // a browser that has never seen you publish is not the same state as an
       // empty one on a browser that has, and only this count tells them apart.
-      let ownAuthorCount = 0;
+      let ownAuthors = [];
       try {
-        ownAuthorCount = (await getOwnAuthors()).length;
+        ownAuthors = await getOwnAuthors();
       } catch (err) {
-        log('own author count failed', err);
+        log('own author list failed', err);
       }
       const mediaPermission = await hasMediaPermission();
+      const waybackPermission = settings.waybackEnabled === true
+        ? await hasWaybackPermission()
+        : false;
       return {
         ok: true,
         settings: settings,
         stats: stats,
-        counts: { tweets: tweets, media: media, following: following, followers: followers },
-        ownAuthorCount: ownAuthorCount,
+        counts: {
+          tweets: tweets, media: media,
+          following: following, followers: followers, profiles: profiles
+        },
+        ownAuthors: ownAuthors,
         purgeCounts: purgeCounts,
-        mediaPermission: mediaPermission
+        mediaPermission: mediaPermission,
+        waybackPermission: waybackPermission,
+        wayback: waybackSummary()
       };
     }
 
@@ -1484,10 +2314,82 @@ async function handleMessage(message, sender) {
       }
     }
 
+    /* Forget one id that was being treated as this account.
+     *
+     * Routed through here rather than written straight from the popup, because
+     * settings.js's write queue is per context: the popup and the worker each
+     * have their own, so two contexts doing read-modify-write on the same list
+     * can lose one of the two edits. Every other settings write already goes
+     * this way for the same reason. */
+    case 'XTB_FORGET_OWN_AUTHOR': {
+      if (!isExtensionPageSender(sender)) return { ok: false, error: 'untrusted sender' };
+      if (typeof message.id !== 'string' || message.id.length === 0) {
+        return { ok: false, error: 'invalid id' };
+      }
+      const remaining = await forgetOwnAuthor(message.id);
+      return { ok: true, ownAuthors: remaining };
+    }
+
     case 'XTB_RESET_STATS': {
       if (!isExtensionPageSender(sender)) return { ok: false, error: 'untrusted sender' };
       const stats = await resetStats();
       return { ok: true, stats: stats };
+    }
+
+    /* ----------------------- the Internet Archive import ------------------- */
+
+    case 'XTB_WAYBACK_START': {
+      if (!isExtensionPageSender(sender)) return { ok: false, error: 'untrusted sender' };
+      if (!isHandle(message.handle)) return { ok: false, error: 'invalid handle' };
+      if (message.mode !== 'gaps' && message.mode !== 'verify') {
+        return { ok: false, error: 'invalid mode' };
+      }
+      // `all` is the "run to the end of the list" switch. It is turned into a
+      // batch as large as the list can be rather than being a second mode the
+      // engine has to know about — there is only ever one stop condition.
+      const runToTheEnd = message.all === true;
+      if (!runToTheEnd && (!Number.isInteger(message.batch) || message.batch < 1 || message.batch > 500)) {
+        return { ok: false, error: 'invalid batch' };
+      }
+      const batch = runToTheEnd ? WAYBACK_MAX_ROWS : message.batch;
+
+      // The switch and the permission are checked here as well as per item, so
+      // that a press with the feature off says so immediately instead of
+      // starting a run that pauses on its first step.
+      const blocked = await waybackBlockedReason();
+      if (blocked !== null) return { ok: false, error: blocked };
+
+      try {
+        return await startWayback(message.handle, batch, message.mode);
+      } catch (err) {
+        // The only thing that throws out here is the CDX query, which is the
+        // one request whose failure means there is nothing to work on.
+        log('wayback: could not list snapshots', err);
+        return { ok: false, error: 'could not reach the archive' };
+      }
+    }
+
+    case 'XTB_WAYBACK_CANCEL': {
+      if (!isExtensionPageSender(sender)) return { ok: false, error: 'untrusted sender' };
+      return cancelWayback();
+    }
+
+    case 'XTB_WAYBACK_STATUS': {
+      if (!isExtensionPageSender(sender)) return { ok: false, error: 'untrusted sender' };
+      return { ok: true, wayback: waybackSummary() };
+    }
+
+    case 'XTB_SYNC_WAYBACK_PERMISSION': {
+      if (!isExtensionPageSender(sender)) return { ok: false, error: 'untrusted sender' };
+      const granted = await hasWaybackPermission();
+      if (!granted) {
+        // Revoked from chrome://extensions while the switch claimed otherwise.
+        // The switch goes off rather than describing a capability that is gone.
+        const settings = await saveSettings({ waybackEnabled: false });
+        pauseWayback('permission');
+        return { ok: true, waybackPermission: false, settings: settings };
+      }
+      return { ok: true, waybackPermission: true };
     }
 
     default:
@@ -1539,10 +2441,58 @@ async function initialize() {
   // worker life left behind. It opens the database itself and leaves the
   // stored list untouched when it cannot.
   await restoreMediaQueue();
+  await restoreWaybackJob();
+}
+
+/**
+ * The wake-up call.
+ *
+ * An alarm is the only thing that starts a service worker when the user is not
+ * browsing anything. The wayback import runs for minutes while they are doing
+ * something else, so without this the run would simply stop at whatever item it
+ * was holding when the browser tore the worker down, and nothing would start it
+ * again until they happened to open x.com. `runWaybackJob`'s own guard makes
+ * the race with initialize()'s restore harmless — whichever arrives second does
+ * nothing.
+ */
+try {
+  chrome.alarms.onAlarm.addListener((alarm) => {
+    if (!alarm || alarm.name !== WAYBACK_ALARM) return;
+    void runWaybackJob();
+  });
+} catch (_) { /* no alarms API: the run still works while the worker lives */ }
+
+/**
+ * Put the first-run setup in front of the user, in a tab, once.
+ *
+ * The five questions cannot be answered in the popup: two of them need a
+ * browser permission, the prompt takes the focus, and the popup closes the
+ * moment it loses focus — so the popup can ask at most one of them and cannot
+ * read back even that answer. A tab has none of those limits, which makes
+ * opening one the difference between a setup flow that finishes and one the
+ * user has to walk through twice.
+ *
+ * It runs on update as well as install, and that is deliberate: the condition
+ * is "never answered", not "just installed", so anyone who has already been
+ * through it — which is everyone who has used the extension — sees nothing.
+ * `tabs.create` needs no permission; the `tabs` permission gates reading tab
+ * properties, not making one.
+ */
+async function openSetupTabIfUnanswered() {
+  try {
+    if (!chrome || !chrome.tabs || typeof chrome.tabs.create !== 'function') return;
+    if (typeof chrome.runtime.getURL !== 'function') return;
+    const settings = await getSettings();
+    if (settings.choicePanelAnswered === true) return;
+    chrome.tabs.create({ url: chrome.runtime.getURL('popup.html') });
+  } catch (_) {
+    // No tab: the popup says where to go instead, so nothing is stranded.
+  }
 }
 
 chrome.runtime.onInstalled.addListener(() => {
   void initialize();
+  void openSetupTabIfUnanswered();
 });
 
 chrome.runtime.onStartup.addListener(() => {

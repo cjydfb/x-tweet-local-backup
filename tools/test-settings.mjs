@@ -24,6 +24,7 @@
  * ========================================================================== */
 
 import path from 'node:path';
+import { readFile } from 'node:fs/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -105,7 +106,7 @@ function assertEqual(a, b, msg) {
 
 const BOOLEAN_KEYS = [
   'debug', 'mediaCache', 'showRemoteThumbnails', 'backfillMedia', 'captureReplies',
-  'captureConnections', 'choicePanelAnswered'
+  'captureConnections', 'waybackEnabled', 'waybackAll', 'choicePanelAnswered'
 ];
 
 /* --------------------------------------------------------------- defaults -- */
@@ -125,9 +126,33 @@ await check('DEFAULT_SETTINGS is exactly the documented set of values', () => {
     backfillMedia: true,
     captureReplies: false,
     captureConnections: false,
+    waybackEnabled: false,
+    waybackBatch: 100,
+    waybackAll: false,
+    waybackHandle: '',
     choicePanelAnswered: false,
     pageSize: 30
   });
+});
+
+await check('the archive import is off, and points at nobody, on a fresh install', async () => {
+  // The one switch here that makes requests of its own to a server that is not
+  // X. It must not be possible to arrive at it by default.
+  reset();
+  const settings = await S.getSettings();
+  assertEqual(settings.waybackEnabled, false, 'a new install could reach the archive without asking');
+  assertEqual(settings.waybackHandle, '', 'a handle was invented for an account nobody has seen');
+});
+
+await check('a batch size outside the range is refused, not clamped', async () => {
+  reset();
+  const before = await S.getSettings();
+  for (const batch of [0, -1, 1.5, 501, '100', null]) {
+    const after = await S.saveSettings({ waybackBatch: batch });
+    assertEqual(after.waybackBatch, before.waybackBatch, 'accepted ' + JSON.stringify(batch));
+  }
+  const ok = await S.saveSettings({ waybackBatch: 250 });
+  assertEqual(ok.waybackBatch, 250, 'a sane value was refused');
 });
 
 await check('the first-run panel is unanswered on a fresh install', async () => {
@@ -289,6 +314,152 @@ await check('storage that is missing entirely is survivable', async () => {
   } finally {
     globalThis.chrome = saved;
   }
+});
+
+/* ------------------------------------------------- the counters, and their wall -- */
+
+console.log('\n== every counter the worker bumps has somewhere to land ==');
+
+/**
+ * The argument list of one `name(` call, found by walking brackets.
+ *
+ * A regex would stop at the first `)` and these calls contain object literals,
+ * ternaries and a second string argument, so the shape has to be walked rather
+ * than matched.
+ */
+function callArguments(source, openParenAt) {
+  let depth = 0;
+  for (let i = openParenAt; i < source.length; i++) {
+    const c = source[i];
+    if (c === '(') depth++;
+    else if (c === ')') {
+      depth--;
+      if (depth === 0) return source.slice(openParenAt + 1, i);
+    }
+  }
+  return '';
+}
+
+/* ---------------------------------------------------- known accounts --- */
+
+console.log('\n== which ids are this account ==');
+
+/* The list that decides whose timeline gets swept. It had no tests at all —
+ * which is how it came to have no way of taking anything out of it either. */
+
+await check('nothing is learned on a fresh install', async () => {
+  reset();
+  assertEqual(await S.getOwnAuthors(), []);
+});
+
+await check('ids are remembered, once each, in the order they arrived', async () => {
+  reset();
+  assertEqual(await S.rememberOwnAuthors(['111', '222']), ['111', '222']);
+  // The same id again is not a second entry. Without this the list would grow
+  // on every single captured post.
+  assertEqual(await S.rememberOwnAuthors(['111']), ['111', '222']);
+  assertEqual(await S.rememberOwnAuthors(['333']), ['111', '222', '333']);
+});
+
+await check('rubbish is refused rather than stored', async () => {
+  reset();
+  assertEqual(await S.rememberOwnAuthors(['', null, 42, {}, 'not a snowflake']), []);
+});
+
+await check('an id can be taken back out — the door that did not exist', async () => {
+  reset();
+  await S.rememberOwnAuthors(['111', '222']);
+  assertEqual(await S.forgetOwnAuthor('111'), ['222']);
+  // Written, not merely returned: a caller that trusted the return value while
+  // the write had quietly not happened would look exactly like this passing.
+  assertEqual(await S.getOwnAuthors(), ['222']);
+});
+
+await check('forgetting something that is not there changes nothing', async () => {
+  reset();
+  await S.rememberOwnAuthors(['111']);
+  assertEqual(await S.forgetOwnAuthor('999'), ['111']);
+  assertEqual(await S.forgetOwnAuthor(''), ['111']);
+  assertEqual(await S.forgetOwnAuthor(null), ['111']);
+  assertEqual(await S.getOwnAuthors(), ['111']);
+});
+
+await check('taking out the wrong one leaves the right one alone', async () => {
+  // The whole point: one bad id goes, the account itself stays.
+  reset();
+  await S.rememberOwnAuthors(['me', 'them'].map((s) => (s === 'me' ? '2032037309219315712' : '999000111222333444')));
+  assertEqual(await S.forgetOwnAuthor('999000111222333444'), ['2032037309219315712']);
+});
+
+await check('an id taken out can be learned again if it really was you', async () => {
+  // The removal must not be a blacklist: the next post from that account puts
+  // it straight back, because the learning path is unchanged.
+  reset();
+  await S.rememberOwnAuthors(['111']);
+  await S.forgetOwnAuthor('111');
+  assertEqual(await S.getOwnAuthors(), []);
+  assertEqual(await S.rememberOwnAuthors(['111']), ['111']);
+});
+
+await check('DEFAULT_STATS.lifetime is where a counter has to be declared to exist', () => {
+  assert(S.DEFAULT_STATS && S.DEFAULT_STATS.lifetime && typeof S.DEFAULT_STATS.lifetime === 'object',
+    'DEFAULT_STATS.lifetime is missing');
+  assert(Object.keys(S.DEFAULT_STATS.lifetime).length > 20,
+    'the lifetime block looks empty: ' + Object.keys(S.DEFAULT_STATS.lifetime).join(', '));
+});
+
+await check('every counter background.js bumps is declared, so none is dropped in silence', async () => {
+  /* bumpLifetime adds a key only when `stats.lifetime` already HAS it:
+   *
+   *   if (Object.prototype.hasOwnProperty.call(stats.lifetime, key)) ...
+   *
+   * so a counter that was never declared is not an error, not a warning and not
+   * a zero — the bump simply does not happen, and the diagnostics panel shows a
+   * number that can never move. That is exactly how the avatar counters shipped
+   * dead, and then how the archive-media counter did. The whitelist is the right
+   * design; a whitelist with no test is a trap. */
+  const src = await readFile(path.join(REPO, 'background.js'), 'utf8');
+  const declared = new Set(Object.keys(S.DEFAULT_STATS.lifetime));
+  const marker = 'bumpLifetime(';
+  const offenders = new Set();
+  let at = src.indexOf(marker);
+
+  while (at !== -1) {
+    /* String literals out first. `bumpLifetime(x, 'IndexedDB open failed: ')`
+       contains ` failed: ` and matched as a counter name — the guard has to be
+       right about what it is looking at, or it reports a defect that is not
+       there and gets switched off. */
+    const args = callArguments(src, at + marker.length - 1)
+      .replace(/'(?:[^'\\]|\\.)*'/g, "''")
+      .replace(/"(?:[^"\\]|\\.)*"/g, '""');
+    const keyPattern = /(?:^|[{,\s])([a-z][A-Za-z0-9_]*)\s*:/g;
+    let m = keyPattern.exec(args);
+    while (m !== null) {
+      if (!declared.has(m[1])) offenders.add(m[1]);
+      m = keyPattern.exec(args);
+    }
+    at = src.indexOf(marker, at + marker.length);
+  }
+
+  assert(offenders.size === 0,
+    'bumped but never declared, so the bump is dropped: ' + [...offenders].join(', '));
+});
+
+await check('and the panel does not list a counter that is not declared', async () => {
+  // The other direction: a row reading `lifetime.someKey || 0` for a key that
+  // does not exist shows a permanent zero, which reads as "this never happens"
+  // rather than as a typo.
+  const src = await readFile(path.join(REPO, 'popup.js'), 'utf8');
+  const declared = new Set(Object.keys(S.DEFAULT_STATS.lifetime));
+  const offenders = new Set();
+  const pattern = /lifetime\.([a-zA-Z][A-Za-z0-9_]*)/g;
+  let m = pattern.exec(src);
+  while (m !== null) {
+    if (!declared.has(m[1])) offenders.add(m[1]);
+    m = pattern.exec(src);
+  }
+  assert(offenders.size === 0,
+    'the panel reads counters that do not exist: ' + [...offenders].join(', '));
 });
 
 /* ------------------------------------------------------------------ done -- */

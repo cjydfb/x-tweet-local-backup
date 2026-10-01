@@ -49,6 +49,51 @@ export const DEFAULT_SETTINGS = {
    */
   captureConnections: false,
   /**
+   * Whether posts may be pulled from the Internet Archive.
+   *
+   * Off by default, and the only switch here that points the extension at a
+   * server that is not X. Everything else in this file decides how much of what
+   * the page already says gets kept; this one decides whether the extension
+   * makes requests of its own, to web.archive.org, on the user's behalf. That
+   * is a different kind of decision and it needs a permission grant from the
+   * browser, so it cannot be on by accident.
+   */
+  waybackEnabled: false,
+  /**
+   * How many snapshots one press of the button fetches.
+   *
+   * A press is a bounded run, not the start of one: it fetches this many and
+   * stops, keeping its place, so pressing again continues rather than starting
+   * over. Measured against the real archive, one snapshot costs about 1.8
+   * seconds — a hundred is three minutes, which is about as long as somebody
+   * will wait without being told otherwise.
+   */
+  waybackBatch: 100,
+  /**
+   * Whether one press runs to the end of the snapshot list instead of stopping
+   * after `waybackBatch`.
+   *
+   * Off by default, and the batch is what a first run should use: a hundred
+   * snapshots is about three minutes, which is long enough to find out whether
+   * this is working before committing an hour to it. On, the number above stops
+   * meaning anything and the field is disabled so it looks that way.
+   *
+   * Nothing is lost either way. The position is written after every item, so a
+   * run that is cut short — by the Stop button, by the browser being closed, by
+   * the machine sleeping — is picked up from the same place the next time.
+   */
+  waybackAll: false,
+  /**
+   * Which handle's posts are looked for.
+   *
+   * Not derivable, and it cannot be: the Archive's index is keyed by handle, so
+   * an account that has been renamed has its older posts filed under the old
+   * name, and only the archive's owner knows what that name was. Empty means
+   * "not chosen yet" and the popup fills it in from the account this browser
+   * has seen publishing.
+   */
+  waybackHandle: '',
+  /**
    * Whether the first-run choice panel has been answered.
    *
    * The four behaviours above are the reason the panel exists: each one changes
@@ -91,6 +136,23 @@ export const DEFAULT_STATS = {
     mediaCached: 0,
     mediaFailed: 0,
     /**
+     * Files the origin refused and the Internet Archive supplied.
+     *
+     * Counted apart from mediaCached because the two mean opposite things about
+     * the account: a plain cache is a live account and a normal download, while
+     * this one only ever rises when pbs.twimg.com has stopped serving the
+     * picture — a deleted post, a suspended account. It is not a warning. It is
+     * the only route by which those pictures exist at all.
+     */
+    mediaFromArchive: 0,
+    /**
+     * The account's own avatar. Cached once and then never requested again, so a
+     * 1 here with 0 below is the finished state; `avatarFailed` rising is what
+     * says the host permission is missing or the CDN said no.
+     */
+    avatarCached: 0,
+    avatarFailed: 0,
+    /**
      * Media downloads that were never even queued because the queue was full.
      * Counted apart from mediaFailed because the two look identical in the
      * archive — a post with no cached file — while the causes are completely
@@ -123,7 +185,30 @@ export const DEFAULT_STATS = {
      * written to constantly.
      */
     connectionsAdded: 0,
-    connectionsRefreshed: 0
+    connectionsRefreshed: 0,
+    /**
+     * Your own profile card, stored for the first time and then re-stored.
+     *
+     * The same split as the roster's, for the same reason: a card that has
+     * stopped changing looks exactly like one that is never being read, and one
+     * counter could not tell those apart.
+     */
+    profileAdded: 0,
+    profileRefreshed: 0,
+    /**
+     * The Internet Archive import: posts it added, posts it filled in, posts it
+     * did not need to ask for, and requests that failed.
+     *
+     * Four counters rather than one, because the three outcomes that are not
+     * failures are the whole point of having two buttons. `skipped` in
+     * particular is the number that says "fill the gaps" worked: those are
+     * posts the archive already had, each of which cost one local read instead
+     * of a request to somebody else's server.
+     */
+    waybackImported: 0,
+    waybackEnriched: 0,
+    waybackSkipped: 0,
+    waybackFailed: 0
   },
   /** Latest snapshot reported by the page realm (per page load, not lifetime). */
   page: {
@@ -157,6 +242,21 @@ export const DEFAULT_STATS = {
      * of this feature a person can be in without any error appearing anywhere.
      */
     connectionsNoOwner: 0,
+    /** Profile responses seen on this page (UserByScreenName / UserByRestId). */
+    profileSeen: 0,
+    /** Cards in them that were this account's own and were sent on to be stored. */
+    profileKept: 0,
+    /** Dropped because the response named an account this browser has not seen publish. */
+    profileNoOwner: 0,
+    /**
+     * Dropped because the response carried no usable account at all.
+     *
+     * Apart from profileNoOwner so that an unfamiliar response shape is
+     * distinguishable from ordinary browsing: the first shows up as this counter
+     * rising on your OWN profile page, which is a bug worth reporting, while the
+     * second rises whenever anybody clicks a stranger's name.
+     */
+    profileNoUser: 0,
     requestBodyRead: 0,
     requestBodyFailed: 0,
     responseCloneFailed: 0,
@@ -223,6 +323,12 @@ export async function getSettings() {
     if (typeof stored.backfillMedia === 'boolean') merged.backfillMedia = stored.backfillMedia;
     if (typeof stored.captureReplies === 'boolean') merged.captureReplies = stored.captureReplies;
     if (typeof stored.captureConnections === 'boolean') merged.captureConnections = stored.captureConnections;
+    if (typeof stored.waybackEnabled === 'boolean') merged.waybackEnabled = stored.waybackEnabled;
+    if (Number.isInteger(stored.waybackBatch) && stored.waybackBatch >= 1 && stored.waybackBatch <= 500) {
+      merged.waybackBatch = stored.waybackBatch;
+    }
+    if (typeof stored.waybackAll === 'boolean') merged.waybackAll = stored.waybackAll;
+    if (typeof stored.waybackHandle === 'string') merged.waybackHandle = stored.waybackHandle;
     if (typeof stored.choicePanelAnswered === 'boolean') merged.choicePanelAnswered = stored.choicePanelAnswered;
     // A stored `captureRetweets` from an older version is simply ignored — the
     // key is gone, and carrying it forward would suggest a setting that no
@@ -250,6 +356,12 @@ async function saveSettingsInternal(patch) {
     if (typeof patch.backfillMedia === 'boolean') current.backfillMedia = patch.backfillMedia;
     if (typeof patch.captureReplies === 'boolean') current.captureReplies = patch.captureReplies;
     if (typeof patch.captureConnections === 'boolean') current.captureConnections = patch.captureConnections;
+    if (typeof patch.waybackEnabled === 'boolean') current.waybackEnabled = patch.waybackEnabled;
+    if (Number.isInteger(patch.waybackBatch) && patch.waybackBatch >= 1 && patch.waybackBatch <= 500) {
+      current.waybackBatch = patch.waybackBatch;
+    }
+    if (typeof patch.waybackAll === 'boolean') current.waybackAll = patch.waybackAll;
+    if (typeof patch.waybackHandle === 'string') current.waybackHandle = patch.waybackHandle;
     if (typeof patch.choicePanelAnswered === 'boolean') current.choicePanelAnswered = patch.choicePanelAnswered;
     if (Number.isInteger(patch.pageSize) && patch.pageSize >= 10 && patch.pageSize <= 200) {
       current.pageSize = patch.pageSize;
@@ -327,6 +439,38 @@ async function rememberOwnAuthorsInternal(ids) {
     } catch (_) { /* quota or context error: it will be relearned from the next post */ }
   }
   return capped;
+}
+
+/**
+ * Stop counting one id as this account.
+ *
+ * The set only ever grew. Nothing removed from it, nothing showed what was in
+ * it, and the only way back from a wrong id was to wipe the whole extension's
+ * storage — and this id decides whose timeline gets swept, so a wrong one means
+ * the archive starts collecting somebody else's posts and will not stop.
+ *
+ * A fact the extension can get wrong has to be a fact the user can correct. The
+ * ids are learned from CreateTweet responses, which is a good guess and not a
+ * proof; this is the door for when the guess was wrong.
+ *
+ * Returns the list that is now stored.
+ */
+export function forgetOwnAuthor(id) {
+  return serialize(() => forgetOwnAuthorInternal(id));
+}
+
+async function forgetOwnAuthorInternal(id) {
+  const existing = await getOwnAuthors();
+  if (!validAuthorId(id)) return existing;
+  const kept = existing.filter((value) => value !== id);
+  if (kept.length === existing.length) return existing;   /* not there: no write */
+  const area = storageArea();
+  if (area !== null) {
+    try {
+      await area.set({ [OWN_AUTHORS_KEY]: kept });
+    } catch (_) { /* quota or context error: it will be relearned from the next post */ }
+  }
+  return kept;
 }
 
 export async function getStats() {
@@ -413,7 +557,8 @@ async function mergePageDiagInternal(diag) {
     'createTweetSeen', 'deleteSeen', 'deleted', 'requestBodyRead', 'requestBodyFailed',
     'responseCloneFailed', 'responseJsonFailed', 'parseFailed', 'parsed',
     'posted', 'postFailed', 'timelineSeen', 'timelineKept', 'detailSeen', 'detailKept',
-    'connectionsSeen', 'connectionsKept', 'connectionsNoOwner'
+    'connectionsSeen', 'connectionsKept', 'connectionsNoOwner',
+    'profileSeen', 'profileKept', 'profileNoOwner', 'profileNoUser'
   ];
   // A new document means a new session token: start the page counters over so
   // the popup never shows a stale maximum from a previous tab or reload.

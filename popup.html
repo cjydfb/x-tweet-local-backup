@@ -85,6 +85,7 @@
         <button id="btn-tab" class="button button--small" type="button" data-i18n="openInTab"></button>
         <button id="btn-fill-media" class="button button--small" type="button" data-i18n="fillMedia" data-i18n-title="fillMediaTitle"></button>
         <button id="btn-media" class="button button--small" type="button" data-i18n="exportArchive" data-i18n-title="exportArchiveTitle"></button>
+        <button id="btn-hosted" class="button button--small" type="button" data-i18n="exportHosted" data-i18n-title="exportHostedTitle"></button>
         <button id="btn-clear" class="button button--danger button--small" type="button" data-i18n="clearAll"></button>
       </div>
 
@@ -132,6 +133,64 @@
              yours until it has seen you publish, and a switch that silently
              stores nothing is indistinguishable from a broken one. -->
         <p class="settings__note" id="note-connections"></p>
+
+        <!-- The only switch here that points the extension at a server that is
+             not X. Everything above decides how much of what the page already
+             says gets kept; this one decides whether the extension makes
+             requests of its own, as the user. It needs a permission grant and
+             cannot be on by accident, and the note under it says what it does
+             and what it cannot reach. -->
+        <label class="toggle">
+          <input type="checkbox" id="opt-wayback">
+          <span data-i18n="optWayback"></span>
+        </label>
+        <p class="settings__note" id="note-wayback"></p>
+
+        <details class="wayback" id="wayback">
+          <summary data-i18n="waybackPanelSummary"></summary>
+          <p class="wayback__note" data-i18n="waybackPanelNote"></p>
+
+          <div class="wayback__field">
+            <label class="wayback__label" for="wayback-handle" data-i18n="waybackHandleLabel"></label>
+            <input type="text" id="wayback-handle" class="wayback__input" spellcheck="false"
+                   autocomplete="off" autocapitalize="off">
+          </div>
+
+          <div class="wayback__field">
+            <label class="wayback__label" for="wayback-batch" data-i18n="waybackBatchLabel"></label>
+            <input type="number" id="wayback-batch" class="wayback__input wayback__input--number"
+                   min="1" max="500" step="1" inputmode="numeric">
+          </div>
+
+          <!-- Off by default, because the batch is what a first run should use:
+               a hundred snapshots is about three minutes, long enough to find
+               out whether this works before committing an hour to it. -->
+          <label class="toggle">
+            <input type="checkbox" id="opt-wayback-all">
+            <span data-i18n="optWaybackAll"></span>
+          </label>
+          <p class="wayback__note" data-i18n="noteWaybackAll"></p>
+
+          <div class="wayback__row">
+            <button id="btn-wayback-fill" class="button button--small" type="button"
+                    data-i18n="btnWaybackFill" data-i18n-title="btnWaybackFillTitle" disabled></button>
+            <button id="btn-wayback-verify" class="button button--small" type="button"
+                    data-i18n="btnWaybackVerify" data-i18n-title="btnWaybackVerifyTitle" disabled></button>
+            <button id="btn-wayback-cancel" class="button button--danger button--small" type="button"
+                    data-i18n="btnWaybackCancel" hidden></button>
+          </div>
+        </details>
+
+        <!-- Which account ids this browser treats as "me".
+             This decides whose timeline gets swept, and it was a set nothing
+             could look at and nothing could take anything out of. A wrong id
+             in here means the archive starts collecting somebody else's posts
+             and will not stop. -->
+        <details class="settings__group" id="own-authors">
+          <summary data-i18n="ownAuthorsSummary"></summary>
+          <p class="settings__note" data-i18n="ownAuthorsNote"></p>
+          <div id="own-author-list"></div>
+        </details>
 
         <label class="toggle">
           <input type="checkbox" id="opt-debug">
@@ -214,10 +273,30 @@
 
       <div class="choice__option">
         <label class="toggle">
+          <input type="checkbox" id="choice-connections">
+          <span data-i18n="optCaptureConnections"></span>
+        </label>
+        <p class="choice__cost" data-i18n="choiceConnectionsCost"></p>
+      </div>
+
+      <div class="choice__option">
+        <label class="toggle">
           <input type="checkbox" id="choice-thumbs">
           <span data-i18n="optThumbs"></span>
         </label>
         <p class="choice__cost" data-i18n="choiceThumbsCost"></p>
+      </div>
+
+      <!-- The only one of the five that points the extension at a server that
+           is not X. It hands over to a second panel before anything is granted,
+           so ticking it here is a decision to be asked, not a decision to have
+           network access. -->
+      <div class="choice__option">
+        <label class="toggle">
+          <input type="checkbox" id="choice-wayback">
+          <span data-i18n="optChoiceWayback"></span>
+        </label>
+        <p class="choice__cost" data-i18n="choiceWaybackCost"></p>
       </div>
 
       <p class="choice__note" data-i18n="choiceCoreNote"></p>
@@ -232,6 +311,28 @@
       <p class="choice__warning" data-i18n="choiceWarning"></p>
 
       <button id="btn-choice-confirm" class="button button--primary button--wide" type="button" data-i18n="choiceConfirm"></button>
+    </div>
+  </div>
+
+  <!-- Turning the archive import on, explained once before the browser is asked
+       for anything. Same overlay as the panel above and for the same reason.
+       It exists because this is the only action in the extension that makes the
+       extension itself talk to a server — and Chrome's own prompt says WHAT is
+       being granted, never what it is for. -->
+  <div class="choice" id="wayback-choice" hidden>
+    <div class="choice__panel" role="dialog" aria-modal="true" aria-labelledby="wayback-choice-title">
+      <h2 class="choice__title" id="wayback-choice-title" data-i18n="waybackChoiceTitle"></h2>
+      <p class="choice__intro" data-i18n="waybackChoiceIntro"></p>
+      <p class="choice__cost" data-i18n="waybackChoiceSource"></p>
+      <p class="choice__warning" data-i18n="waybackChoiceWarning"></p>
+      <!-- A way out, which the panel above does not need and this one does.
+           Confirming THAT panel writes four preferences and can be re-opened
+           and changed at will; confirming this one asks the browser for a
+           permission, and there is no "review it later" for a prompt. -->
+      <button id="btn-wayback-dismiss" class="button button--small" type="button"
+              data-i18n="waybackChoiceCancel"></button>
+      <button id="btn-wayback-confirm" class="button button--primary button--wide" type="button"
+              data-i18n="waybackChoiceConfirm"></button>
     </div>
   </div>
 

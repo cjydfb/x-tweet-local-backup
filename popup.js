@@ -21,15 +21,22 @@ import {
   listDeletions,
   queryConnections,
   listConnections,
+  listProfiles,
   sameKey,
   SCHEMA_VERSION
 } from './db.js';
 
 import { DEFAULT_SETTINGS } from './settings.js';
 
-import { requestMediaPermission, isAllowedMediaUrl } from './media-cache.js';
+import { requestMediaPermission, isAllowedMediaUrl, avatarKey } from './media-cache.js';
 
 import { buildZip, describeMediaArchive, buildMediaIndexJson, buildConnectionsCsv } from './zip.js';
+
+import { isHandle, hasWaybackPermission, requestWaybackPermission } from './wayback.js';
+
+import {
+  buildHostedLayout, utf8Bytes, safeNamePart, mediaExtension, HOSTED_TWEETS_SOFT_MAX
+} from './hosted.js';
 
 /* -------------------------------------------------------------------------- */
 /* Localisation                                                               */
@@ -91,9 +98,11 @@ const state = {
   counts: { tweets: null, media: null, following: null, followers: null },
   purgeCounts: { superseded: 0, deleted: 0 },
   mediaPermission: false,
-  /** How many of this account's own ids this browser has learned. 0 means the
-   *  roster line cannot be working yet, and the note under its switch says so. */
-  ownAuthorCount: 0,
+  /** The ids this browser has learned to treat as this account. Empty means the
+   *  roster line cannot be working yet, and the note under its switch says so.
+   *  The ids themselves, not a count: a wrong one has to be removable, and it
+   *  cannot be removed if it cannot be seen. */
+  ownAuthors: [],
   armedPurge: null,
   savingChoices: false,
   /** Which list is on screen: 'tweets', 'following' or 'followers'. */
@@ -157,14 +166,31 @@ const els = {
   purgeDeletedCount: document.getElementById('cleanup-deleted-count'),
   tab: document.getElementById('btn-tab'),
   media: document.getElementById('btn-media'),
+  hosted: document.getElementById('btn-hosted'),
   clear: document.getElementById('btn-clear'),
   choice: document.getElementById('choice'),
   choiceMedia: document.getElementById('choice-media'),
   choiceBackfill: document.getElementById('choice-backfill'),
   choiceReplies: document.getElementById('choice-replies'),
+  choiceConnections: document.getElementById('choice-connections'),
   choiceThumbs: document.getElementById('choice-thumbs'),
+  choiceWayback: document.getElementById('choice-wayback'),
   choiceConfirm: document.getElementById('btn-choice-confirm'),
-  choiceShow: document.getElementById('btn-choice-show')
+  choiceShow: document.getElementById('btn-choice-show'),
+  optWayback: document.getElementById('opt-wayback'),
+  optWaybackAll: document.getElementById('opt-wayback-all'),
+  noteWayback: document.getElementById('note-wayback'),
+  settingsPanel: document.getElementById('settings'),
+  waybackPanel: document.getElementById('wayback'),
+  ownAuthorsPanel: document.getElementById('own-authors'),
+  ownAuthorList: document.getElementById('own-author-list'),
+  waybackHandle: document.getElementById('wayback-handle'),
+  waybackBatch: document.getElementById('wayback-batch'),
+  waybackFill: document.getElementById('btn-wayback-fill'),
+  waybackVerify: document.getElementById('btn-wayback-verify'),
+  waybackCancel: document.getElementById('btn-wayback-cancel'),
+  waybackChoice: document.getElementById('wayback-choice'),
+  waybackConfirm: document.getElementById('btn-wayback-confirm')
 };
 
 /* -------------------------------------------------------------------------- */
@@ -314,6 +340,255 @@ function revokeObjectUrls() {
  * The caller must therefore NOT claim the file exists after calling this — see
  * the notice each export prints on this path.
  */
+/**
+ * The account's own avatar, as a data: URL, or null.
+ *
+ * INLINED into the profile object rather than written as a file, because the
+ * archive has two export forms and only the ZIP can carry a file. A picture
+ * that appears in one of them and not the other is a difference nobody would
+ * remember six months later — this one rides in the JSON, so both forms open
+ * with a real face and neither needs the network.
+ *
+ * It is one image of about thirty kilobytes, which is under three percent of a
+ * normal archive and nothing at all next to the photographs it sits beside.
+ */
+async function avatarDataUrl(db, profile) {
+  if (!profile || typeof profile.userId !== 'string' || profile.userId.length === 0) return null;
+  try {
+    const record = await getMediaRecord(db, avatarKey(profile.userId));
+    if (!record || !record.blob) return null;
+    return await blobToDataUrl(record.blob);
+  } catch (_) {
+    return null;   /* no picture is an ordinary outcome, not a failed export */
+  }
+}
+
+/**
+ * Is the account's own picture in the database right now?
+ *
+ * Answered by looking, not by counting: the counter records that a download
+ * happened once, and after that first time it can never move again — so a pair
+ * of zeroes was equally consistent with "stored and healthy" and with "never
+ * attempted". Returns false for every failure, because "no picture" is the safe
+ * reading of a database that will not answer.
+ */
+async function avatarIsStored(db) {
+  try {
+    if (!db) return false;
+    const profiles = await listProfiles(db);
+    const newest = profiles && profiles.length > 0 ? profiles[0] : null;
+    if (!newest || typeof newest.userId !== 'string' || newest.userId.length === 0) return false;
+    const record = await getMediaRecord(db, avatarKey(newest.userId));
+    return !!(record && record.blob);
+  } catch (_) {
+    return false;
+  }
+}
+
+/**
+ * Who this archive says it is: the newest profile card's handle and user id.
+ *
+ * The handle names export files — two archives exported on the same day from
+ * two accounts were both called `x-tweet-backup-archive-2026-10-02.zip`, and
+ * once they are out of the browser nothing on either of them says whose it is.
+ * The id marks which of the remembered author ids is this account, in the list
+ * of ones that are, so a wrong entry can be told from the right one.
+ */
+async function ownIdentity() {
+  const card = await identityFromProfileCard();
+  if (card.handle !== null) return card;
+  return await identityFromArchiveContent();
+}
+
+/** The profile card's own answer, when there is one. */
+async function identityFromProfileCard() {
+  try {
+    const profiles = await listProfiles(state.db);
+    const newest = profiles && profiles.length > 0 ? profiles[0] : null;
+    if (newest === null) return { handle: null, userId: null };
+    const name = typeof newest.screenName === 'string' ? newest.screenName : '';
+    const safe = safeNamePart(name);
+    const id = newest.userId;
+    return {
+      handle: safe.length > 0 ? safe : null,
+      userId: typeof id === 'string' && id.length > 0 ? id
+        : (typeof id === 'number' && isFinite(id) ? String(id) : null)
+    };
+  } catch (_) {
+    return { handle: null, userId: null };
+  }
+}
+
+/**
+ * Whose archive this is, worked out from what is IN it.
+ *
+ * The profile card is the right answer and the usual one, but it is only
+ * written when this browser sees the account's own profile — so an archive can
+ * hold hundreds of posts and have no card at all. That is not hypothetical: it
+ * is the state this was reported from, an export of 447 posts by one account
+ * that came out with nothing in its file name, because there was no card to
+ * read a name from and the file was left nameless rather than guessed at.
+ *
+ * The fallback is the account the archive is mostly MADE of, which is the
+ * question a file name is really answering — and it is right whether those
+ * posts came from this browser or from the Internet Archive, where an import
+ * leaves the same shape behind.
+ *
+ * One page, not the whole store. A dominant author is obvious within a few
+ * hundred records, and the alternative is parsing a hundred thousand of them
+ * every time the popup opens.
+ */
+async function identityFromArchiveContent() {
+  try {
+    const page = await queryTweets(state.db, { pageSize: 2000, scanBudget: 20000 });
+    const items = page && Array.isArray(page.items) ? page.items : [];
+    const tally = new Map();
+    for (const record of items) {
+      const author = record && record.author;
+      if (!author || typeof author.screenName !== 'string' || author.screenName.length === 0) continue;
+      const key = typeof author.id === 'string' && author.id.length > 0 ? author.id : author.screenName;
+      const seen = tally.get(key);
+      if (seen === undefined) tally.set(key, { count: 1, screenName: author.screenName, id: author.id });
+      else seen.count++;
+    }
+    let best = null;
+    for (const entry of tally.values()) {
+      if (best === null || entry.count > best.count) best = entry;
+    }
+    if (best === null) return { handle: null, userId: null };
+    const safe = safeNamePart(best.screenName);
+    return {
+      handle: safe.length > 0 ? safe : null,
+      userId: typeof best.id === 'string' && best.id.length > 0 ? best.id : null
+    };
+  } catch (_) {
+    return { handle: null, userId: null };
+  }
+}
+
+/**
+ * What an export is called: `x-tweet-backup-archive-<handle>-<date>.<ext>`.
+ *
+ * The handle is left out entirely when there is no profile card yet, rather
+ * than filled in with a placeholder — `archive-unknown-2026-10-02.zip` reads
+ * like an answer, and "no name" is not one.
+ *
+ * Both exports get it. The ZIP used to say `x-tweet-backup-archive-<date>` and
+ * the JSON `x-tweet-backup-<date>`, and neither said whose — which is the same
+ * question for both of them, so both keep their own prefix and gain the handle
+ * in the same place. Files exported earlier keep the names they already have;
+ * this only changes what is written from here on.
+ */
+function archiveFileName(extension) {
+  const identity = state.ownIdentity && typeof state.ownIdentity === 'object' ? state.ownIdentity : {};
+  const handle = typeof identity.handle === 'string' && identity.handle.length > 0 ? identity.handle : null;
+  const stem = extension === 'zip' ? 'x-tweet-backup-archive-' : 'x-tweet-backup-';
+  return stem + (handle === null ? '' : handle + '-') + todayStamp() + '.' + extension;
+}
+
+/**
+ * Make sure the name is knowable before a picker is opened.
+ *
+ * `refreshState` fills this on every popup open, and that is where it normally
+ * comes from. This is the backstop for when that did not happen — a state read
+ * that failed, an extension reloaded while the popup was already open — because
+ * the failure is completely silent: the file is simply nameless, and nothing
+ * anywhere says why.
+ *
+ * It costs an IndexedDB read of a handful of rows, and it only runs when the
+ * value is missing. The picker wants the click's activation, which is why this
+ * is not done unconditionally before one.
+ */
+async function ensureIdentity() {
+  // Retried on a MISSING HANDLE, not on a missing object: `ownIdentity` returns
+  // `{handle: null}` for every way it can fail, so "there is an object" is not
+  // the same question as "there is a name".
+  const handle = state.ownIdentity && typeof state.ownIdentity.handle === 'string'
+    ? state.ownIdentity.handle : '';
+  if (handle.length > 0) return;
+  state.ownIdentity = await ownIdentity();
+}
+
+/**
+ * The list of ids this browser thinks are this account.
+ *
+ * Shown because there was no way to see it, and the only way out of a wrong
+ * entry was to wipe the extension's storage. Every line says which id, whether
+ * it is the one on this archive's own profile card, and offers to forget it.
+ *
+ * A removed id is NOT removed from x.com pages that are already open — the page
+ * keeps its own copy of the set and only ever adds to it — so the note under
+ * the list says to reload them. That is the same "F5 after touching the
+ * extension" the project already asks for, but here it decides whether the
+ * removal appears to have worked at all.
+ */
+function renderOwnAuthors() {
+  els.ownAuthorList.textContent = '';
+  if (state.ownAuthors.length === 0) {
+    els.ownAuthorList.appendChild(noteLine(t('ownAuthorsNone')));
+    return;
+  }
+
+  const own = state.ownIdentity && typeof state.ownIdentity.userId === 'string' ? state.ownIdentity.userId : null;
+  for (const id of state.ownAuthors) {
+    const row = document.createElement('div');
+    row.className = 'ownauthor';
+
+    const label = document.createElement('span');
+    label.className = 'ownauthor__id';
+    label.textContent = id;
+    row.appendChild(label);
+
+    const tag = document.createElement('span');
+    tag.className = 'ownauthor__tag';
+    tag.textContent = id === own ? t('ownAuthorsThisOne') : t('ownAuthorsOther');
+    row.appendChild(tag);
+
+    const forget = document.createElement('button');
+    forget.type = 'button';
+    forget.className = 'button button--danger button--small';
+    forget.textContent = t('ownAuthorsForget');
+    forget.addEventListener('click', () => { void forgetOwnAuthor(id); });
+    row.appendChild(forget);
+
+    els.ownAuthorList.appendChild(row);
+  }
+
+  els.ownAuthorList.appendChild(noteLine(t('ownAuthorsReload')));
+}
+
+function noteLine(text) {
+  const p = document.createElement('p');
+  p.className = 'settings__note';
+  p.textContent = text;
+  return p;
+}
+
+async function forgetOwnAuthor(id) {
+  const response = await send({ type: 'XTB_FORGET_OWN_AUTHOR', id: id });
+  if (!response || response.ok !== true) {
+    setNotice(t('errForgetOwnAuthor', [(response && response.error) || t('unknownError')]), 'error');
+    return;
+  }
+  state.ownAuthors = Array.isArray(response.ownAuthors) ? response.ownAuthors : [];
+  renderOwnAuthors();
+  renderConnectionsNote();
+  setNotice(t('okOwnAuthorForgotten'), 'ok');
+}
+
+function blobToDataUrl(blob) {
+  return new Promise((resolve) => {
+    try {
+      const reader = new FileReader();
+      reader.onload = () => resolve(typeof reader.result === 'string' ? reader.result : null);
+      reader.onerror = () => resolve(null);
+      reader.readAsDataURL(blob);
+    } catch (_) {
+      resolve(null);
+    }
+  });
+}
+
 function downloadBlob(blob, filename) {
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement('a');
@@ -423,9 +698,25 @@ async function refreshState() {
   state.counts = response.counts || { tweets: null, media: null, following: null, followers: null };
   state.purgeCounts = Object.assign({ superseded: 0, deleted: 0 }, response.purgeCounts || {});
   state.mediaPermission = response.mediaPermission === true;
-  state.ownAuthorCount = Number.isInteger(response.ownAuthorCount) ? response.ownAuthorCount : 0;
+  state.ownAuthors = Array.isArray(response.ownAuthors) ? response.ownAuthors : [];
+  /* Whether the account's picture is actually in the database.
+   *
+   * The lifetime counter could not answer this and was read as if it could:
+   * caching happens ONCE and every sighting after that is `skipped`, which
+   * bumps nothing at all — so `0 / 0` meant "already stored" exactly as often
+   * as it meant "never tried", and the two could not be told apart from the
+   * panel. This is the fact itself rather than a count of an event. */
+  state.avatarStored = await avatarIsStored(state.db);
+  /* For the export file names — see archiveFileName(). Read here and not at
+     export time because the save picker only opens while the click's activation
+     is still live, and an IndexedDB read in front of it is time spent before
+     the dialog is allowed to appear. */
+  state.ownIdentity = await ownIdentity();
+  state.waybackPermission = response.waybackPermission === true;
+  state.wayback = response.wayback || null;
   renderCleanup();
   renderConnectionsNote();
+  renderOwnAuthors();
 
   els.optDebug.checked = state.settings.debug === true;
   els.optThumbs.checked = state.settings.showRemoteThumbnails === true;
@@ -433,12 +724,27 @@ async function refreshState() {
   els.optBackfillMedia.checked = state.settings.backfillMedia === true;
   els.optCaptureReplies.checked = state.settings.captureReplies === true;
   els.optCaptureConnections.checked = state.settings.captureConnections === true;
+  els.optWayback.checked = state.settings.waybackEnabled === true;
+  els.optWaybackAll.checked = state.settings.waybackAll === true;
   // Meaningless without the master switch, so it says so rather than looking
   // like a setting that does nothing.
   els.optBackfillMedia.disabled = state.settings.mediaCache !== true;
   // Same reasoning: with media caching off there is nothing to fill.
   els.fillMedia.disabled = state.settings.mediaCache !== true;
   els.diagnostics.hidden = state.settings.debug !== true;
+
+  els.waybackBatch.value = String(state.settings.waybackBatch);
+  // Never overwritten once it has a value: this box is the one thing here the
+  // user has to supply rather than choose, and it is refilled from the stored
+  // setting on every open so a typo is not permanent.
+  if (String(els.waybackHandle.value || '').trim() === '') {
+    els.waybackHandle.value = state.settings.waybackHandle || '';
+  }
+  renderWaybackNote();
+  updateWaybackButtons();
+  // A run can be going while this popup was closed, or opened again while one
+  // is still going. Either way the poll has to be running to see it end.
+  if (state.wayback !== null && state.wayback.running === true) startWaybackPoll();
 
   renderSummary();
   renderDiagnostics();
@@ -578,6 +884,14 @@ function renderDiagnostics() {
     [t('diagConnectionsSeen'), String(page.connectionsSeen || 0), ''],
     [t('diagConnectionsKept'), String(page.connectionsKept || 0), ''],
     [t('diagConnectionsNoOwner'), String(page.connectionsNoOwner || 0), ''],
+    // And the profile card, on its own for the same reason. These four are what
+    // say whether the reader's header will draw: seen-but-not-kept means the
+    // pages being visited are somebody else's, and noUser rising on your OWN
+    // profile is the signal that the response shape moved.
+    [t('diagProfileSeen'), String(page.profileSeen || 0), ''],
+    [t('diagProfileKept'), String(page.profileKept || 0), page.profileKept ? 'is-good' : ''],
+    [t('diagProfileNoOwner'), String(page.profileNoOwner || 0), ''],
+    [t('diagProfileNoUser'), String(page.profileNoUser || 0), page.profileNoUser ? 'is-bad' : ''],
     [t('diagReceived'), String(lifetime.received || 0), ''],
     [t('diagMarkedDeleted'), String(lifetime.deletedMarked || 0), ''],
     [t('diagUnmatchedDelete'), String(lifetime.deletedUnmatched || 0), ''],
@@ -590,10 +904,31 @@ function renderDiagnostics() {
     // constantly, and those want opposite investigations.
     [t('diagConnectionsAdded'), String(lifetime.connectionsAdded || 0), lifetime.connectionsAdded ? 'is-good' : ''],
     [t('diagConnectionsRefreshed'), String(lifetime.connectionsRefreshed || 0), ''],
+    [t('diagProfileAdded'), String(lifetime.profileAdded || 0), lifetime.profileAdded ? 'is-good' : ''],
+    [t('diagProfileRefreshed'), String(lifetime.profileRefreshed || 0), ''],
+    /* The account's own picture. The first row is the FACT — is it in the
+       database — and it is the one to read; the two below are history, and
+       `avatarCached` in particular cannot move again once it has fired once,
+       because every later sighting is skipped. A pair of zeroes down there is
+       not a fault, which is what it looked like. */
+    [t('diagAvatarStored'), state.avatarStored === true ? t('diagAvatarYes') : t('diagAvatarNo'),
+      state.avatarStored === true ? 'is-good' : ''],
+    [t('diagAvatarCached'), String(lifetime.avatarCached || 0), lifetime.avatarCached ? 'is-good' : ''],
+    [t('diagAvatarFailed'), String(lifetime.avatarFailed || 0), lifetime.avatarFailed ? 'is-bad' : ''],
+    // The archive import. `skipped` is the one that says "fill the gaps" is
+    // doing its job: each of those is a post the archive already had, and each
+    // one cost a local read instead of a request to somebody else's server.
+    [t('diagWaybackImported'), String(lifetime.waybackImported || 0), lifetime.waybackImported ? 'is-good' : ''],
+    [t('diagWaybackEnriched'), String(lifetime.waybackEnriched || 0), lifetime.waybackEnriched ? 'is-good' : ''],
+    [t('diagWaybackSkipped'), String(lifetime.waybackSkipped || 0), ''],
+    [t('diagWaybackFailed'), String(lifetime.waybackFailed || 0), lifetime.waybackFailed ? 'is-bad' : ''],
     [t('diagUpsertOk'), String(lifetime.upsertOk || 0), lifetime.upsertOk ? 'is-good' : ''],
     [t('diagUpsertFailed'), String(lifetime.upsertFailed || 0), lifetime.upsertFailed ? 'is-bad' : ''],
     [t('diagRejected'), String(lifetime.rejected || 0), lifetime.rejected ? 'is-bad' : ''],
     [t('diagMediaCached'), String(lifetime.mediaCached || 0), ''],
+    // Which of the two sources answered. A number here is not a problem — it is
+    // the only way a picture from a deleted account gets into an archive at all.
+    [t('diagMediaFromArchive'), String(lifetime.mediaFromArchive || 0), lifetime.mediaFromArchive ? 'is-good' : ''],
     [t('diagMediaFailed'), String(lifetime.mediaFailed || 0), lifetime.mediaFailed ? 'is-bad' : ''],
     // Not the same failure as mediaFailed: nothing was requested at all. A post
     // whose download was dropped looks exactly like a post that had no media,
@@ -715,7 +1050,7 @@ async function setView(next) {
  * fix reads as a broken control.
  */
 function renderConnectionsNote() {
-  els.noteConnections.textContent = state.ownAuthorCount > 0
+  els.noteConnections.textContent = state.ownAuthors.length > 0
     ? t('noteConnections')
     : t('noteConnectionsInactive');
 }
@@ -1589,7 +1924,13 @@ async function deleteOne(id) {
   }
   const card = els.list.querySelector('.card[data-id="' + CSS.escape(id) + '"]');
   if (card) card.remove();
-  state.renderedIds.delete(id);
+  /* `state.renderedIds` never existed — the set of drawn rows lives per list, on
+     the paging state. Reading a missing property gave `undefined` and the call
+     on it threw a TypeError, and because the record was already gone from the
+     database and the card already removed from the page by then, the only
+     symptom was the count, the empty state and the "deleted" notice never
+     updating. */
+  paging().rendered.delete(id);
   if (state.counts.tweets !== null && state.counts.tweets > 0) state.counts.tweets--;
   renderSummary();
   showEmptyState();
@@ -1738,23 +2079,43 @@ function timezoneBlock() {
   };
 }
 
-async function buildTweetsJson() {
-  const chunks = [];
-  chunks.push('{\n  "schemaVersion": ' + JSON.stringify(SCHEMA_VERSION) + ',\n');
-  chunks.push('  "generator": "x-tweet-backup",\n');
-  chunks.push('  "generatorVersion": ' + JSON.stringify(extensionVersion()) + ',\n');
-  chunks.push('  "exportedAt": ' + JSON.stringify(new Date().toISOString()) + ',\n');
-  chunks.push('  "timezone": ' + JSON.stringify(timezoneBlock()) + ',\n');
-  chunks.push('  "tweets": [');
+/**
+ * One envelope, or several.
+ *
+ * `options.maxShardBytes` splits the record array into more than one complete
+ * envelope. It exists for GitHub: a single file there is refused outright over
+ * 100 MB, and refusing means the upload has already pushed every media blob
+ * before it finds out. Each shard is a whole envelope — its own count, its own
+ * schema version — so each one opens on its own in this reader and in anything
+ * else that reads this format.
+ *
+ * `options.omitConnections` leaves the follow roster out. The hosted form
+ * writes it to its own file: a roster is tens of megabytes, and inlined it
+ * would be most of a single file's budget and a huge tail for a reader to
+ * range-read.
+ *
+ * With neither option set the output is byte-for-byte what this function has
+ * always produced — asserted, because the plain export is what people already
+ * have on disk and a changed byte there is a changed archive.
+ */
+async function buildTweetsJson(options) {
+  const opts = options || {};
+  const exportedAt = new Date().toISOString();
+  const timezone = timezoneBlock();
 
+  const head = '{\n  "schemaVersion": ' + JSON.stringify(SCHEMA_VERSION) + ',\n' +
+    '  "generator": "x-tweet-backup",\n' +
+    '  "generatorVersion": ' + JSON.stringify(extensionVersion()) + ',\n' +
+    '  "exportedAt": ' + JSON.stringify(exportedAt) + ',\n' +
+    '  "timezone": ' + JSON.stringify(timezone) + ',\n' +
+    '  "tweets": [';
+
+  const recordTexts = [];
   let count = 0;
   await forEachTweet(state.db, (record) => {
-    chunks.push((count === 0 ? '\n    ' : ',\n    ') + JSON.stringify(record));
+    recordTexts.push(JSON.stringify(record));
     count++;
   });
-
-  chunks.push(count === 0 ? ']' : '\n  ]');
-  chunks.push(',\n  "count": ' + count + ',\n');
 
   // Deletion events live beside the tweets, not inside them. A deletion has to
   // travel even when this machine never archived the tweet — that is what
@@ -1772,8 +2133,34 @@ async function buildTweetsJson() {
   } catch (err) {
     throw new Error(t('errDeletionsUnreadable', [describe(err)]));
   }
-  chunks.push('  "deletions": ' + JSON.stringify(deletions));
 
+  // Your own profile card sits immediately after `count`, and BOTH sides of that
+  // position are load-bearing.
+  //
+  // It has to come AFTER the tweet array, because reader.html locates that array
+  // by scanning the raw bytes for the literal "tweets" key inside a probe
+  // measured in kilobytes — anything placed before it that grew large enough
+  // would stop the archive opening at all. A bio capped at 2000 characters would
+  // usually be fine, and "usually fine" is not the standard this invariant is
+  // held to.
+  //
+  // And it has to come BEFORE the roster, because the reader reaches this part
+  // of the file with one bounded forward read from the array's closing bracket.
+  // The roster can be tens of megabytes; the card would be out of reach behind it.
+  //
+  // A failed read STOPS the export, like the deletion log and the roster: a file
+  // that looks complete while silently missing the header is worse than no file.
+  let profiles;
+  try {
+    profiles = await listProfiles(state.db);
+  } catch (err) {
+    throw new Error(t('errProfileUnreadable', [describe(err)]));
+  }
+  const profile = profiles.length > 0 ? profiles[0] : null;
+  if (profile !== null) {
+    const face = await avatarDataUrl(state.db, profile);
+    if (face !== null) profile.avatarData = face;
+  }
   // The follow roster rides LAST, and that position is load-bearing rather than
   // tidy. reader.html does not parse this file: it finds the tweet array by
   // scanning the raw bytes for the literal "tweets" key inside a probe whose
@@ -1792,19 +2179,80 @@ async function buildTweetsJson() {
     throw new Error(t('errConnectionsUnreadable', [describe(err)]));
   }
 
-  // Omitted entirely when empty, so an archive belonging to someone who never
-  // switched the feature on is byte-for-byte what earlier versions wrote.
-  if (connections.length > 0) {
-    chunks.push(',\n  "connections": ' + JSON.stringify(connections) + '\n}\n');
-  } else {
-    chunks.push('\n}\n');
+  /**
+   * Everything after the record array, for one shard.
+   *
+   * Shard 1 carries the profile and the deletions; the later ones carry
+   * neither. Their `deletions` is an EMPTY ARRAY rather than a missing key, and
+   * that is not tidiness: `envelopeHasList` reads `[]` as "no list here", so a
+   * shard without it stays quiet, while an absent key would be the same answer
+   * arrived at differently and a `null` would be a third.
+   */
+  function tailFor(shardCount, extras) {
+    let out = (shardCount === 0 ? ']' : '\n  ]') + ',\n  "count": ' + shardCount + ',\n';
+    if (extras.profile !== null && extras.profile !== undefined) {
+      out += '  "profile": ' + JSON.stringify(extras.profile) + ',\n';
+    }
+    out += '  "deletions": ' + JSON.stringify(extras.deletions || []);
+    // Omitted entirely when empty, so an archive belonging to someone who never
+    // switched the feature on is byte-for-byte what earlier versions wrote.
+    if (Array.isArray(extras.connections) && extras.connections.length > 0) {
+      out += ',\n  "connections": ' + JSON.stringify(extras.connections) + '\n}\n';
+    } else {
+      out += '\n}\n';
+    }
+    return out;
   }
 
+  function renderShard(records, isFirst) {
+    let body = '';
+    for (let i = 0; i < records.length; i++) {
+      body += (i === 0 ? '\n    ' : ',\n    ') + records[i];
+    }
+    return head + body + tailFor(records.length, {
+      profile: isFirst ? profile : null,
+      deletions: isFirst ? deletions : [],
+      connections: isFirst && opts.omitConnections !== true ? connections : []
+    });
+  }
+
+  const groups = [];
+  if (!(opts.maxShardBytes > 0)) {
+    groups.push(recordTexts);
+  } else {
+    let current = [];
+    let bytes = 0;
+    for (const text of recordTexts) {
+      // The separator and the indentation, and nothing for the head — this is a
+      // guard against a hard limit, not an exact budget.
+      const cost = utf8Bytes(text) + 6;
+      if (current.length > 0 && bytes + cost > opts.maxShardBytes) {
+        groups.push(current);
+        current = [];
+        bytes = 0;
+      }
+      current.push(text);
+      bytes += cost;
+    }
+    if (current.length > 0 || groups.length === 0) groups.push(current);
+  }
+
+  const shards = groups.map((records, i) => ({
+    text: renderShard(records, i === 0),
+    count: records.length
+  }));
+
   return {
-    text: chunks.join(''),
+    text: shards[0].text,
+    shards: shards,
     count: count,
     deletions: deletions.length,
-    connections: connections.length
+    deletionsRows: deletions,
+    connections: connections.length,
+    connectionsRows: connections,
+    profile: profile,
+    timezone: timezone,
+    exportedAt: exportedAt
   };
 }
 
@@ -1815,7 +2263,8 @@ async function exportAll() {
   els.export.textContent = t('busyExportingShort');
 
   try {
-    const filename = 'x-tweet-backup-' + todayStamp() + '.json';
+    await ensureIdentity();
+    const filename = archiveFileName('json');
     // The destination is chosen before the document is built: the picker needs
     // the click's user activation and building spends it. See chooseSaveFile.
     const target = await chooseSaveFile(filename);
@@ -1859,26 +2308,56 @@ async function exportAll() {
   }
 }
 
-function safeNamePart(value) {
-  return String(value === undefined || value === null ? '' : value).replace(/[^A-Za-z0-9_-]/g, '');
-}
-
-function extensionFor(contentType, mediaType) {
-  const ct = typeof contentType === 'string' ? contentType.toLowerCase() : '';
-  if (ct.indexOf('jpeg') !== -1 || ct.indexOf('jpg') !== -1) return '.jpg';
-  if (ct.indexOf('png') !== -1) return '.png';
-  if (ct.indexOf('webp') !== -1) return '.webp';
-  if (ct.indexOf('gif') !== -1) return '.gif';
-  if (ct.indexOf('mp4') !== -1) return '.mp4';
-  if (ct.indexOf('webm') !== -1) return '.webm';
-  if (mediaType === 'photo') return '.jpg';
-  if (mediaType === 'video' || mediaType === 'animated_gif') return '.mp4';
-  return '.bin';
-}
-
 function parseDateOrNow(iso) {
   const ms = typeof iso === 'string' ? Date.parse(iso) : NaN;
   return Number.isFinite(ms) ? new Date(ms) : new Date();
+}
+
+/**
+ * Everything an archive is made of, gathered once.
+ *
+ * The envelope, the media rows, how many rows could not be named. Extracted so
+ * that the ZIP export and the hosted-layout export cannot disagree about what
+ * an archive contains: they lay the files out differently — a ZIP puts every
+ * picture in one `media/` directory, a hosted archive splits them by year and
+ * month — but the rows are the same rows and the envelope is the same envelope.
+ *
+ * `tweetId` and `mediaId` are the values AS STORED, because they are the join
+ * key: the reader pairs a file back to a post by looking them up in the media
+ * index, and an id that had been sanitised out of recognition would simply
+ * never match. `fileName` is the sanitised form, because that one is a path.
+ * For every real tweet the two are identical — a snowflake id and a media key
+ * are digits and underscores already — so this costs nothing and is correct for
+ * the file that comes from somewhere else.
+ */
+async function collectArchiveInputs(options) {
+  const built = await buildTweetsJson(options);
+  const records = await listAllMedia(state.db);
+  const rows = [];
+  let skipped = 0;
+
+  for (const record of records) {
+    if (!record || typeof record !== 'object') continue;
+    if (!(record.blob instanceof Blob)) { skipped++; continue; }
+
+    const tweetId = safeNamePart(record.tweetId);
+    const mediaId = safeNamePart(record.mediaId);
+    if (tweetId.length === 0 || mediaId.length === 0) { skipped++; continue; }
+
+    rows.push({
+      fileName: 'media/' + tweetId + '_' + mediaId + mediaExtension(record.contentType, record.type),
+      tweetId: String(record.tweetId),
+      mediaId: String(record.mediaId),
+      type: typeof record.type === 'string' ? record.type : null,
+      contentType: typeof record.contentType === 'string' ? record.contentType : null,
+      bytes: record.blob.size,
+      blob: record.blob,
+      cachedAt: typeof record.cachedAt === 'string' ? record.cachedAt : null,
+      date: parseDateOrNow(record.cachedAt)
+    });
+  }
+
+  return { built: built, rows: rows, skipped: skipped, generatedAt: new Date().toISOString() };
 }
 
 /**
@@ -1898,7 +2377,8 @@ async function exportArchive() {
   setNotice(t('busyReading'));
 
   try {
-    const filename = 'x-tweet-backup-archive-' + todayStamp() + '.zip';
+    await ensureIdentity();
+    const filename = archiveFileName('zip');
     // Destination first, for the same reason as exportAll: the picker needs the
     // click's user activation, and packing the ZIP would spend it.
     const target = await chooseSaveFile(filename);
@@ -1911,39 +2391,29 @@ async function exportArchive() {
       return;
     }
 
-    const built = await buildTweetsJson();
-
-    const records = await listAllMedia(state.db);
-    const rows = [];
-    let skipped = 0;
-
-    for (const record of records) {
-      if (!record || typeof record !== 'object') continue;
-      if (!(record.blob instanceof Blob)) { skipped++; continue; }
-
-      const tweetId = safeNamePart(record.tweetId);
-      const mediaId = safeNamePart(record.mediaId);
-      if (tweetId.length === 0 || mediaId.length === 0) { skipped++; continue; }
-
-      rows.push({
-        fileName: 'media/' + tweetId + '_' + mediaId + extensionFor(record.contentType, record.type),
-        tweetId: tweetId,
-        mediaId: mediaId,
-        type: typeof record.type === 'string' ? record.type : null,
-        contentType: typeof record.contentType === 'string' ? record.contentType : null,
-        bytes: record.blob.size,
-        blob: record.blob,
-        date: parseDateOrNow(record.cachedAt)
-      });
-    }
-
-    const generatedAt = new Date().toISOString();
+    const input = await collectArchiveInputs();
+    const built = input.built;
+    const rows = input.rows;
+    const skipped = input.skipped;
+    const generatedAt = input.generatedAt;
     setNotice(t('busyPacking', [String(built.count), String(rows.length)]));
+
+    // The ZIP's own naming rule, kept here rather than in collectArchiveInputs:
+    // a ZIP puts every picture in one `media/` directory, while the hosted form
+    // splits them by year and month. Two different questions, two answers.
+    const zipRows = rows.map((row) => ({
+      fileName: row.fileName,
+      tweetId: row.tweetId,
+      mediaId: row.mediaId,
+      type: row.type,
+      contentType: row.contentType,
+      bytes: row.bytes
+    }));
 
     const extraFiles = [
       { name: 'tweets.json', text: built.text, date: new Date() },
-      { name: 'MEDIA-INDEX.txt', text: describeMediaArchive(rows, { generatedAt: generatedAt, skipped: skipped, connections: built.connections }), date: new Date() },
-      { name: 'MEDIA-INDEX.json', text: buildMediaIndexJson(rows, { generatedAt: generatedAt, skipped: skipped, schemaVersion: SCHEMA_VERSION, version: extensionVersion() }), date: new Date() }
+      { name: 'MEDIA-INDEX.txt', text: describeMediaArchive(zipRows, { generatedAt: generatedAt, skipped: skipped, connections: built.connections, profile: built.profile }), date: new Date() },
+      { name: 'MEDIA-INDEX.json', text: buildMediaIndexJson(zipRows, { generatedAt: generatedAt, skipped: skipped, schemaVersion: SCHEMA_VERSION, version: extensionVersion() }), date: new Date() }
     ];
 
     // Only when there is a roster to write. An archive from someone who never
@@ -1951,7 +2421,7 @@ async function exportArchive() {
     if (built.connections > 0) {
       extraFiles.push({
         name: 'CONNECTIONS.csv',
-        text: buildConnectionsCsv(await listConnections(state.db)),
+        text: buildConnectionsCsv(built.connectionsRows),
         date: new Date()
       });
     }
@@ -1987,6 +2457,128 @@ async function exportArchive() {
     els.media.disabled = false;
     els.media.textContent = t('exportArchive');
   }
+}
+
+/**
+ * Write the archive as a hosted layout — the shape a GitHub repository wants.
+ *
+ * Not a ZIP, and that is the entire point. This reader opens an archive by
+ * reading a few bytes here and a few bytes there: the head to find the record
+ * array, the tail for the envelope, one record at a time as you scroll. Over a
+ * ZIP none of that is possible without unpacking the whole thing first, which
+ * is the one thing this project refuses to do. See hosted.js for the layout.
+ *
+ * Runs only in a full tab. The directory picker takes focus, and Chrome closes
+ * a toolbar popup the moment it loses focus — so the picker's promise would
+ * never settle and the export would disappear with no error at all. That is the
+ * same question, asked for the same reason, as the first-run panel asks.
+ */
+async function exportHostedToFolder() {
+  if (state.exportingMedia || state.db === null) return;
+  if (isToolbarPopup()) {
+    setNotice(t('errHostedNeedsTab'), 'error');
+    return;
+  }
+  if (typeof window.showDirectoryPicker !== 'function') {
+    setNotice(t('errNoDirectoryPicker'), 'error');
+    return;
+  }
+
+  state.exportingMedia = true;
+  els.hosted.disabled = true;
+  els.hosted.textContent = t('busyPackingShort');
+
+  try {
+    // Before anything is built: the picker needs the click's activation, and
+    // building an envelope spends it.
+    let root;
+    try {
+      root = await window.showDirectoryPicker({ mode: 'readwrite' });
+    } catch (err) {
+      if (err && err.name === 'AbortError') setNotice(t('exportCancelled'), '');
+      else setNotice(t('errHosted', [describe(err)]), 'error');
+      return;
+    }
+
+    /* Refused rather than merged into. A folder that already holds an older
+       archive would keep the media files this run no longer writes, and the
+       result is a directory whose index names files that are there and whose
+       files include ones the index has never heard of — pushed to GitHub, that
+       is an archive that looks complete and has ghosts in it. */
+    for await (const _entry of root.values()) {
+      setNotice(t('errHostedNotEmpty'), 'error');
+      return;
+    }
+
+    setNotice(t('busyReading'));
+    const input = await collectArchiveInputs({ maxShardBytes: HOSTED_TWEETS_SOFT_MAX });
+
+    const profile = input.built.profile;
+    const layout = buildHostedLayout({
+      shards: input.built.shards,
+      mediaRows: input.rows,
+      deletions: input.built.deletionsRows,
+      connections: input.built.connectionsRows,
+      profile: profile,
+      listing: false,
+      meta: {
+        generatedAt: input.generatedAt,
+        generatorVersion: extensionVersion(),
+        schemaVersion: SCHEMA_VERSION,
+        timezone: input.built.timezone,
+        totalCount: input.built.count,
+        account: profile === null ? null : {
+          userId: profile.userId === undefined ? null : String(profile.userId),
+          screenName: typeof profile.screenName === 'string' ? profile.screenName : null,
+          name: typeof profile.name === 'string' ? profile.name : null
+        }
+      }
+    });
+
+    let written = 0;
+    for (const file of layout.files) {
+      // index.json is FIRST in the list and written LAST: a reader that opens a
+      // folder while its index names files that have not been written yet finds
+      // half an archive, and an index that arrives last can only ever be
+      // complete when it lands.
+      if (file.path === 'index.json') continue;
+      await writeFileInto(root, file.path, file.text === undefined ? file.blob : file.text);
+      written++;
+      if (written % 25 === 0) {
+        setNotice(t('busyHostedWriting', [String(written), String(layout.files.length - 1)]));
+      }
+    }
+    await writeFileInto(root, 'index.json', layout.indexText);
+
+    let message = t('okHostedWritten', [
+      String(input.built.count),
+      String(layout.index.media.count),
+      formatBytes(layout.index.media.bytesTotal),
+      root.name
+    ]);
+    if (input.skipped > 0) message += t('okArchiveSkipped', [String(input.skipped)]);
+    if (layout.problems.length > 0) message += t('okHostedProblems', [String(layout.problems.length)]);
+    setNotice(message, 'ok');
+  } catch (err) {
+    setNotice(t('errHosted', [describe(err)]), 'error');
+  } finally {
+    state.exportingMedia = false;
+    els.hosted.disabled = false;
+    els.hosted.textContent = t('exportHosted');
+  }
+}
+
+/** One file, at a slash-separated path, inside a directory handle. */
+async function writeFileInto(root, path, content) {
+  const parts = String(path).split('/');
+  let dir = root;
+  for (let i = 0; i < parts.length - 1; i++) {
+    dir = await dir.getDirectoryHandle(parts[i], { create: true });
+  }
+  const handle = await dir.getFileHandle(parts[parts.length - 1], { create: true });
+  const stream = await handle.createWritable();
+  await stream.write(content);
+  await stream.close();
 }
 
 /* -------------------------------------------------------------------------- */
@@ -2045,6 +2637,16 @@ async function onMediaToggle() {
     setNotice(t('okMediaOff'), 'ok');
     return;
   }
+  // The intent goes down BEFORE the browser is asked, and for the same reason
+  // the archive switch does: the prompt takes the focus, the popup closes, and
+  // everything after the request is code that may never run. Written here it
+  // has already happened, so a grant lands on a setting that is already on
+  // instead of on a switch the user has to come back and flip a second time.
+  //
+  // A refusal needs no undoing here: init() reads the permission back on the
+  // next open and turns the switch off if it is not there. That reconciliation
+  // is the reason this is allowed to write a claim it has not earned yet.
+  void applySettings({ mediaCache: true });
   // The checkbox shows intent; enableMediaCache reports what happened, so a
   // refused grant puts the switch back to off instead of leaving it claiming
   // caching that does not exist.
@@ -2052,22 +2654,416 @@ async function onMediaToggle() {
 }
 
 /* -------------------------------------------------------------------------- */
+/* The archive import                                                         */
+/* -------------------------------------------------------------------------- */
+
+/* Nothing in this section runs by itself. The switch is off until somebody
+   turns it on, and the run only starts from a button — this is the one part of
+   the extension that makes requests of its own, to a server that is not X, and
+   it does not get to decide that on the user's behalf. */
+
+/** What is in the batch box, clamped to what the background will accept. */
+function waybackBatchValue() {
+  const n = Number.parseInt(els.waybackBatch.value, 10);
+  if (!Number.isFinite(n)) return DEFAULT_SETTINGS.waybackBatch;
+  return Math.min(500, Math.max(1, n));
+}
+
+/** Who will be swept: whatever is typed, minus a leading @. Empty means no. */
+function waybackHandleValue() {
+  const typed = String(els.waybackHandle.value || '').trim().replace(/^@/, '');
+  return isHandle(typed) ? typed : '';
+}
+
+/**
+ * The line under the switch.
+ *
+ * The same reasoning as the note under the follow-list switch: a control that
+ * is on and doing nothing is indistinguishable from one that is broken, so it
+ * says which of the states it is in rather than sitting there inert.
+ */
+function renderWaybackNote() {
+  const summary = state.wayback;
+  const job = summary && summary.job ? summary.job : null;
+
+  if (state.settings.waybackEnabled !== true) {
+    els.noteWayback.textContent = t('noteWaybackOff');
+    return;
+  }
+  if (summary && summary.running === true && job !== null) {
+    els.noteWayback.textContent = t('waybackProgress', [
+      t(job.mode === 'verify' ? 'btnWaybackVerify' : 'btnWaybackFill'),
+      String(job.imported + job.enriched + job.skipped),
+      String(job.batch)
+    ]);
+    return;
+  }
+  if (job !== null && job.pauseReason !== null) {
+    els.noteWayback.textContent = t('noteWaybackPaused', [
+      String(job.cursor), String(summary.total), pauseReasonText(job.pauseReason)
+    ]);
+    return;
+  }
+  if (job !== null) {
+    // A batch that stopped the ordinary way: the run is still on disk with its
+    // position, and the one thing worth saying is that pressing again carries
+    // on rather than starting over. Without this the note read like a finished
+    // run and the leftovers were invisible.
+    const remaining = Math.max(0, summary.total - job.cursor);
+    els.noteWayback.textContent = t('noteWaybackMore', [String(remaining), String(summary.total)]);
+    return;
+  }
+  if (summary && summary.last) {
+    const last = summary.last;
+    els.noteWayback.textContent = t('noteWaybackDone', [
+      String(last.imported), String(last.enriched), String(last.skipped), String(last.failed)
+    ]);
+    return;
+  }
+  if (waybackHandleValue() === '') {
+    els.noteWayback.textContent = t('noteWaybackNoHandle');
+    return;
+  }
+  // Ready and nothing to say. Every branch above reports a state worth knowing;
+  // this one is the absence of one — the two buttons name what they do and the
+  // field above says how many, so a sentence repeating both was noise. Empty
+  // rather than hidden by hand: `.settings__note:empty` takes it out of the
+  // layout, so the switch does not sit above a blank line.
+  els.noteWayback.textContent = '';
+}
+
+/**
+ * Why a paused run is paused, in words.
+ *
+ * A table of thunks rather than a table of key names, and the difference
+ * matters: tools/check-i18n.mjs finds a string by matching a literal call with
+ * a quoted name in this file, so a key that only ever appears as a computed
+ * value reads as an unused string and the check fails — which is the check
+ * working, because a key reached only through a variable is one nobody can find
+ * by searching.
+ */
+const WAYBACK_PAUSE_TEXT = {
+  'off': function () { return t('waybackPausedOff'); },
+  'permission': function () { return t('waybackPausedPermission'); },
+  'archive-down': function () { return t('waybackPausedArchive'); },
+  'stopped': function () { return t('waybackPausedStopped'); }
+};
+
+function pauseReasonText(reason) {
+  const entry = Object.prototype.hasOwnProperty.call(WAYBACK_PAUSE_TEXT, reason)
+    ? WAYBACK_PAUSE_TEXT[reason] : null;
+  return entry === null ? t('waybackPausedOff') : entry();
+}
+
+/** Both buttons are live only when a press would actually do something. */
+function updateWaybackButtons() {
+  const summary = state.wayback;
+  const running = summary !== null && summary !== undefined && summary.running === true;
+  const enabled = state.settings.waybackEnabled === true && state.waybackPermission === true;
+  const ready = enabled && waybackHandleValue() !== '' && !running;
+  els.waybackFill.disabled = !ready;
+  els.waybackVerify.disabled = !ready;
+  els.waybackCancel.hidden = !running;
+  // Disabled rather than hidden: the number still means something the moment
+  // that switch goes off, and a field that vanished and came back would look
+  // like it had been forgotten.
+  els.waybackBatch.disabled = state.settings.waybackAll === true;
+}
+
+/**
+ * Put the import controls in front of the user.
+ *
+ * They sit behind two closed drawers — 设置, and 导入设置 inside it — which is
+ * the right place for a feature nobody has switched on and the wrong one for a
+ * feature that has just been granted a browser permission. The reported symptom
+ * was exactly that: the switch was on, the prompt had been answered, and there
+ * was no button anywhere. Nothing was broken — the buttons were two clicks away
+ * and no sentence on the page said so.
+ *
+ * `outer` is the whole difference between the two moments this is called.
+ * Opening 导入设置 on its own costs nothing while 设置 is shut: the controls are
+ * simply waiting the next time it is opened, which is the right amount of help
+ * for a popup that is only being looked at. Opening 设置 as well rearranges the
+ * window and shortens the list, so it happens only when the user is in the
+ * middle of setting this up — straight after the grant, and on the first open
+ * after a popup died on the prompt.
+ */
+function revealWaybackPanel(outer) {
+  if (outer === true) els.settingsPanel.open = true;
+  els.waybackPanel.open = true;
+}
+
+/**
+ * True until a run has ever been started — the state the reveal above is for.
+ *
+ * A settled job is not nothing to say; it has a note of its own, and the drawers
+ * should stay where the user left them. This is only ever about the stretch
+ * between switching the feature on and pressing the button for the first time.
+ */
+function waybackUntouched() {
+  const summary = state.wayback;
+  if (summary === null || summary === undefined) return true;
+  const job = summary.job === undefined ? null : summary.job;
+  const last = summary.last === undefined ? null : summary.last;
+  return job === null && last === null;
+}
+
+/* ---- the progress poll ---- */
+
+let waybackPoll = null;
+
+/**
+ * Stop asking. Called from three places and all three are needed: the run
+ * finishing, the popup going away, and the request failing. A timer left
+ * running in a popup that was opened as a tab would ask the service worker for
+ * something every second for as long as the tab lives.
+ */
+function stopWaybackPoll() {
+  if (waybackPoll !== null) {
+    clearInterval(waybackPoll);
+    waybackPoll = null;
+  }
+}
+
+async function pollWayback() {
+  const response = await send({ type: 'XTB_WAYBACK_STATUS' });
+  if (!response || response.ok !== true) {
+    stopWaybackPoll();
+    return;
+  }
+  state.wayback = response.wayback;
+  renderWaybackNote();
+  updateWaybackButtons();
+
+  if (state.wayback === null || state.wayback.running !== true) {
+    stopWaybackPoll();
+    const last = state.wayback && state.wayback.last ? state.wayback.last : null;
+    if (last !== null) {
+      setNotice(t('okWaybackDone', [
+        String(last.imported), String(last.enriched), String(last.skipped), String(last.failed)
+      ]), 'ok');
+    }
+    // The saved-posts counter in the summary is now out of date by however many
+    // records this run wrote, and nothing else would refresh it.
+    await refreshState();
+  }
+}
+
+function startWaybackPoll() {
+  if (waybackPoll === null) waybackPoll = setInterval(() => { void pollWayback(); }, 1000);
+  updateWaybackButtons();
+}
+
+/* ---- starting, and stopping ---- */
+
+/* The same thunk table as WAYBACK_PAUSE_TEXT, and for the same reason: these
+   strings have to appear as literal `t('...')` calls or the i18n check cannot
+   see them. The codes are the background's own error words. */
+const WAYBACK_ERROR_TEXT = {
+  'off': function () { return t('errWaybackOff'); },
+  'permission': function () { return t('errWaybackPermission'); },
+  'already running': function () { return t('errWaybackAlreadyRunning'); },
+  'invalid handle': function () { return t('errWaybackBadHandle'); },
+  'invalid batch': function () { return t('errWaybackBadBatch'); },
+  'invalid mode': function () { return t('errWaybackBadBatch'); },
+  'no snapshots for that handle': function () { return t('errWaybackNoSnapshots'); },
+  'could not reach the archive': function () { return t('errWaybackArchiveDown'); }
+};
+
+async function startWayback(mode) {
+  const handle = waybackHandleValue();
+  if (handle === '') {
+    setNotice(t('errWaybackBadHandle'), 'error');
+    return;
+  }
+  const batch = waybackBatchValue();
+  const all = state.settings.waybackAll === true;
+  els.waybackBatch.value = String(batch);
+
+  els.waybackFill.disabled = true;
+  els.waybackVerify.disabled = true;
+  setNotice(t('busyWayback'));
+
+  let response = null;
+  try {
+    response = await send({ type: 'XTB_WAYBACK_START', handle: handle, batch: batch, mode: mode, all: all });
+  } catch (err) {
+    response = null;
+  }
+
+  if (!response || response.ok !== true) {
+    const code = response && response.error ? response.error : '';
+    const entry = Object.prototype.hasOwnProperty.call(WAYBACK_ERROR_TEXT, code)
+      ? WAYBACK_ERROR_TEXT[code] : null;
+    setNotice(entry === null ? t('errWayback') : entry(), 'error');
+    updateWaybackButtons();
+    return;
+  }
+
+  // Only written once the run has actually started: a handle or a size that was
+  // refused is not a preference, it is a mistake.
+  await applySettings({ waybackHandle: handle, waybackBatch: batch });
+  state.wayback = response.wayback;
+  setNotice(all ? t('okWaybackStartedAll') : t('okWaybackStarted', [String(batch)]), 'ok');
+  startWaybackPoll();
+  renderWaybackNote();
+  revealWaybackPanel(false);
+}
+
+async function onWaybackCancel() {
+  els.waybackCancel.disabled = true;
+  try {
+    await send({ type: 'XTB_WAYBACK_CANCEL' });
+    setNotice(t('okWaybackCancelling'));
+  } finally {
+    els.waybackCancel.disabled = false;
+  }
+}
+
+/* ---- the switch, and the one permission this extension asks for ---- */
+
+/**
+ * Turning it on asks first, and the asking happens BEFORE the permission
+ * prompt — because Chrome's prompt says what is granted and never what it is
+ * for, and "read and change your data on web.archive.org" is not an
+ * explanation of anything.
+ */
+function openWaybackChoice() {
+  // The switch is already ON by the time this is called, and deliberately so —
+  // see onWaybackToggle. Turning it on here instead would be writing a wish:
+  // Chrome's permission prompt takes the focus, an extension popup closes the
+  // moment it loses focus, and everything after the request in confirmWayback
+  // is code that may simply never run. What was written BEFORE the prompt is
+  // the only part that is certain to have happened.
+  els.waybackChoice.hidden = false;
+  els.waybackConfirm.focus();
+  void prefillWaybackHandle().then(renderWaybackNote);
+}
+
+function closeWaybackChoice() {
+  els.waybackChoice.hidden = true;
+  // Backing out is not a commitment, so the switch goes back off — unless the
+  // permission is already there, in which case the only thing that happened is
+  // that a disclosure was read twice.
+  if (state.waybackPermission !== true) {
+    void applySettings({ waybackEnabled: false });
+    els.optWayback.checked = false;
+    return;
+  }
+  els.optWayback.checked = state.settings.waybackEnabled === true;
+}
+
+async function confirmWayback() {
+  els.waybackConfirm.disabled = true;
+  try {
+    // FIRST await in this handler, before anything else. chrome.permissions
+    // .request is only honoured while the click's activation is still live, and
+    // any await ahead of it spends that activation.
+    //
+    // And this is very likely the last line of this function that ever runs:
+    // the prompt takes the focus, the popup closes on the spot, and the code
+    // below is written for the case where it did not. Everything the answer
+    // implies is already on disk — the switch was set by the toggle that opened
+    // this panel — so a popup that dies here loses nothing. The next open reads
+    // the permission back and reconciles in init().
+    const granted = await requestWaybackPermission();
+
+    if (granted !== true) {
+      await applySettings({ waybackEnabled: false });
+      els.optWayback.checked = false;
+      els.waybackChoice.hidden = true;
+      setNotice(t('errWaybackPermission'), 'error');
+      return;
+    }
+
+    // Belt and braces: already true in practice, since the toggle wrote it.
+    if (state.settings.waybackEnabled !== true) {
+      await applySettings({ waybackEnabled: true });
+    }
+    state.waybackPermission = true;
+    els.waybackChoice.hidden = true;
+    // Before refreshState, not after: this is DOM only, and a throw inside the
+    // state read must not be what stops the buttons from being found.
+    revealWaybackPanel(true);
+    setNotice(t('okWaybackOn'), 'ok');
+    await refreshState();
+  } finally {
+    els.waybackConfirm.disabled = false;
+  }
+}
+
+/**
+ * The switch, and where the intent is written down.
+ *
+ * OFF is the easy half. ON writes the setting IMMEDIATELY, before the panel
+ * that explains it and before the browser prompt that grants it — which is
+ * backwards from how it reads, and is the whole point. Chrome's permission
+ * prompt takes the focus away from the popup, and a popup closes the moment it
+ * loses focus; so anything the confirm handler writes AFTER the prompt is code
+ * that may never run. Written here, in a click handler of its own, the intent
+ * is on disk before the prompt exists.
+ *
+ * The state this leaves in between — switch on, no permission yet — is not a
+ * lie the code has to remember to undo. init() reads the permission back on
+ * every open and turns the switch off if it is not there, the same way it
+ * already does for the media cache.
+ */
+function onWaybackToggle() {
+  if (els.optWayback.checked !== true) {
+    void (async () => {
+      await applySettings({ waybackEnabled: false });
+      els.waybackChoice.hidden = true;
+      setNotice(t('okWaybackOff'), 'ok');
+      await refreshState();
+    })();
+    return;
+  }
+  void applySettings({ waybackEnabled: true });
+  openWaybackChoice();
+}
+
+/**
+ * Fill the handle box from the account this browser has seen, once.
+ *
+ * The Archive's index is keyed by handle and an account that was renamed has
+ * its older posts filed under the old name — which only its owner knows, so the
+ * box is theirs to fill. This is a starting point, not an answer.
+ */
+async function prefillWaybackHandle() {
+  if (String(els.waybackHandle.value || '').trim() !== '') return;
+  try {
+    const profiles = await listProfiles(state.db);
+    const newest = profiles && profiles.length > 0 ? profiles[0] : null;
+    if (newest && typeof newest.screenName === 'string' && isHandle(newest.screenName)) {
+      els.waybackHandle.value = newest.screenName;
+    }
+  } catch (_) { /* no card stored yet: the box stays empty and the note says so */ }
+}
+
+/* -------------------------------------------------------------------------- */
 /* First-run choices                                                          */
 /* -------------------------------------------------------------------------- */
 
 /**
- * The four questions the panel asks, each bound to the settings key it writes.
+ * The questions the panel asks, each bound to the settings key it writes.
  *
- * A table rather than four copies of the same three lines: a box added to the
- * markup but forgotten here — or wired to a key that settings.js does not know —
- * would be a behaviour the user can see and cannot set, and it would look like a
- * checkbox that simply does nothing.
+ * A table rather than a copy of the same three lines per box: a box added to
+ * the markup but forgotten here — or wired to a key that settings.js does not
+ * know — would be a behaviour the user can see and cannot set, and it would look
+ * like a checkbox that simply does nothing.
+ *
+ * The archive import is the odd one out. The other four decide what gets KEPT
+ * out of what the page already says; this one decides whether the extension
+ * goes and asks somebody else, which is why it is the only one that hands over
+ * to a second panel before anything is granted.
  */
 const CHOICE_QUESTIONS = [
   { box: els.choiceMedia, key: 'mediaCache' },
   { box: els.choiceBackfill, key: 'backfillMedia' },
   { box: els.choiceReplies, key: 'captureReplies' },
-  { box: els.choiceThumbs, key: 'showRemoteThumbnails' }
+  { box: els.choiceConnections, key: 'captureConnections' },
+  { box: els.choiceThumbs, key: 'showRemoteThumbnails' },
+  { box: els.choiceWayback, key: 'waybackEnabled' }
 ];
 
 /**
@@ -2104,9 +3100,21 @@ function closeChoicePanel() {
  *
  * The permission request goes FIRST, before anything else is awaited: the
  * click's activation is what makes it legal, and every await spends part of the
- * window it has to run in. A refused or unavailable grant leaves media caching
- * off and leaves the refusal on screen, through the same function the settings
- * toggle uses, so the two can never report different outcomes.
+ * window it has to run in.
+ *
+ * WHICH IS WHY THE PATCH IS SENT BEFORE IT, WITHOUT BEING AWAITED. Chrome's
+ * permission prompt takes the focus, a popup closes the moment it loses focus,
+ * and this function does not survive that — it is not "slow", it is gone, and
+ * nothing below the request will ever run. So the request cannot come first in
+ * the *order of effects*; it can only come first among the awaits. send() hands
+ * the message to the service worker synchronously, inside this same click, and
+ * the service worker is a context that does not close when the popup does.
+ *
+ * The one thing that cannot go in that patch is mediaCache, because its value
+ * is the permission's answer and there is no answer yet. It is written
+ * afterwards, and if the popup died before that, it stays false — which is the
+ * safe direction to fail in: a cache that is off is a cache that downloads
+ * nothing, and the switch is a click away.
  */
 async function confirmChoices() {
   if (state.savingChoices === true) return;
@@ -2119,6 +3127,17 @@ async function confirmChoices() {
       wanted[question.key] = question.box.checked === true;
     }
 
+    // Sent, not awaited — see above. Every one of these needs no permission, so
+    // every one of them can be settled before the prompt exists.
+    const settling = applySettings({
+      backfillMedia: wanted.backfillMedia,
+      captureReplies: wanted.captureReplies,
+      captureConnections: wanted.captureConnections,
+      showRemoteThumbnails: wanted.showRemoteThumbnails,
+      waybackEnabled: wanted.waybackEnabled,
+      choicePanelAnswered: true
+    });
+
     let mediaOn = state.settings.mediaCache === true && wanted.mediaCache === true;
     if (wanted.mediaCache === true && state.settings.mediaCache !== true) {
       mediaOn = await enableMediaCache();
@@ -2127,16 +3146,14 @@ async function confirmChoices() {
       els.choiceMedia.checked = mediaOn === true;
     }
 
-    const saved = await applySettings({
-      mediaCache: mediaOn,
-      backfillMedia: wanted.backfillMedia,
-      captureReplies: wanted.captureReplies,
-      showRemoteThumbnails: wanted.showRemoteThumbnails,
-      choicePanelAnswered: true
-    });
+    const saved = await settling;
     // applySettings has already said what went wrong; the panel stays open so
     // the answers are not closed away along with the message.
     if (saved !== true) return;
+
+    if (state.settings.mediaCache !== mediaOn) {
+      await applySettings({ mediaCache: mediaOn });
+    }
 
     // A refused permission is the one answer that must be read rather than
     // assumed, and enableMediaCache has just said so — a cheerful "saved" over
@@ -2148,6 +3165,14 @@ async function confirmChoices() {
     // more urgent thing and must be the line left standing.
     await refreshState();
     closeChoicePanel();
+
+    // The archive import cannot be granted from here: its permission needs a
+    // disclosure first, and a disclosure needs a button. So the panel settles
+    // the switch and hands over to the panel that explains it — which is a
+    // second click, and therefore a second user gesture, for the request.
+    if (wanted.waybackEnabled === true && state.waybackPermission !== true) {
+      openWaybackChoice();
+    }
   } finally {
     state.savingChoices = false;
     els.choiceConfirm.disabled = false;
@@ -2200,6 +3225,10 @@ function bindEvents() {
 
   els.media.addEventListener('click', () => {
     void exportArchive();
+  });
+
+  els.hosted.addEventListener('click', () => {
+    void exportHostedToFolder();
   });
 
   els.more.addEventListener('click', () => {
@@ -2295,6 +3324,37 @@ function bindEvents() {
   els.choiceConfirm.addEventListener('click', () => {
     void confirmChoices();
   });
+
+  els.optWayback.addEventListener('change', onWaybackToggle);
+  els.waybackConfirm.addEventListener('click', () => { void confirmWayback(); });
+  els.waybackChoice.querySelector('#btn-wayback-dismiss')
+    .addEventListener('click', closeWaybackChoice);
+  els.waybackFill.addEventListener('click', () => { void startWayback('gaps'); });
+  els.waybackVerify.addEventListener('click', () => { void startWayback('verify'); });
+  els.waybackCancel.addEventListener('click', () => { void onWaybackCancel(); });
+  els.waybackHandle.addEventListener('input', () => { renderWaybackNote(); updateWaybackButtons(); });
+  els.waybackBatch.addEventListener('change', () => {
+    els.waybackBatch.value = String(waybackBatchValue());
+    renderWaybackNote();
+  });
+  els.optWaybackAll.addEventListener('change', () => {
+    void (async () => {
+      const ok = await applySettings({ waybackAll: els.optWaybackAll.checked });
+      if (ok) {
+        updateWaybackButtons();
+        renderWaybackNote();
+      }
+    })();
+  });
+  // Opening the panel is the moment the handle is worth guessing: it costs a
+  // database read, and there is no reason to spend one on every popup open for
+  // a box nobody has looked at.
+  els.waybackPanel.addEventListener('toggle', () => {
+    if (els.waybackPanel.open === true) void prefillWaybackHandle().then(renderWaybackNote);
+  });
+  // A popup left open as a tab would otherwise keep asking the worker for a
+  // status every second for as long as the tab lives.
+  window.addEventListener('pagehide', stopWaybackPoll);
 
   els.purgeSuperseded.addEventListener('click', () => onPurgeClick('superseded'));
   els.purgeDeleted.addEventListener('click', () => onPurgeClick('deleted'));
@@ -2396,23 +3456,85 @@ async function init() {
     if (sync && sync.ok === true && sync.mediaPermission !== true) {
       state.settings.mediaCache = false;
       els.optMedia.checked = false;
-      setNotice(t('errMediaRevoked'), 'error');
+      // The same sentence as a refusal from the switch, and deliberately: this
+      // path is now reached by BOTH — a revoke from chrome://extensions, and a
+      // declined prompt whose popup closed before the answer could be read.
+      // From here they are the same fact: the permission is not there.
+      setNotice(t('errMediaPermission'), 'error');
     }
   }
 
-  // The first-run panel, asked once. Opened from the same state read the
-  // settings toggles use, so its boxes start on the values that are really in
-  // force, and opened before the list is built so the popup is never seen in the
-  // un-asked state first.
-  //
-  // It is an overlay, not a gate. Posts, edits and deletions have been captured
-  // since the moment the extension was installed — nothing below this line, and
-  // nothing in settings.js, waits on the answer. The list loads on exactly the
-  // same schedule whether the panel is up or has been answered for months.
-  if (state.settings.choicePanelAnswered !== true) openChoicePanel();
+  // The same reconciliation for the archive import, and it is load-bearing here
+  // in a way it is not for the media cache: that switch is deliberately written
+  // BEFORE the browser asks, because the prompt takes the focus and the popup
+  // closes — so "on with no permission yet" is a state this flow creates on
+  // purpose, and this is the one place it gets read back. Granted turns it into
+  // a working switch with nothing said; refused turns it off and says why.
+  if (state.settings.waybackEnabled === true && state.waybackPermission !== true) {
+    const sync = await send({ type: 'XTB_SYNC_WAYBACK_PERMISSION' });
+    if (sync && sync.ok === true && sync.waybackPermission !== true) {
+      state.settings = Object.assign({}, DEFAULT_SETTINGS, sync.settings || {});
+      els.optWayback.checked = false;
+      setNotice(t('errWaybackPermission'), 'error');
+    }
+  }
+
+  /* On, and permitted. The controls belong somewhere the user can see them.
+   *
+   * This is the branch a popup that died on the permission prompt comes back
+   * through — the grant is already on disk and refreshState has just read it
+   * back, so nothing above fires — and it is the only chance to say where the
+   * buttons are. It deliberately says nothing: the drawers opening is the
+   * whole message, and a sentence about it would be one more line to read on
+   * the way to the thing it is describing.
+   *
+   * Once a run exists the drawers stay as the user left them; the note under
+   * the switch is telling that story by then. */
+  if (state.settings.waybackEnabled === true && state.waybackPermission === true) {
+    revealWaybackPanel(waybackUntouched());
+  }
 
   renderViewTabs();
   await reload();
+
+  /* The first-run panel, asked once — and asked in a TAB.
+
+     Not a stylistic choice. Two of the five questions need a browser
+     permission, and Chrome's permission prompt takes the focus, and an
+     extension popup closes the instant it loses focus. In the popup the first
+     prompt ends the whole flow: the second question is never asked, and the
+     answer to the first is never read back, so the setting the user just chose
+     is still off when they look again. A tab has none of that — nothing closes,
+     both prompts run in sequence, and both answers are observed and stored.
+
+     So the popup says where to go rather than showing a panel it cannot finish.
+     The button that opens the tab is already in the footer; this only points at
+     it. The panel is opened from the same state read the settings toggles use,
+     so its boxes start on the values really in force rather than on the
+     defaults.
+
+     LAST, and it has to be last: reload() clears the notice on its way in, so
+     a line written before it is wiped a moment later and the popup ends up
+     saying nothing at all. (Found by the popup harness — the only thing in this
+     project that runs this file.) Opening the panel after the list is built
+     costs one frame of the list underneath an overlay that covers it, which is
+     the reason moving it is safe.
+
+     Either way it is an overlay, not a gate. Posts, edits and deletions have
+     been captured since the moment the extension was installed — nothing above
+     this line, and nothing in settings.js, waits on the answer. The list loads
+     on exactly the same schedule whether the panel is up or has been answered
+     for months. */
+  if (state.settings.choicePanelAnswered !== true) {
+    // isToolbarPopup, not pageLayoutMatches. The question here is "will a
+    // permission prompt kill me", and the answer is "only if I am the toolbar
+    // popup" — which is capped at 800x600, so a short wide TAB is fine and
+    // pageLayoutMatches would have wrongly turned it away. The other reading
+    // (the roster switch's) is about which layout CSS is drawing, and that is
+    // a different question with a different answer.
+    if (isToolbarPopup()) setNotice(t('choiceNeedsTab'));
+    else openChoicePanel();
+  }
 }
 
 void init();

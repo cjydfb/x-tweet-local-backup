@@ -2,13 +2,15 @@
   "manifest_version": 3,
   "default_locale": "en",
   "name": "__MSG_appName__",
-  "version": "2.1.0",
+  "version": "3.2.3",
+  "version_name": "3.2.3 beta",
   "description": "__MSG_appDesc__",
   "minimum_chrome_version": "111",
 
   "permissions": [
     "storage",
-    "unlimitedStorage"
+    "unlimitedStorage",
+    "alarms"
   ],
 
   "host_permissions": [
@@ -20,7 +22,8 @@
 
   "optional_host_permissions": [
     "https://pbs.twimg.com/*",
-    "https://video.twimg.com/*"
+    "https://video.twimg.com/*",
+    "https://web.archive.org/*"
   ],
 
   "background": {

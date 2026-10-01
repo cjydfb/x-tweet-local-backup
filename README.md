@@ -65,6 +65,24 @@
 - **全新安装需要先发一条帖**：在扩展见过你发帖之前，它不知道哪个账号是你的，这时设置里会写明"还没生效"
 - 名单**只在标签页或手机里能看**（弹窗太小，装不下第二个列表）。导出的 ZIP 里多一个 `CONNECTIONS.csv`，用表格软件直接打开
 
+## 从互联网档案馆补齐历史推文（可选，默认关闭）
+
+**为什么要有这个**：扩展只能从你**发出去的那一刻**开始记 —— 装它之前的、在别的设备上发的、早就删了的，都抓不到。而互联网档案馆里存着你旧推文的**公开快照**，**而且带着几样现场抓不到的东西**：谁能回复、链接在正文的哪个位置、更完整的引用原帖。
+
+打开设置里那个开关，填上用户名，然后两个按钮选一个：
+
+- **拉取数据** —— 只拉归档里没有的。已经有的**连请求都不发**，所以很快
+- **全部核对** —— 连已经有的也重新拉一遍，让档案馆那份把上面那几样补进去。**慢很多**（每条约两秒），但**不会覆盖**你的正文、计数和来源
+
+**几件你该知道的：**
+
+- **这是本扩展唯一一个要你单独授权的联网功能。** 去的是 `web.archive.org` —— **装的时候不会要，是你打开开关那一刻才问。只下载，不上传任何东西**，不碰你的登录凭据（取头像和取图片也会联网，但去的是 X 自己的图片服务器，那个权限装的时候就有，见上面「数据存在哪里」）
+- **用户名要你自己填，而且要按老名字再拉一次。** 档案馆是按用户名索引的；改过名的话，旧帖子记在老名字下面，只拉新名字会漏掉它们
+- **一次拉一批就停**，条数自己填（默认 100，约三分钟）。**关掉弹窗也会继续跑**
+- **再点一次是接着拉，不是重头来。** 位置记在硬盘上，浏览器随时会把闲着的后台掐掉 —— 掐了之后下次自己接着跑，**不会漏也不会重**
+- **随时能停**：已经在途的那个请求会跑完，但它带回来的**不会**写进去
+- 断网、档案馆离线、快照 404 —— 连着五次没应答就**主动停手**，不会拿上千个请求去打一个已经挂了的站
+
 ## 数据存在哪里
 
 在**扩展自己的 IndexedDB** 里，跟着浏览器配置文件走。
@@ -79,6 +97,7 @@
 - 发布时页面必须是开着的，否则那一条不会被当场记录（其他设备发的事后可以补录）
 - 时间线补录只覆盖主页的「帖子」和「回复」两栏；**关注和粉丝名单要单独打开开关**，并且需要你手动打开那个页面往下滑
 - 归档里的正文**保持原样**，t.co 短链不会改写成真实地址；真实地址单独存在 `entities.urls[].expandedUrl`，显示在卡片下方的「链接指向」里
+- **关注和粉丝名单补不回来。** 推文删了可以从互联网档案馆捞，**关注关系没有任何地方存着** —— 查过档案馆（没存这些页面），也查过整个 archive.org（没人上传过这种数据集）。所以那份名单**只能你自己滚，而且只能现在滚**
 
 ---
 
@@ -453,6 +472,44 @@ else's followers stores nothing at all.
 The ZIP adds `CONNECTIONS.csv` when the roster is non-empty — the same rows, with
 stable English headers, for a spreadsheet.
 
+## Filling in older posts from the Internet Archive (opt-in, off by default)
+
+**Why this exists.** The extension can only record a post from the moment it is
+published. Anything from before it was installed, anything published on another
+machine, anything already deleted — none of that was ever captured. The Internet
+Archive holds public snapshots of your older posts, and they carry a few things
+a live capture cannot see: who was allowed to reply, where the links sat in the
+text, a fuller copy of a quoted post.
+
+Turn on the switch in Settings, fill in the handle, then pick one of two buttons:
+
+- **Fetch data** — fetch only what this archive does not already have. A post
+  it has costs *no request at all*, so this is quick.
+- **Check everything** — re-fetch posts it already has, so the archived copy can
+  fill in the fields above. **Much slower** (about two seconds each), and it does
+  **not** overwrite your text, your counts, or where a row came from.
+
+**Things worth knowing:**
+
+- **This is the only feature that needs a permission of its own.** It talks to
+  `web.archive.org` and the grant is asked for — not at install time, only when
+  you turn the switch on. **It only downloads.** Nothing is uploaded and no
+  credential of yours is touched. Avatars and images do go online too, but to
+  X's own image CDN, which the extension is granted at install; see "Where the
+  data lives" above.
+- **The handle is yours to fill in, and an old name needs its own sweep.** The
+  Archive is indexed by handle, so posts made before a rename are filed under the
+  old one and a sweep of the new name alone will not reach them.
+- **One press fetches a batch and stops.** The size is yours to set (100 by
+  default, about three minutes). **It keeps running after the popup closes.**
+- **Pressing again continues; it does not start over.** The position is on disk,
+  because the browser tears down an idle service worker at will — a run that was
+  interrupted resumes by itself and neither skips nor repeats a post.
+- **Stop is always available.** The request already in flight finishes; whatever
+  it brought back is not written.
+- A dead archive stops the run after five failures in a row, rather than spending
+  a thousand requests on a service that is already down.
+
 ## Link expansions are archived, because t.co is not yours
 
 X rewrites every link in a post to a `t.co` shortlink and keeps the real
@@ -534,6 +591,11 @@ stay unambiguous instants either way.
 
 ## Known limitations
 
+- **The follow / follower roster cannot be recovered from anywhere.** A deleted
+  post can be pulled back out of the Internet Archive; a follow relationship
+  cannot. The Archive does not hold those pages, and a search of the whole of
+  archive.org turns up no dataset containing them. That list is the one thing
+  that can only be captured while it still exists.
 - **This extension can only be as reliable as the current X web fetch /
   CreateTweet implementation.** If X changes its front-end networking, moves to a
   different transport, replaces `window.fetch`, or reshapes the GraphQL response,

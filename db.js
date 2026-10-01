@@ -14,13 +14,20 @@ export const DB_NAME = 'xTweetBackup';
 //   v2 added the `deletions` store (see below).
 //   v3 added the `createdAtId` compound index on `tweets`.
 //   v4 added the `connections` store (see below).
-export const DB_VERSION = 4;
+//   v5 added the `profile` store (see below).
+export const DB_VERSION = 5;
 // Version of the RECORD/export shape. v2 added `lang` and `entities`
 // (link expansions, hashtags, mentions); v3 added the `connections` array to the
-// export envelope. Records and files written under an earlier version simply
-// have no such fields — the shape is additive, so readers must tolerate their
-// absence rather than assume them.
-export const SCHEMA_VERSION = 3;
+// export envelope; v4 added the `profile` object to it; v5 added four fields to
+// every record — `quotedTweet` (the quoted post's own text and author, which
+// used to be reduced to an id), `postedVia` (the client it was posted from),
+// `viewerState` (whether the account had liked / bookmarked / reposted it) and
+// `sensitive`. The last three describe the moment of capture and can never be
+// recovered afterwards; the first is recoverable only while the original still
+// exists. Records and files written under an earlier version simply have no
+// such fields — the shape is additive, so readers must tolerate their absence
+// rather than assume them.
+export const SCHEMA_VERSION = 5;
 
 export const STORE_TWEETS = 'tweets';
 export const STORE_MEDIA = 'media';
@@ -63,6 +70,33 @@ export const STORE_CONNECTIONS = 'connections';
 
 /** The two lists this archive keeps. Part of the primary key, so the set is closed. */
 export const CONNECTION_LISTS = ['following', 'followers'];
+
+/**
+ * The account's own profile card — the header the standalone reader draws above
+ * the timeline.
+ *
+ *   { userId, screenName, screenNameLower, name, accountCreatedAt, bio,
+ *     bioUrls, location, websiteUrl, lang, blueVerified, verified,
+ *     followersCount, followingCount, tweetCount, avatarUrl, bannerUrl,
+ *     firstSeenAt, lastSeenAt, source, schemaVersion }
+ *
+ * Its own store rather than a row in `connections`, and not for tidiness. That
+ * store is keyed [list, userId] with `list` drawn from a closed set of two, and
+ * every listing, count and export walks it as a roster — so a third value would
+ * be written into CONNECTIONS.csv as a person you follow. The merge rules are
+ * opposites too: a roster row is one partial view of somebody else and must
+ * never erase what an earlier view filled in, while this is a snapshot of one
+ * account where the newest answer is the true one. And the roster is opt-in
+ * because it is about other people; this is about you, and is written either way.
+ *
+ * Keyed by userId rather than by a single fixed key, because this archive
+ * already tolerates more than one account — ownAuthorIds is a set. A browser
+ * used for two accounts keeps both cards, and the export writes the one seen
+ * most recently, which is the account the browser was last used as.
+ *
+ * One row per account, so there is no index. The store is small enough to walk.
+ */
+export const STORE_PROFILE = 'profile';
 
 export const INDEX_CAPTURED_AT = 'capturedAt';
 export const INDEX_CREATED_AT = 'createdAt';
@@ -221,6 +255,18 @@ export function openDB() {
           connections.createIndex(INDEX_CONNECTION_LIST, ['list', 'screenNameLower', 'userId'], { unique: true });
         }
       }
+
+      // v4 -> v5: the account's own profile card.
+      //
+      // A new store again, the most additive change there is: nothing already in
+      // the database is opened, read or rewritten, so the upgrade cannot lose a
+      // tweet or a person. Keyed by userId and with no index — there is one row
+      // per account and the whole store is walked.
+      if (oldVersion < 5) {
+        if (!db.objectStoreNames.contains(STORE_PROFILE)) {
+          db.createObjectStore(STORE_PROFILE, { keyPath: 'userId' });
+        }
+      }
     };
 
     request.onsuccess = () => {
@@ -302,9 +348,117 @@ function transactionDone(tx) {
 /* -------------------------------------------------------------------------- */
 
 /**
+ * Whether a value the page sent carries an answer at all.
+ *
+ * `null`, `undefined` and the empty string are the shapes "nothing was said"
+ * arrives in. An empty ARRAY is the same thing one level down, and that case is
+ * load-bearing rather than cosmetic: an import from the Internet Archive writes
+ * `media: []` for a post whose media it could not lay hands on, and reading that
+ * as "this post has no media" would delete the four photographs this machine
+ * watched being uploaded — the one direction a backup must never move in.
+ *
+ * Zero and false are deliberately NOT empty. They are answers — "no likes",
+ * "X has not marked this sensitive" — and the rule below exists so that a real
+ * answer always beats an old one.
+ */
+export function isAbsent(value) {
+  if (value === null || value === undefined) return true;
+  if (typeof value === 'string') return value.length === 0;
+  if (Array.isArray(value)) return value.length === 0;
+  return false;
+}
+
+export function isPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * Merge one field of a fresh capture into the value already stored.
+ *
+ * Lists merge as whole units: the fresh list wins if it has anything in it, and
+ * an empty one leaves the stored list untouched. Element-wise merging would be
+ * nonsense here — a media list is not a set to union, it is an ordered thing
+ * that belongs to one capture.
+ *
+ * Objects merge key by key, DOWNWARD, rather than as units. A degraded response
+ * routinely carries a container with nothing in it — an author node with no
+ * name, a metrics block with one count missing, an entities block whose four
+ * lists are all empty — and taking such a container wholesale would blank four
+ * good fields to record one thin one.
+ *
+ * Everything else is a scalar, and the rule is the one sentence the whole
+ * function exists for: the fresh value wins unless it carries no answer.
+ */
+export function mergeField(before, next) {
+  if (isPlainObject(before) && isPlainObject(next)) {
+    const out = {};
+    for (const key of Object.keys(next)) {
+      out[key] = mergeField(before[key], next[key]);
+    }
+    // A key only the stored row has survives. That is what keeps `supersededBy`
+    // and `deletedAt` — written by markSuperseded and markDeleted to a row that
+    // is already on disk, never carried by a capture — from being erased by the
+    // next capture of the same tweet, which is exactly what used to happen.
+    for (const key of Object.keys(before)) {
+      if (!Object.prototype.hasOwnProperty.call(out, key)) out[key] = before[key];
+    }
+    return out;
+  }
+  if (isAbsent(next)) {
+    // Neither side has anything to say. Keeping the stored `undefined` would
+    // leave the key present with no value, where every other row carries an
+    // explicit null — and a reader testing `record.poll !== null` would be
+    // right about every row but this one. The fresh shape wins.
+    return before === undefined ? next : before;
+  }
+  return next;
+}
+
+/**
+ * Merge a fresh capture of a tweet into the row already stored.
+ *
+ * THE RULE, in one line: the newest answer wins, unless it is empty.
+ *
+ * This used to be "the fresh record replaces the old one, wholesale", and that
+ * stopped being safe the moment a row could be written from two places. A
+ * capture made while the page is open is the only one that can say whether the
+ * account had liked, bookmarked or reposted the post; one imported from the
+ * Internet Archive is the only one that can say who was allowed to reply, and
+ * only it carries the positions of links inside the text. Wholesale replacement
+ * means whichever source arrives LAST erases what the other one knew and it does
+ * not — one field over from the failure the two marks below were taught to
+ * survive.
+ *
+ * The rule is symmetric on purpose. Keeping the stored row and only filling its
+ * gaps would be the other obvious choice, and it is wrong in the direction that
+ * cannot be repaired: like a post after it was captured, have a timeline sweep
+ * see it again, and a fill-the-gaps rule freezes "you had not liked this"
+ * forever, because `false` is a perfectly good value to fill a gap with and
+ * nothing would ever overwrite it.
+ */
+export function mergeCapture(previous, fresh) {
+  const merged = {};
+  // Iterated in the FRESH record's key order so that a row's fields stay in the
+  // documented order however many times it is rewritten.
+  for (const key of Object.keys(fresh)) {
+    merged[key] = mergeField(previous[key], fresh[key]);
+  }
+  for (const key of Object.keys(previous)) {
+    if (!Object.prototype.hasOwnProperty.call(merged, key)) merged[key] = previous[key];
+  }
+  return merged;
+}
+
+/**
  * Insert or update one tweet. The tweet id is the primary key, so re-capturing
- * the same tweet updates the existing row instead of duplicating it. The
- * original capturedAt is preserved so list ordering stays stable.
+ * the same tweet updates the existing row instead of duplicating it.
+ *
+ * The three timestamps are the one place the newest answer does NOT win. They
+ * are the row's own history rather than the page's data: `capturedAt` is what
+ * the list is ordered by, so letting a re-capture move it would shuffle the
+ * archive every time a post is seen again, and `firstCapturedAt` answers a
+ * question — "when did this archive first see it?" — that only the first
+ * capture can answer.
  *
  * Resolves with { existed, record }.
  */
@@ -407,25 +561,51 @@ export function upsertTweet(db, record) {
         const previous = getRequest.result;
         if (previous && typeof previous === 'object') {
           existed = true;
-          merged = Object.assign({}, record, {
-            capturedAt: previous.capturedAt || record.capturedAt,
-            firstCapturedAt: previous.firstCapturedAt || previous.capturedAt || record.capturedAt,
-            updatedAt: record.capturedAt
-          });
+          merged = mergeCapture(previous, record);
 
-          // `record` came out of sanitizeRecord, which rebuilds from a whitelist
-          // of fields that a capture can carry. The two marks below are NOT part
-          // of a capture — markSuperseded and markDeleted add them afterwards, to
-          // a row that is already stored. Copying the fresh record over the old
-          // one would therefore erase them, and an erased deletion mark makes the
-          // row quietly leave the cleanup panel even though nothing was restored.
-          // They are archive history, not capture data, so they survive.
-          if (typeof previous.supersededBy === 'string' && previous.supersededBy.length > 0) {
-            merged.supersededBy = previous.supersededBy;
+          // A handful of fields are not facts of their own but consequences of
+          // the one beside them, and merging can leave the two disagreeing. A
+          // response that did not carry the poll writes `poll: null` AND
+          // `isPoll: false`; the null correctly leaves the stored poll alone,
+          // but the false is a perfectly good boolean and takes the flag with
+          // it — leaving a record that says "not a poll" while holding the poll's
+          // choices. So each flag is recomputed from the merged whole, and can
+          // never contradict the content it describes. (Two tests in
+          // test-background.mjs pin this; the poll one is how it was found.)
+          // Tested with isAbsent rather than `!== null`, because a row written
+          // before one of these fields existed has no such key at all: reading
+          // `merged.poll.isPoll` off a schema-v1 row threw, and a throw inside
+          // this callback is a row that silently never gets written.
+          merged.isReply = !isAbsent(merged.replyTo) && !isAbsent(merged.replyTo.tweetId);
+          merged.isPoll = !isAbsent(merged.poll) && merged.poll.isPoll === true;
+          // The retweeted id is the content and `isRetweet` is its label, so a
+          // surviving id can only mean the post really is a retweet.
+          if (!isAbsent(merged.retweetedTweetId)) merged.isRetweet = true;
+          // Only `editedFrom` makes a post an edit. `editTweetIds` is NOT a
+          // marker of one — the archive stores that chain for every post,
+          // including ones never edited — so testing it here would turn an
+          // ordinary imported post into an "earlier version" by mistake.
+          if (!isAbsent(merged.editedFrom)) merged.isEdit = true;
+
+          // The one field where the fresh record can carry a GUESS that is not
+          // empty. When a response does not name the conversation, sanitizeRecord
+          // substitutes the parent post or the post's own id and raises
+          // conversationIdInferred to say so — and that substitute is a perfectly
+          // good string, so the rule above would let it overwrite a conversation
+          // id an earlier capture actually knew. A guess never beats a fact; it
+          // only fills in when there is no fact to beat.
+          if (record.conversationIdInferred && previous.conversationIdInferred !== true &&
+              typeof previous.conversationId === 'string' && previous.conversationId.length > 0) {
+            merged.conversationId = previous.conversationId;
+            merged.conversationIdInferred = false;
           }
-          if (typeof previous.deletedAt === 'string' && previous.deletedAt.length > 0) {
-            merged.deletedAt = previous.deletedAt;
-          }
+
+          // The three timestamps are the row's own history rather than the
+          // page's data, and are the other place mergeCapture's rule does not
+          // apply — see its caller for why.
+          merged.capturedAt = previous.capturedAt || record.capturedAt;
+          merged.firstCapturedAt = previous.firstCapturedAt || previous.capturedAt || record.capturedAt;
+          merged.updatedAt = record.capturedAt;
         }
         try {
           store.put(merged);
@@ -792,7 +972,8 @@ export function clearAll(db) {
       // and the abort discards the clears already queued on it — so listing one
       // too few here does not partially clear, it clears nothing at all and
       // reports failure.
-      tx = db.transaction([STORE_TWEETS, STORE_MEDIA, STORE_DELETIONS, STORE_CONNECTIONS], 'readwrite');
+      tx = db.transaction(
+        [STORE_TWEETS, STORE_MEDIA, STORE_DELETIONS, STORE_CONNECTIONS, STORE_PROFILE], 'readwrite');
     } catch (err) {
       reject(err);
       return;
@@ -804,6 +985,7 @@ export function clearAll(db) {
       tx.objectStore(STORE_MEDIA).clear();
       tx.objectStore(STORE_DELETIONS).clear();
       tx.objectStore(STORE_CONNECTIONS).clear();
+      tx.objectStore(STORE_PROFILE).clear();
     } catch (err) {
       try {
         tx.abort();
@@ -1241,12 +1423,13 @@ function unionOwnerIds(previous, fresh) {
 /**
  * Merge a new sighting of a person into the row already stored.
  *
- * The opposite rule to upsertTweet, deliberately. A capture carries every field
- * it knows about and the newest one wins; a roster observation does not, because
- * the same person comes back with a different subset each time. So a non-empty
- * new value wins, an empty one never erases, and the two fields that are this
- * row's own history rather than the page's data — firstSeenAt and ownerIds — are
- * merged instead of replaced.
+ * The opposite rule to mergeCapture, deliberately. A capture is the page
+ * reporting what it knows about a post, and there the newest answer wins unless
+ * it is empty; a roster observation is not, because the same person comes back
+ * with a different subset of their profile every time and the newest sighting is
+ * routinely the thinnest. So a non-empty new value wins, an empty one never
+ * erases, and the two fields that are this row's own history rather than the
+ * page's data — firstSeenAt and ownerIds — are merged instead of replaced.
  *
  * The same principle as mergeLinkEntities: fill the gaps, never take away.
  */
@@ -1290,6 +1473,203 @@ function mergeConnection(previous, fresh, seenAt) {
   merged.ownerIds = unionOwnerIds(previous.ownerIds, fresh.ownerIds);
 
   return merged;
+}
+
+/** Text fields an empty answer must never be allowed to erase. */
+const PROFILE_TEXT_FIELDS = ['screenName', 'name', 'accountCreatedAt', 'bio',
+  'location', 'websiteUrl', 'lang', 'avatarUrl', 'bannerUrl', 'pinnedTweetId'];
+/* `listedCount` and `mediaCount` are the account's own totals; `likeCount` here
+   is the account's lifetime LIKES GIVEN, not the likes on any post — the same
+   name means the other thing on a tweet, which is why these three are only ever
+   read off a profile. */
+const PROFILE_COUNT_FIELDS = ['followersCount', 'followingCount', 'tweetCount',
+  'listedCount', 'mediaCount', 'likeCount'];
+const PROFILE_FLAG_FIELDS = ['blueVerified', 'verified', 'protected'];
+/** Lists inside the bio: the links, and the accounts it names. */
+const PROFILE_LIST_FIELDS = ['bioUrls', 'bioMentions'];
+
+/**
+ * Merge a new sighting of your own profile into the row already stored.
+ *
+ * One rule, applied field by field: THE NEWEST ANSWER WINS, UNLESS IT IS EMPTY.
+ * The same rule mergeCapture applies to a tweet, and for the same reason.
+ *
+ * The first half is the opposite of mergeConnection, deliberately. A roster row
+ * is one partial view of somebody else, so filling gaps is the only safe move; a
+ * profile is a snapshot of one account, and a fill-the-gaps rule here would
+ * freeze the card at whatever the first response happened to carry — a bio
+ * written yesterday would never replace one from last year.
+ *
+ * The second half is the same rule mergeConnection uses, for the same reason.
+ * Several response shapes can omit a field — a degraded node, an older operation
+ * version, a limited account — and reading an absent field as "it is now empty"
+ * would delete a bio captured a year ago on the strength of one thin response.
+ *
+ * Note what is NOT here: no ownerIds (the row's userId IS the account), and
+ * firstSeenAt/lastSeenAt behave as they do on a roster row, because they are the
+ * row's own history rather than the page's data.
+ */
+function mergeProfile(previous, fresh, seenAt) {
+  const merged = Object.assign({}, fresh);
+
+  for (const field of PROFILE_TEXT_FIELDS) {
+    const next = fresh[field];
+    const before = previous[field];
+    if ((next === null || next === undefined || next === '') &&
+        typeof before === 'string' && before.length > 0) {
+      merged[field] = before;
+    }
+  }
+
+  for (const field of PROFILE_COUNT_FIELDS) {
+    // 0 is a real answer — "this account has no followers" is not the same as
+    // "this response did not carry the number" — so only a non-number falls back.
+    if (typeof fresh[field] !== 'number' && typeof previous[field] === 'number') {
+      merged[field] = previous[field];
+    }
+  }
+
+  for (const field of PROFILE_FLAG_FIELDS) {
+    if (typeof fresh[field] !== 'boolean' && typeof previous[field] === 'boolean') {
+      merged[field] = previous[field];
+    }
+  }
+
+  /* The two lists inside a bio. A non-empty answer replaces the list whole —
+     the bio was rewritten, and these describe the new one — while an empty or
+     absent one leaves what was there, because a response that carried no links
+     is not a statement that the bio has none. */
+  for (const field of PROFILE_LIST_FIELDS) {
+    if (Array.isArray(fresh[field]) && fresh[field].length > 0) {
+      merged[field] = fresh[field];
+    } else if (Array.isArray(previous[field])) {
+      merged[field] = previous[field];
+    }
+  }
+
+  merged.firstSeenAt = typeof previous.firstSeenAt === 'string' && previous.firstSeenAt.length > 0
+    ? previous.firstSeenAt
+    : seenAt;
+  merged.lastSeenAt = seenAt;
+
+  return merged;
+}
+
+/**
+ * Record a sighting of your own profile.
+ *
+ * `seenAt` comes from the caller's clock, never from the page, for the same
+ * reason a roster row's does: the row means "when this browser last saw it", and
+ * only this browser knows that.
+ *
+ * Resolves with { existed }.
+ */
+export function upsertProfile(db, record, seenAt) {
+  return new Promise((resolve, reject) => {
+    let tx;
+    try {
+      tx = db.transaction(STORE_PROFILE, 'readwrite');
+    } catch (err) {
+      reject(err);
+      return;
+    }
+
+    const store = tx.objectStore(STORE_PROFILE);
+    let existed = false;
+    let failure = null;
+
+    const done = transactionDone(tx);
+    done.then(
+      () => { if (failure !== null) reject(failure); else resolve({ existed: existed }); },
+      (err) => { if (failure !== null) reject(failure); else reject(err); }
+    );
+
+    try {
+      const getRequest = store.get(record.userId);
+      getRequest.onsuccess = () => {
+        const previous = getRequest.result;
+        const merged = (previous && typeof previous === 'object')
+          ? (existed = true, mergeProfile(previous, record, seenAt))
+          : Object.assign({}, record, { firstSeenAt: seenAt, lastSeenAt: seenAt });
+        try {
+          store.put(merged);
+        } catch (err) {
+          failure = err;
+          try { tx.abort(); } catch (_) { /* ignore */ }
+        }
+      };
+      // No screenNameLower gate here, unlike upsertConnection: that gate exists
+      // because a null there writes no index entry and removes the row from every
+      // listing. This store has no index, so there is nothing to invalidate.
+    } catch (err) {
+      failure = err;
+      try { tx.abort(); } catch (_) { /* ignore */ }
+    }
+  });
+}
+
+/**
+ * Every profile card this archive holds, most recently seen first.
+ *
+ * Walks the STORE rather than an index — there is no index, and one would only
+ * be a second thing to keep in step. The tie-break on userId makes two exports of
+ * the same database byte-identical, which is what lets an export be compared
+ * against the one before it.
+ */
+export function listProfiles(db) {
+  return new Promise((resolve, reject) => {
+    let tx;
+    try {
+      tx = db.transaction(STORE_PROFILE, 'readonly');
+    } catch (err) {
+      reject(err);
+      return;
+    }
+
+    const rows = [];
+    const done = transactionDone(tx);
+    done.then(() => {
+      rows.sort((a, b) => {
+        const left = typeof a.lastSeenAt === 'string' ? a.lastSeenAt : '';
+        const right = typeof b.lastSeenAt === 'string' ? b.lastSeenAt : '';
+        if (left !== right) return left < right ? 1 : -1;
+        return String(a.userId) < String(b.userId) ? 1 : -1;
+      });
+      resolve(rows);
+    }, reject);
+
+    try {
+      tx.objectStore(STORE_PROFILE).openCursor().onsuccess = function () {
+        const cursor = this.result;
+        if (!cursor) return;
+        rows.push(cursor.value);
+        cursor.continue();
+      };
+    } catch (_) { /* the transaction's own error is what gets reported */ }
+  });
+}
+
+/** How many accounts this archive holds a card for. Normally one. */
+export function countProfiles(db) {
+  return new Promise((resolve, reject) => {
+    let tx;
+    try {
+      tx = db.transaction(STORE_PROFILE, 'readonly');
+    } catch (err) {
+      reject(err);
+      return;
+    }
+
+    let value = 0;
+    const done = transactionDone(tx);
+    done.then(() => resolve(value), reject);
+
+    try {
+      tx.objectStore(STORE_PROFILE).count().onsuccess = function () {
+        value = this.result;
+      };
+    } catch (_) { /* the transaction's own error is what gets reported */ }
+  });
 }
 
 /**

@@ -16,6 +16,7 @@
  * ========================================================================== */
 
 import { getMediaRecord, putMediaRecord } from './db.js';
+import { hasWaybackPermission } from './wayback.js';
 
 export const MEDIA_HOSTS = ['pbs.twimg.com', 'video.twimg.com'];
 export const MEDIA_ORIGINS = ['https://pbs.twimg.com/*', 'https://video.twimg.com/*'];
@@ -204,6 +205,98 @@ async function fetchBlob(url) {
 }
 
 /* -------------------------------------------------------------------------- */
+/* The archive's copy                                                         */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The same image, as the Internet Archive kept it.
+ *
+ * `2im_` is the wayback machine's "hand back the raw bytes" form — without it
+ * the archive wraps the file in its own viewer page and what arrives is HTML.
+ * The `2` is a timestamp prefix that matches every capture there has ever been,
+ * so this asks for whichever copy the archive holds rather than naming one.
+ * That is deliberate: the alternative is a CDX query to pick the snapshot
+ * nearest the post's date, which is a second request per image against an index
+ * that rate-limits hard, to choose between copies of a picture that is already
+ * not available anywhere else.
+ */
+function waybackImageUrl(url) {
+  return 'https://web.archive.org/web/2im_/' + url;
+}
+
+/** Which of the two sources a download came from, for the counters. */
+const FROM_ORIGIN = 'origin';
+const FROM_ARCHIVE = 'archive';
+
+/**
+ * Fetch one image, from wherever it still exists.
+ *
+ * The two sources are complementary rather than ranked. The origin is the
+ * canonical file and usually the better one — but it is gone the moment the
+ * account is, and X answers 403 for a suspended account's media rather than
+ * 404, so the failure is indistinguishable from "you may not". The archive's
+ * copy is whatever a crawler happened to capture years ago: lower fidelity
+ * sometimes, and absent for any image no crawl ever loaded — but it survives
+ * the account, and it is the ONLY source that does.
+ *
+ * Measured before this was written: of 400 distinct pbs.twimg.com image URLs in
+ * the index, 298 came back 200 with an image content-type and real JPEG/PNG
+ * magic bytes. So the archive is not a long shot. It is the majority case.
+ *
+ * Returns `{ ok, blob, contentType, from }` — `from` is which one answered.
+ */
+async function fetchMediaBytes(url) {
+  const direct = await fetchBlob(url);
+  if (direct.ok === true) return Object.assign({ from: FROM_ORIGIN }, direct);
+
+  /* No grant, no fallback. Asking anyway would produce a CORS failure that
+     looks exactly like "the archive does not have it", and the counters would
+     then blame the archive for a permission this extension never had. */
+  let allowed = false;
+  try {
+    allowed = await hasWaybackPermission();
+  } catch (_) {
+    allowed = false;
+  }
+  if (!allowed) return Object.assign({ from: FROM_ORIGIN }, direct);
+
+  let archived = await fetchBlob(waybackImageUrl(url));
+
+  /* And again without the query string, which is where most of these actually
+     live. For a photo, `pickBestSource` appends `?name=large` — a size hint
+     that is part of the REQUEST, not of the file's address — and a crawl that
+     saved the picture saved it under whatever address it used, usually the bare
+     one. Measured: the bare form answers 200 with real PNG bytes, and the same
+     URL with `?name=large` answers 404. Without this second attempt the
+     fallback would be dead for photographs, which is nearly everything an
+     archive holds, while passing every test that only checked it was called.
+   *
+     The query is kept for the first attempt because a video's URL carries a
+     `?tag=` that the archive may well have stored: this tries what we asked for,
+     then what was probably saved, and does not have to decide which is which. */
+  if (archived.ok !== true && url.indexOf('?') !== -1) {
+    archived = await fetchBlob(waybackImageUrl(url.split('?')[0]));
+  }
+
+  if (archived.ok === true) return Object.assign({ from: FROM_ARCHIVE }, archived);
+
+  /* Both failed, and the reason reported is the ARCHIVE's.
+   *
+   * Not the origin's, even though that is the one we led with: a 404 or a 403
+   * from pbs.twimg.com is the expected half of this path — it is why the
+   * fallback exists — so repeating it back says nothing an operator does not
+   * already know, and it actively hid the interesting failure. Reported after
+   * the first end-to-end run: the counters said `http 404`, which was the CDN's
+   * answer, while what had actually gone wrong was that the archive copy could
+   * not be read at all. */
+  const failed = Object.assign({}, direct);
+  if (typeof archived.reason === 'string' && archived.reason.length > 0) {
+    failed.reason = (direct.reason || 'origin failed') + '; archive: ' + archived.reason;
+  }
+  return Object.assign({ from: FROM_ORIGIN }, failed);
+}
+
+/* -------------------------------------------------------------------------- */
 /* Public entry point                                                         */
 /* -------------------------------------------------------------------------- */
 
@@ -212,7 +305,7 @@ async function fetchBlob(url) {
  * Returns { cached, skipped, failed } counters.
  */
 export async function cacheMediaForTweet(db, tweet, options) {
-  const result = { cached: 0, skipped: 0, failed: 0, reason: null };
+  const result = { cached: 0, skipped: 0, failed: 0, fromArchive: 0, reason: null };
 
   try {
     const opts = options || {};
@@ -268,10 +361,11 @@ export async function cacheMediaForTweet(db, tweet, options) {
 
       let downloaded;
       try {
-        downloaded = await fetchBlob(sourceUrl);
+        downloaded = await fetchMediaBytes(sourceUrl);
       } finally {
         activeDownloads--;
       }
+      if (downloaded.from === FROM_ARCHIVE) result.fromArchive++;
 
       if (!downloaded.ok) {
         result.failed++;
@@ -311,6 +405,118 @@ export async function cacheMediaForTweet(db, tweet, options) {
   } catch (err) {
     result.failed++;
     result.reason = (err && err.message) ? String(err.message) : 'unexpected media cache error';
+  }
+
+  return result;
+}
+
+/* -------------------------------------------------------------------------- */
+/* The account's own face                                                     */
+/* -------------------------------------------------------------------------- */
+
+/** The store key one account's avatar lives under. */
+export const AVATAR_MEDIA_ID = 'avatar';
+
+export function avatarKey(userId) {
+  return String(userId) + ':' + AVATAR_MEDIA_ID;
+}
+
+/**
+ * The same picture at a size worth putting in a header.
+ *
+ * X serves one image at several fixed sizes and the size is the last word of
+ * the file name, so this is a rename rather than a different request. The
+ * stored URL is `_normal` — 48px, which is what the timeline bubble needs and
+ * what the capture happens to record — and the reader draws it at 142. Asking
+ * for the bigger one costs one string replace and turns a blurred square into
+ * a photograph. Anything that does not match is left exactly as it was.
+ */
+function biggerAvatarUrl(url) {
+  return url.replace(/_(normal|bigger|mini|reasonably_small)(\.\w+)$/i, '_400x400$2');
+}
+
+/**
+ * Cache the account's own avatar, once.
+ *
+ * The archive has always carried the URL and never the picture, so an offline
+ * reader could draw nothing but a letter — which is what it did, and what was
+ * reported back as "还是没有头像". A URL is not a picture; the bytes have to
+ * come from somewhere, and pbs.twimg.com is the only place they exist.
+ *
+ * ONCE. Every later open reads it out of the archive with no network at all,
+ * which is the whole difference between this and the reader's "联网看头像"
+ * switch — that one re-requests on every open, for as long as it is on.
+ *
+ * The owner only. Every author in a timeline has a URL too, and fetching those
+ * would be hundreds of requests and hundreds of files for faces that are not
+ * what an archive of your own posts is for.
+ *
+ * Never throws, like everything else in this file: the card is stored whether
+ * or not the picture came with it.
+ */
+export async function cacheAvatar(db, profile) {
+  const result = { cached: false, skipped: false, reason: null };
+
+  try {
+    if (!db || !profile || typeof profile !== 'object') return result;
+    const userId = typeof profile.userId === 'string' && profile.userId.length > 0 ? profile.userId : null;
+    if (userId === null) return result;
+    if (!isAllowedMediaUrl(profile.avatarUrl)) return result;
+
+    const key = avatarKey(userId);
+    /* What we would ask for now, worked out before the record is read because
+       the record is judged against it. */
+    const sourceUrl = biggerAvatarUrl(profile.avatarUrl);
+
+    const existing = await getMediaRecord(db, key);
+    /* Kept only when it is the picture that address would fetch TODAY.
+     *
+     * This used to be "is there a blob at all", and that is a one-way door: an
+     * earlier version of this stored whatever `profile.avatarUrl` named, which
+     * is `_normal` — 48 pixels — so anyone who ran it has a small square under
+     * this key and every run since skips straight past it. The header would
+     * stay blurred for good, with nothing on screen or in the counters to say
+     * why. The record remembers the address it came from, so the question is
+     * answered exactly rather than guessed at from the file size.
+     *
+     * Nothing is written unless bytes arrive, so a re-fetch that fails leaves
+     * the old picture exactly where it was: this can only ever improve. */
+    if (existing && existing.blob && existing.sourceUrl === sourceUrl) {
+      result.skipped = true;
+      return result;
+    }
+
+    /* The same grant the media cache uses. No separate prompt: a user who
+       wanted pictures in their archive has already answered this. */
+    if (!(await hasMediaPermission())) {
+      result.reason = 'media host permission not granted';
+      return result;
+    }
+
+    const downloaded = await fetchMediaBytes(sourceUrl);
+    if (downloaded.ok !== true) {
+      result.reason = downloaded.reason;
+      return result;
+    }
+    result.fromArchive = downloaded.from === FROM_ARCHIVE ? 1 : 0;
+
+    await putMediaRecord(db, {
+      key: key,
+      tweetId: userId,
+      mediaId: AVATAR_MEDIA_ID,
+      type: 'photo',
+      sourceUrl: sourceUrl,
+      contentType: downloaded.contentType,
+      size: downloaded.blob.size,
+      width: null,
+      height: null,
+      altText: null,
+      cachedAt: new Date().toISOString(),
+      blob: downloaded.blob
+    });
+    result.cached = true;
+  } catch (err) {
+    result.reason = err && err.message ? String(err.message) : 'unexpected avatar cache error';
   }
 
   return result;

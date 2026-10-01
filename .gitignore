@@ -1,6 +1,7 @@
 # Exported archives contain your own post data. They are personal content and
 # must never be committed — the repo is the extension, not anyone's backup.
 x-tweet-backup-*.json
+wayback-*.json
 *.zip
 
 # Contact sheets produced by tools/make-icons.mjs. The icons that ship are in

@@ -790,6 +790,30 @@ body {
   grid-template-columns: auto 1fr;
   gap: 2px 10px;
   margin: 8px 0 8px;
+  /* Scrolls inside itself, and it has to.
+   *
+   * The row count grows with every line the extension learns (44 rows now) and
+   * one row is ~18.5px, so the expanded grid measured 812px. The popup is capped
+   * at 600 and `body` is `overflow: hidden`, so there was no scrollbar anywhere:
+   * the panel was clipped mid-row, and it pushed the footer — the export and
+   * clear buttons — off the bottom of the window with it. Every ancestor
+   * reported zero internal overflow, which is why it read as "cannot scroll"
+   * rather than "too tall".
+   *
+   * The bound scales with the window, so the toolbar popup shows a short window
+   * onto the grid and the full-page layout (the same markup, opened with 「在
+   * 标签页打开」) shows most of it at once. Below the bound nothing shrinks: the
+   * list keeps its 150px floor (see .list) and the footer keeps its buttons.
+   *
+   * 508 is the chrome above and below the grid that must stay on screen: the
+   * header, the toolbar, the list at its floor, the list-footer and the footer,
+   * measured at 440x600 rather than added up — at that size the formula yields
+   * exactly the 92px that fits, and the floor is the same number so the two
+   * agree rather than fight. That is about five rows: enough to read a counter
+   * and scroll to the next, which is what the panel is for. */
+  max-height: max(92px, min(calc(100vh - 508px), 320px));
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .diagnostics__grid dt {
@@ -917,6 +941,33 @@ body {
   display: none;
 }
 
+/* ---------------------------------------------------- known accounts ---- */
+
+/* One remembered author id per row: the id, whether it is the account on this
+   archive's own profile card, and the way to take it out. The id is monospace
+   because it is a number to compare character by character, and the note under
+   the list is `.settings__note` like every other caveat here. */
+.ownauthor {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 5px 0 1px;
+}
+
+.ownauthor__id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.ownauthor__tag {
+  flex: 1;
+  min-width: 120px;
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
 /* --------------------------------------------------------------- cleanup */
 
 .cleanup {
@@ -958,6 +1009,86 @@ body {
   margin-left: 6px;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   color: var(--text-faint);
+}
+
+/* --------------------------------------------------- the archive import -- */
+
+/* The same furniture as .cleanup above, deliberately: this is the second
+   collapsible panel in the settings body, and two of them that looked different
+   would read as two different kinds of thing. */
+.wayback {
+  margin: 8px 0 2px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-soft);
+  padding: 6px 9px;
+  font-size: 11px;
+}
+
+.wayback summary {
+  cursor: pointer;
+  color: var(--text-soft);
+  font-size: 11px;
+}
+
+.wayback__note {
+  margin: 7px 0 8px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-faint);
+}
+
+.wayback__field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+}
+
+.wayback__label {
+  color: var(--text-soft);
+  flex: 0 0 auto;
+}
+
+/* There is no text-input style in this file besides the toolbar's search box,
+   which is sized for the toolbar. */
+.wayback__input {
+  flex: 1 1 auto;
+  min-width: 0;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 3px 6px;
+  font: inherit;
+  font-size: 12px;
+}
+
+/* A batch is a number between 1 and 500; it does not need the full width, and
+   the narrowness is a hint about what belongs in it. */
+.wayback__input--number {
+  flex: 0 0 64px;
+}
+
+/* A disabled field has to LOOK disabled, and by default this one does not.
+   The rules above set an explicit background and colour, and an explicit
+   colour is exactly what stops the browser's own greyed-out rendering from
+   showing through — so switching "fetch everything" on left the number box
+   looking live while it silently ignored every keystroke. Said again in the
+   panel's own colours rather than with opacity, so it reads as unavailable
+   rather than as something faded that is about to come back. */
+.wayback__input:disabled {
+  background: var(--bg-soft);
+  color: var(--text-faint);
+  cursor: not-allowed;
+}
+
+.wayback__row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 5px 0 1px;
 }
 
 .footer__actions {
@@ -1113,6 +1244,31 @@ body {
      base rule for why this is decided here and nowhere else. */
   .viewswitch {
     display: flex;
+  }
+
+  /* The same panel, a different budget.
+   *
+   * This layout's chrome is taller than the popup's — the header, the roster
+   * switch and the footer all get more padding here — so the one constant in the
+   * base rule cannot serve both. Measured at 880x900 the base value left the
+   * page 6px taller than the window. 590 is that layout's chrome, and the 60px
+   * floor is what keeps the grid from collapsing to nothing on a laptop tab,
+   * which is where this branch is most likely to be only just tall enough. */
+  .diagnostics__grid {
+    max-height: max(60px, min(calc(100vh - 590px), 320px));
+  }
+
+  /* Opening the panel has to take its height from somewhere, and here the only
+     slack is the list's floor.
+   *
+   * The popup branch does not need this: at 600px the list at 150 and the grid
+   * at 92 fit together exactly. This layout does, because the range it covers
+   * starts at 610 — and a 1366x768 laptop leaves about 628px of viewport, which
+   * is a common size rather than a corner one. Measured at 700x620 without this
+   * the footer still hung 26px below the window. 60px still shows a card head,
+   * and the floor is restored the moment the panel is closed. */
+  .app:has(.diagnostics[open]) .list {
+    min-height: 60px;
   }
 }
 

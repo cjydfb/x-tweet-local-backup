@@ -323,6 +323,46 @@
     return { list: payload.list, ownerId: payload.ownerId, records: records };
   }
 
+  /**
+   * A profile card is one row: a name, a bio of at most 2000 characters and a
+   * handful of URLs. Far below the bridge limit even with a full bio of CJK,
+   * which is three bytes a character.
+   */
+  const MAX_PROFILE_BYTES = 32 * 1024;
+
+  /**
+   * Your own profile card — one record, not a batch.
+   *
+   * Unlike a follow list there is no envelope to hoist fields onto and nothing
+   * that could disagree with itself, so all this side has to establish is that
+   * the message names a numeric account and that it fits the bridge. Every other
+   * field is rebuilt from a whitelist in background.js; anything demanded here
+   * beyond that would be a second, weaker copy of that whitelist, and a second
+   * definition is one that can drift.
+   *
+   * The account being *ours* is settled by inject.js against the ids this
+   * browser has watched publish, and it is not re-checked here: this side has no
+   * such set and must not grow one.
+   */
+  function validateProfile(raw) {
+    if (!isObject(raw)) return null;
+    const payload = raw.payload;
+    if (!isObject(payload)) return null;
+    if (!isTweetId(payload.userId)) return null;
+
+    let serialized;
+    try {
+      serialized = JSON.stringify(payload);
+    } catch (_) {
+      return null;
+    }
+    if (typeof serialized !== 'string' || serialized.length > MAX_PROFILE_BYTES) {
+      reportRejection('a profile card exceeded ' + MAX_PROFILE_BYTES + ' bytes');
+      return null;
+    }
+    return payload;
+  }
+
   /** How many link targets one post can have. X's own cap; the page applies it too. */
   const MAX_LINK_ENTRIES = 64;
 
@@ -525,6 +565,19 @@
         return;
       }
 
+      if (data.type === 'X_PROFILE_SEEN') {
+        const payload = validateProfile(data);
+        if (payload === null) {
+          log('rejected malformed profile payload');
+          return;
+        }
+        forwardToBackground({
+          type: 'X_PROFILE_SEEN',
+          payload: payload
+        });
+        return;
+      }
+
       if (data.type === 'X_TWEET_DELETED') {
         // A delete carries no tweet content — only which id was removed and
         // when — so it gets its own narrow validation rather than reusing the
@@ -575,6 +628,20 @@
             timelineKept: data.payload.timelineKept,
             detailSeen: data.payload.detailSeen,
             detailKept: data.payload.detailKept,
+            // These three were left out of this list when the roster shipped, so
+            // the panel has always shown 0 for counters that were counting
+            // correctly the whole time — the page was reporting them and this
+            // whitelist was dropping them on the floor. Adding them is what
+            // makes the new profile counters below worth anything: a whitelist
+            // that silently swallows a field is indistinguishable from a feature
+            // that never fired.
+            connectionsSeen: data.payload.connectionsSeen,
+            connectionsKept: data.payload.connectionsKept,
+            connectionsNoOwner: data.payload.connectionsNoOwner,
+            profileSeen: data.payload.profileSeen,
+            profileKept: data.payload.profileKept,
+            profileNoOwner: data.payload.profileNoOwner,
+            profileNoUser: data.payload.profileNoUser,
             requestBodyRead: data.payload.requestBodyRead,
             requestBodyFailed: data.payload.requestBodyFailed,
             responseCloneFailed: data.payload.responseCloneFailed,

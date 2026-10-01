@@ -53,6 +53,14 @@ const SKIP_DIRS = new Set(['.git', 'tools', 'reader', 'node_modules']);
 const SKIP_FILES = new Set(['.gitignore', '.gitattributes', '.DS_Store', 'Thumbs.db', 'desktop.ini']);
 const SKIP_EXT = new Set(['.zip', '.crx', '.log']);
 
+/* Personal data dumps, named rather than enumerated because the handle in them
+   varies. tools/import-wayback.mjs writes `wayback-<handle>.json` into whatever
+   directory it is run from, and it is usually run from here — so these land at
+   the repository root by default and must not be mistaken for a file the
+   extension needs. The same rule as `x-tweet-backup-*.json` in .gitignore: the
+   repo is the extension, not anyone's backup. */
+const SKIP_PATTERNS = [/^wayback-[A-Za-z0-9_]+\.json$/];
+
 // What the extension actually is. The package is built from this list rather
 // than from "everything not obviously development-only", because a blocklist
 // ships a directory nobody meant to include and an allowlist cannot. Both times
@@ -68,9 +76,11 @@ const SHIPPED_TOP = new Set([
   'background.js',
   'content.js',
   'db.js',
+  'hosted.js',
   'inject.js',
   'media-cache.js',
   'settings.js',
+  'wayback.js',
   'zip.js',
   'popup.html',
   'popup.css',
@@ -106,6 +116,7 @@ function collect(dir, prefix, out, topLevel) {
     } else if (entry.isFile()) {
       if (SKIP_FILES.has(entry.name)) continue;
       if (SKIP_EXT.has(path.extname(entry.name).toLowerCase())) continue;
+      if (SKIP_PATTERNS.some((re) => re.test(entry.name))) continue;
       if (topLevel && !SHIPPED_TOP.has(entry.name)) throw unknownTopLevel(entry.name);
       out.push({ abs, rel, mtime: fs.statSync(abs).mtime });
     }
@@ -246,7 +257,18 @@ if (typeof version !== 'string' || version.length === 0) {
   process.exit(1);
 }
 
-const outPath = process.argv[2] || path.join(REPO, '..', 'x-tweet-backup-' + version + '.zip');
+/* The file is named after `version_name` when there is one, because that is
+ * what the person unzipping it sees on chrome://extensions — and because
+ * Chrome refuses letters in `version` itself, so a prerelease has nowhere else
+ * to say so. `"3.2.0 beta"` becomes `x-tweet-backup-3.2.0-beta.zip`; spaces and
+ * anything else that would be awkward in a path become dashes. The NUMBER
+ * still comes from `version`, unchanged. */
+const versionName = typeof manifest.version_name === 'string' ? manifest.version_name.trim() : '';
+const stem = versionName.length > 0
+  ? versionName.replace(/[^A-Za-z0-9.]+/g, '-').replace(/^-+|-+$/g, '')
+  : version;
+
+const outPath = process.argv[2] || path.join(REPO, '..', 'x-tweet-backup-' + stem + '.zip');
 
 const files = [];
 try {

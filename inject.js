@@ -40,6 +40,12 @@
   const BODY_READ_TIMEOUT_MS = 3000;     // never hang on request-body parsing
   const INTEGRITY_CHECK_MS = 20000;      // low-frequency, detection only
   const MAX_TEXT_CHARS = 200000;
+  /* A quoted post's body rides along inside the same record, so it needs its
+     own, much tighter ceiling or one long quote could push the whole payload
+     past MAX_BRIDGE_BYTES and cost the record entirely. 25,000 is X's own
+     long-post limit: the cap can therefore never truncate anything X would
+     have let its author write, it only bounds what one row can weigh. */
+  const MAX_QUOTED_TEXT_CHARS = 25000;
   const MAX_MEDIA_ITEMS = 64;
   const MAX_POLL_CHOICES = 4;            // X offers 2, 3 or 4 choices
   const MAX_BINDING_VALUES = 256;        // card binding_values is a small list
@@ -167,6 +173,42 @@
   /** Guard against a pathological response; a real page of this list is fifty rows. */
   const MAX_CONNECTION_USERS = 200;
 
+  /* Your own profile card — the header the standalone reader draws above the
+   * timeline.
+   *
+   * This is the ONE read whose RESPONSE says whose it is. A follow list has to be
+   * recognised from the request, because its response names no owner (see
+   * CONNECTION_OPERATIONS); here the account is in the bytes —
+   * `data.user.result.rest_id` — so the guard is settled by what came back
+   * rather than by what the page claimed when it asked.
+   *
+   * UserByRestId is the same node at the same path and costs one array entry and
+   * no second parser. It fires when a profile is opened by id rather than by
+   * handle — a mention, an internal link.
+   *
+   * The operation is NOT exclusive to a profile page: it is how X resolves a
+   * handle to an account anywhere in the product, so it can fire several times
+   * in a session. That is exactly why the guard is on the response. Frequency
+   * does not matter when the answer is compared against the accounts this
+   * browser has watched publish.
+   */
+  const PROFILE_OPERATIONS = ['userbyscreenname', 'userbyrestid'];
+
+  /**
+   * How much bio to keep.
+   *
+   * Applied HERE and again in background.js, because a profile record travels
+   * alone: postRecordBatches splits an ARRAY that can outweigh the bridge limit,
+   * and a card is not an array, so nothing measures it on the way out. A response
+   * carrying a huge bio would be refused by post() whole and the card lost. 2000
+   * is the cap sanitizeProfile applies, so the two agree.
+   */
+  const MAX_BIO_CHARS = 2000;
+
+  /** Guard against a pathological response; no real bio has this many links. */
+  const MAX_BIO_URLS = 8;
+  const MAX_BIO_MENTIONS = 8;
+
   /** Guard against a pathological response; no real timeline page approaches this. */
   const MAX_TIMELINE_NODES = 200000;
   const MAX_TIMELINE_TWEETS = 500;
@@ -201,6 +243,21 @@
     // somebody else looks like, and a rise here with kept flat is what a fresh
     // install looks like before it has seen you publish anything.
     connectionsNoOwner: 0,
+    // And apart from those again: a profile card is not a post, not a sweep of
+    // one, and not a list of other people.
+    profileSeen: 0,
+    profileKept: 0,
+    // Dropped because the response says it is somebody this browser has not
+    // watched publish. This is the normal outcome of clicking anyone else's
+    // name, and a rise here with kept flat is also what a fresh install looks
+    // like before it has seen you publish anything.
+    profileNoOwner: 0,
+    // Dropped because the response carried no usable account at all — a
+    // suspended, withheld or deleted account answers with a node that has no id,
+    // and so does a response shape this build does not know. Reported apart
+    // from profileNoOwner so that a shape change is distinguishable from
+    // ordinary browsing.
+    profileNoUser: 0,
     requestBodyRead: 0,
     requestBodyFailed: 0,
     responseCloneFailed: 0,
@@ -258,6 +315,10 @@
       connectionsSeen: diag.connectionsSeen,
       connectionsKept: diag.connectionsKept,
       connectionsNoOwner: diag.connectionsNoOwner,
+      profileSeen: diag.profileSeen,
+      profileKept: diag.profileKept,
+      profileNoOwner: diag.profileNoOwner,
+      profileNoUser: diag.profileNoUser,
       requestBodyRead: diag.requestBodyRead,
       requestBodyFailed: diag.requestBodyFailed,
       responseCloneFailed: diag.responseCloneFailed,
@@ -386,7 +447,7 @@
           hookInstalled: diag.hookInstalled,
           operations: ALL_OPERATIONS.concat(TIMELINE_OPERATIONS)
             .concat(REPLY_TIMELINE_OPERATIONS).concat(DETAIL_OPERATIONS)
-            .concat(CONNECTION_OPERATIONS)
+            .concat(CONNECTION_OPERATIONS).concat(PROFILE_OPERATIONS)
         });
         flushQueue();
         return;
@@ -584,11 +645,12 @@
     if (isConnections && !captureConnections) return null;
     const isTimeline = TIMELINE_OPERATIONS.indexOf(lower) !== -1 || isReplyTimeline;
     const isDetail = DETAIL_OPERATIONS.indexOf(lower) !== -1;
+    const isProfile = PROFILE_OPERATIONS.indexOf(lower) !== -1;
 
     // A publish or a delete is always a POST. Matching those names on a GET
     // would mean the operation is not what we think it is, so they are kept
     // strictly POST-only; the queries are the GETs that are wanted.
-    if (isTimeline || isDetail || isConnections) {
+    if (isTimeline || isDetail || isConnections || isProfile) {
       if (upperMethod !== 'GET') return null;
     } else if (upperMethod !== 'POST' || ALL_OPERATIONS.indexOf(lower) === -1) {
       return null;
@@ -605,7 +667,13 @@
       // Whose list this is, read from the request's own query string. Null is a
       // real answer — it means the page did not say, and handleConnectionsJson
       // drops the response rather than guessing which side it is looking at.
-      ownerUserId: isConnections ? normalizeTweetId(readUrlVariablesField(url, 'userId')) : null
+      ownerUserId: isConnections ? normalizeTweetId(readUrlVariablesField(url, 'userId')) : null,
+      // A flag and nothing else. The request's `variables.screenName` exists and
+      // is deliberately NOT read: it has no gating use here — the response
+      // carries the stronger fact — and reading it could only ever make us
+      // reject good data (a rename between the query and the response) or accept
+      // bad data (a lookup of somebody else's handle). See handleProfileJson.
+      isProfile: isProfile
     };
   }
 
@@ -669,6 +737,7 @@
       info.isConnections = analysis.isConnections === true;
       info.connectionList = analysis.connectionList;
       info.ownerUserId = analysis.ownerUserId;
+      info.isProfile = analysis.isProfile === true;
       info.queryId = analysis.queryId;
       info.operationName = analysis.operationName;
 
@@ -927,6 +996,37 @@
   ];
 
   /**
+   * Turn an offset X supplied into one a JavaScript string understands.
+   *
+   * X counts characters the way a person does: an emoji is ONE. A JavaScript
+   * string counts that same emoji as TWO UTF-16 units, so an offset used
+   * directly lands one place early for every emoji before it.
+   *
+   * Every `indices` array X sends is counted this way. The check in
+   * stripMediaPlaceholders below would reject a misplaced slice rather than cut
+   * real text, so the failure was silent in the other direction: the
+   * placeholder was simply left in the archived post. Measured on the real
+   * archive, one of the eighteen posts that still carried its media link had an
+   * emoji immediately before it.
+   */
+  function toJsOffset(text, pointOffset) {
+    if (!Number.isSafeInteger(pointOffset) || pointOffset <= 0) return 0;
+
+    let seen = 0;
+    for (let i = 0; i < text.length; i++) {
+      if (seen === pointOffset) return i;
+      const code = text.charCodeAt(i);
+      // A high surrogate followed by a low one is one character stored twice.
+      if (code >= 0xd800 && code <= 0xdbff && i + 1 < text.length) {
+        const next = text.charCodeAt(i + 1);
+        if (next >= 0xdc00 && next <= 0xdfff) i++;
+      }
+      seen++;
+    }
+    return text.length;
+  }
+
+  /**
    * X appends a t.co placeholder for every attached media item to full_text.
    * Observed live: "@user the actual text https://t.co/33Q3ctjQCE".
    *
@@ -953,14 +1053,20 @@
         const indices = asArray(item.indices);
         if (indices === null || indices.length !== 2) continue;
 
-        const start = asFiniteNumber(indices[0]);
-        const end = asFiniteNumber(indices[1]);
-        if (start === null || end === null) continue;
-        if (!Number.isInteger(start) || !Number.isInteger(end)) continue;
-        if (start < 0 || end > s.length || start >= end) continue;
+        const rawStart = asFiniteNumber(indices[0]);
+        const rawEnd = asFiniteNumber(indices[1]);
+        if (rawStart === null || rawEnd === null) continue;
+        if (!Number.isInteger(rawStart) || !Number.isInteger(rawEnd)) continue;
+        if (rawStart < 0 || rawEnd <= rawStart) continue;
 
         const mediaUrl = nonEmptyString(item.url);
         if (mediaUrl === null) continue;
+
+        /* X's numbers are counted in characters, not in the UTF-16 units a
+           JavaScript string is made of, so they are converted before use. */
+        const start = toJsOffset(s, rawStart);
+        const end = toJsOffset(s, rawEnd);
+        if (start >= end) continue;
         if (s.slice(start, end).indexOf(mediaUrl) !== 0) continue;
 
         ranges.push([start, end]);
@@ -1235,6 +1341,104 @@
       const match = /\/status\/([0-9]{1,25})/.exec(attachmentUrl);
       if (match) return match[1];
     }
+    return null;
+  }
+
+  /**
+   * The quoted post itself, not merely its id.
+   *
+   * X hands the whole quoted tweet over inside the response this file already
+   * intercepts — text, author, timestamp — and until now only its id was
+   * copied out. That id says *that* something was quoted and nothing about
+   * what it said, so the day the original is deleted or its author suspended,
+   * the archive holds a pointer into a hole.
+   *
+   * Deliberately left out: the quoted post's media, metrics and entities.
+   * Every one of them is present and every one of them widens both this record
+   * and the sanitizer that has to re-check it. Text and authorship are the
+   * part that is gone for good when the other side disappears.
+   */
+  function extractQuotedTweet(result) {
+    const node = asObject(walk(result, ['quoted_status_result', 'result']));
+    if (node === null) return null;
+
+    const legacy = asObject(node.legacy) || {};
+    const id = normalizeTweetId(node.rest_id) || normalizeTweetId(legacy.id_str);
+    if (id === null) return null;
+
+    const body = nonEmptyString(legacy.full_text) ||
+                 nonEmptyString(legacy.text) ||
+                 nonEmptyString(walk(node, ['note_tweet', 'note_tweet_results', 'result', 'text']));
+
+    const createdAtRaw = nonEmptyString(legacy.created_at);
+
+    const clamped = body !== null && body.length > MAX_QUOTED_TEXT_CHARS
+      ? body.slice(0, MAX_QUOTED_TEXT_CHARS)
+      : body;
+
+    return {
+      tweetId: id,
+      text: clamped === null ? '' : clamped,
+      createdAt: parseXDate(createdAtRaw),
+      createdAtRaw: createdAtRaw,
+      author: extractAuthor(node)
+    };
+  }
+
+  /**
+   * Which client posted this.
+   *
+   * X sends `source` as a small anchor — `<a href="https://mobile.twitter.com"
+   * rel="nofollow">Twitter Web App</a>` — and it is the only surviving record
+   * of how a post was made. It is also the one field here that is about the
+   * moment of posting rather than the post: nothing later can reconstruct it.
+   *
+   * The markup is read, never stored. An archive has no business carrying a
+   * fragment of somebody else's HTML, and this is a trust boundary.
+   */
+  function extractPostedVia(result) {
+    const raw = nonEmptyString(result.source);
+    if (raw === null) return null;
+
+    const anchor = /<a[^>]*\shref\s*=\s*["']([^"']*)["'][^>]*>([\s\S]*?)<\/a>/i.exec(raw);
+    const href = anchor ? anchor[1] : null;
+    const inner = anchor ? anchor[2] : raw;
+
+    const name = nonEmptyString(inner.replace(/<[^>]*>/g, '')) ||
+                 nonEmptyString(raw.replace(/<[^>]*>/g, ''));
+    const url = href !== null && /^https?:\/\//i.test(href) ? href : null;
+
+    if (name === null && url === null) return null;
+    return { name: name, url: url };
+  }
+
+  /**
+   * Whether the account itself had liked, bookmarked or reposted the post when
+   * it was seen. Three booleans describing one instant; like `postedVia`, this
+   * is a fact about then, not about the post, and nothing can recover it after
+   * the fact.
+   */
+  function extractViewerState(legacy) {
+    const node = asObject(legacy);
+    if (node === null) return null;
+    return {
+      liked: node.favorited === true,
+      bookmarked: node.bookmarked === true,
+      reposted: node.retweeted === true
+    };
+  }
+
+  /**
+   * X's own sensitive-content mark. `null` when the key is absent, which is
+   * the common case and is NOT the same as false — X omits a field it has
+   * nothing to say about, and recording that omission as "not sensitive"
+   * would be inventing an answer nobody gave.
+   */
+  function extractSensitive(legacy) {
+    const node = asObject(legacy);
+    if (node === null) return null;
+    if (node.possibly_sensitive === true) return true;
+    if (node.possibly_sensitive === false) return false;
     return null;
   }
 
@@ -1553,6 +1757,15 @@
       conversationId: conversationId,
       conversationIdInferred: conversationIdInferred,
       quoteTweetId: quoteTweetId,
+      // The four below are all facts X sends alongside the post and that this
+      // file used to read past. Three of them — which client posted it, how
+      // the account itself had reacted, and whether X marks it sensitive —
+      // describe the moment and cannot be recovered later. The quoted post is
+      // the opposite: it is recoverable only while the original still exists.
+      quotedTweet: extractQuotedTweet(result),
+      postedVia: extractPostedVia(result),
+      viewerState: extractViewerState(legacy),
+      sensitive: extractSensitive(legacy),
       author: author,
       entities: entities,
       media: media,
@@ -1569,7 +1782,11 @@
         backfilled: false,
         tombstone: false
       },
-      schemaVersion: 2
+      // Re-stamped by `sanitizeRecord` in background.js, which is where the
+      // number is actually decided — this file runs in the page and cannot
+      // import it. Kept in step by hand so a record read straight out of the
+      // page during debugging does not claim a shape it no longer has.
+      schemaVersion: 5
     };
   }
 
@@ -2072,7 +2289,24 @@
    * `list` and `ownerId` are deliberately absent — they belong to the message,
    * not the row, so a single forged row cannot claim to be from the other list.
    */
-  function buildConnectionRecord(user, requestInfo, capturedVia) {
+  /**
+   * The fields a user node carries, whichever operation delivered it.
+   *
+   * A follow list and a profile card answer with the SAME node shape — measured
+   * against real responses, both come back as the flat `core` / `avatar` /
+   * `profile_bio` / `relationship_counts` / `tweet_counts` blocks, with no
+   * `legacy` on either. So the reading lives here once. Two copies would be two
+   * places to update the day X moves a field again, and the failure mode of the
+   * forgotten copy is a silently half-empty record rather than an error.
+   *
+   * Callers differ only in what they add: a roster row is keyed by which list it
+   * came from and carries no banner, because that URL on a few thousand rows is
+   * dead weight for a view that never shows it.
+   *
+   * Returns null when the node names no account, which is the only field either
+   * caller cannot invent.
+   */
+  function readUserNode(user, maxBio) {
     const core = isObject(user.core) ? user.core : {};
     const bio = isObject(user.profile_bio) ? user.profile_bio : {};
     const bioEntities = isObject(bio.entities) ? bio.entities : {};
@@ -2091,7 +2325,7 @@
 
     const bioUrls = [];
     const rawUrls = Array.isArray(bioDescription.urls) ? bioDescription.urls : [];
-    for (let i = 0; i < rawUrls.length && bioUrls.length < 8; i++) {
+    for (let i = 0; i < rawUrls.length && bioUrls.length < MAX_BIO_URLS; i++) {
       const item = rawUrls[i];
       if (!isObject(item)) continue;
       const expanded = nonEmptyString(item.expanded_url) || nonEmptyString(item.url);
@@ -2103,6 +2337,8 @@
       });
     }
 
+    const rawBio = typeof bio.description === 'string' ? bio.description : null;
+
     return {
       userId: userId,
       // The numeric id is the identity; the handle is a label that can change.
@@ -2113,7 +2349,12 @@
       screenNameLower: screenName === null ? '' : screenName.toLowerCase(),
       name: nonEmptyString(core.name),
       accountCreatedAt: nonEmptyString(core.created_at),
-      bio: typeof bio.description === 'string' ? bio.description : null,
+      // Clamped only where a cap was asked for. A roster row keeps what came
+      // back because sanitizeConnection caps it on arrival; a profile card is
+      // posted on its own and has nothing between here and the bridge limit.
+      bio: (maxBio !== undefined && rawBio !== null && rawBio.length > maxBio)
+        ? rawBio.slice(0, maxBio)
+        : rawBio,
       bioUrls: bioUrls,
       location: typeof place.location === 'string' ? place.location : null,
       websiteUrl: nonEmptyString(website.expanded_url) || nonEmptyString(website.url),
@@ -2123,9 +2364,77 @@
       followersCount: asFiniteNumber(counts.followers),
       followingCount: asFiniteNumber(counts.following),
       tweetCount: asFiniteNumber(tweetCounts.tweets),
-      avatarUrl: nonEmptyString(avatar.image_url),
-      source: { operationName: requestInfo.operationName, capturedVia: capturedVia }
+      avatarUrl: nonEmptyString(avatar.image_url)
     };
+  }
+
+  function buildConnectionRecord(user, requestInfo, capturedVia) {
+    const common = readUserNode(user);
+    if (common === null) return null;
+    return Object.assign(common, {
+      source: { operationName: requestInfo.operationName, capturedVia: capturedVia }
+    });
+  }
+
+  /**
+   * Your own profile card — the header the standalone reader draws above the
+   * timeline.
+   *
+   * Everything readUserNode returns, plus the banner. The count field is
+   * `tweetCount` and never `tweets`: reader.html finds the exported tweet array
+   * by scanning the raw bytes for that literal key, so a second one anywhere in
+   * the envelope is a trap rather than a name.
+   */
+  function buildProfileRecord(user, requestInfo, capturedVia) {
+    const common = readUserNode(user, MAX_BIO_CHARS);
+    if (common === null) return null;
+
+    /* Everything else a user node carries that only a PROFILE card wants.
+       A roster row is somebody else seen once in a list, and a pinned tweet id
+       on three thousand of them is dead weight — the same reason the banner is
+       read here and not in readUserNode.
+       Every path below was read off a real UserByScreenName rather than
+       guessed: `privacy.protected`, `pinned_items.tweet_ids_str`,
+       `tweet_counts.media_tweets` and `action_counts.favorites_count`. */
+    const banner = isObject(user.banner) ? user.banner : {};
+    const privacy = isObject(user.privacy) ? user.privacy : {};
+    const actions = isObject(user.action_counts) ? user.action_counts : {};
+    const tweetCounts = isObject(user.tweet_counts) ? user.tweet_counts : {};
+    const pinned = isObject(user.pinned_items) ? user.pinned_items : {};
+    const pinnedIds = Array.isArray(pinned.tweet_ids_str) ? pinned.tweet_ids_str : [];
+
+    /* The accounts named in the bio. The bio TEXT already contains "@name"
+       verbatim — this is structure beside it, kept for the same reason a post
+       keeps its entity lists. v2 carries no display name for a mention on a
+       tweet either, so `name` is null there too rather than invented here. */
+    const bio = isObject(user.profile_bio) ? user.profile_bio : {};
+    const bioEntities = isObject(bio.entities) ? bio.entities : {};
+    const bioDescription = isObject(bioEntities.description) ? bioEntities.description : {};
+    const bioMentions = [];
+    const rawMentions = Array.isArray(bioDescription.mentions) ? bioDescription.mentions : [];
+    for (let i = 0; i < rawMentions.length && bioMentions.length < MAX_BIO_MENTIONS; i++) {
+      const item = rawMentions[i];
+      if (!isObject(item)) continue;
+      const handle = nonEmptyString(item.screen_name) || nonEmptyString(item.username);
+      if (handle === null) continue;
+      bioMentions.push({ screenName: handle, name: null });
+    }
+
+    return Object.assign(common, {
+      bannerUrl: nonEmptyString(banner.image_url),
+      bioMentions: bioMentions,
+      protected: typeof privacy.protected === 'boolean' ? privacy.protected : null,
+      pinnedTweetId: pinnedIds.length > 0 ? normalizeTweetId(pinnedIds[0]) : null,
+      mediaCount: asFiniteNumber(tweetCounts.media_tweets),
+      likeCount: asFiniteNumber(actions.favorites_count),
+      /* No listed count, and this is not an omission: a real UserByScreenName
+         has no `listed` anywhere in it — measured, not assumed. Only an
+         archived payload carries one, in `public_metrics.listed_count`, so a
+         profile read live leaves this null and a profile imported from the
+         Archive fills it in. The merge keeps a number, so the two compose. */
+      listedCount: null,
+      source: { operationName: requestInfo.operationName, capturedVia: capturedVia }
+    });
   }
 
   /** Every usable row in one follow-list response. */
@@ -2201,6 +2510,86 @@
       list: requestInfo.connectionList,
       ownerId: ownerId
     });
+    scheduleDiag();
+  }
+
+  /* ---------------------------------------------------------- own profile */
+
+  /**
+   * The account node in a profile response.
+   *
+   * One path, because there is one: measured against X's own client, both
+   * UserByScreenName and UserByRestId answer with the node at
+   * `data.user.result`, carrying `rest_id` directly and no visibility wrapper.
+   * A profile that cannot be shown comes back as a node with no id at all,
+   * which the id check below rejects without needing a special case.
+   */
+  function findProfileUser(json) {
+    return asObject(walk(json, ['data', 'user', 'result']));
+  }
+
+  function handleProfileJson(json, requestInfo, capturedVia) {
+    diag.profileSeen++;
+
+    if (json === null || typeof json !== 'object') {
+      diag.responseJsonFailed++;
+      diag.lastError = 'profile response was not a usable object';
+      diag.lastErrorAt = new Date().toISOString();
+      scheduleDiag();
+      return;
+    }
+
+    const user = findProfileUser(json);
+    const userId = user === null ? null : normalizeTweetId(user.rest_id);
+    if (user === null || userId === null) {
+      // Not an error, and deliberately not folded into responseJsonFailed: a
+      // suspended, withheld or deleted account answers with a node that has no
+      // id, and so does a response shape this build does not know. Both are
+      // "no card this time", and this counter is what says which.
+      diag.profileNoUser++;
+      scheduleDiag();
+      return;
+    }
+
+    // The guard, and the whole difference between this line and the roster's.
+    //
+    // A follow list has to be recognised from the REQUEST, because its response
+    // never names whose list it is. This response does: `rest_id` is the account
+    // the card belongs to, so nothing about the identity is taken on trust. What
+    // is left to decide is whether that account is OURS — and the only thing
+    // allowed to answer that is the set of ids this browser has actually watched
+    // publish.
+    //
+    // Deliberately NOT noteOwnAuthor, and it matters more here than it does for
+    // the roster. This operation fires for every handle X resolves anywhere in
+    // the product, so a line that fed the set would turn whoever you looked at
+    // next into "you" — and the profile sweep would then archive THEIR posts as
+    // yours. That set is fed by CreateTweet responses and by nothing else.
+    if (!ownAuthorIds.has(userId)) {
+      diag.profileNoOwner++;
+      if (debugEnabled) log('a profile was seen, but it is not one of our accounts — skipping');
+      scheduleDiag();
+      return;
+    }
+
+    let record = null;
+    try {
+      record = buildProfileRecord(user, requestInfo, capturedVia);
+    } catch (err) {
+      recordError('buildProfileRecord', err);
+      scheduleDiag();
+      return;
+    }
+    if (record === null) {
+      diag.profileNoUser++;
+      scheduleDiag();
+      return;
+    }
+
+    // One record, so no batcher: postRecordBatches exists to split an ARRAY that
+    // can outweigh the bridge limit, and a card is a few kilobytes. Counted only
+    // once the message has actually left the page, like every other line.
+    if (post('X_PROFILE_SEEN', record)) diag.profileKept++;
     scheduleDiag();
   }
 
@@ -2416,6 +2805,31 @@
         return;
       }
 
+      // A profile card is a query as well. X sends these over XHR, so this path
+      // is not the one that normally runs — but the fetch path losing a flag it
+      // was never taught is a mistake this file has already made twice, and the
+      // cost of copying it here is four lines.
+      if (requestInfo.isProfile === true) {
+        let profClone;
+        try {
+          profClone = response.clone();
+        } catch (err) {
+          diag.responseCloneFailed++;
+          recordError('response.clone (profile)', err);
+          return;
+        }
+        let profJson = null;
+        try {
+          profJson = await profClone.json();
+        } catch (err) {
+          diag.responseJsonFailed++;
+          recordError('clone.json (profile)', err);
+          return;
+        }
+        handleProfileJson(profJson, requestInfo, 'fetch');
+        return;
+      }
+
       // A delete marks an existing record instead of writing a new one.
       // (deleteSeen was already counted when the request went out.)
       if (requestInfo.isDelete === true) {
@@ -2601,6 +3015,11 @@
         return;
       }
 
+      if (info.isProfile === true) {
+        handleProfileJson(readXhrResponseJson(xhr), info, 'xhr');
+        return;
+      }
+
       // A delete marks an existing record instead of writing a new one.
       // (deleteSeen was already counted when the request went out.)
       if (info.isDelete === true) {
@@ -2714,7 +3133,8 @@
               isDetail: analysis.isDetail,
               isConnections: analysis.isConnections,
               connectionList: analysis.connectionList,
-              ownerUserId: analysis.ownerUserId
+              ownerUserId: analysis.ownerUserId,
+              isProfile: analysis.isProfile
             });
           } else {
             // The same XHR object can be reused via open(); never let stale
@@ -2743,6 +3163,10 @@
             // every page of it to createTweetSeen, which is the one number the
             // whole diagnostics panel is read for.
             else if (info.isConnections === true) { /* counted when the body arrives */ }
+            // Nor is a profile card a publish. Without this branch, every handle
+            // X resolves — which is most links anybody clicks — would be counted
+            // as a post the hook saw and failed to archive.
+            else if (info.isProfile === true) { /* counted when the body arrives */ }
             else diag.createTweetSeen++;
             // The body is handed to us as-is; we only read it when it is a
             // string, and we never modify or replace it.
@@ -2829,6 +3253,7 @@
             else if (requestInfo.isTimeline === true) { /* counted when the body arrives */ }
             else if (requestInfo.isDetail === true) { /* counted when the body arrives */ }
             else if (requestInfo.isConnections === true) { /* counted when the body arrives */ }
+            else if (requestInfo.isProfile === true) { /* counted when the body arrives */ }
             else diag.createTweetSeen++;
             observeResponse(originalPromise, requestInfo);
             scheduleDiag();

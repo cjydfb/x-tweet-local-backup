@@ -1,0 +1,1103 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>归档阅读器 — X Tweet Local Backup</title>
+<style>
+  /* X's own palette, to the hex. Light and dark both, following the system by
+     default and the 主题 button when it is used, because the point of this file
+     is that reading your archive feels like reading the timeline.
+
+     `color-scheme` is declared alongside the palette rather than left to the
+     browser, and that is not a detail. The native parts of a form control — the
+     calendar button on the date field above all — are drawn by the UA in
+     whichever scheme it was told it was in. With no declaration it assumes
+     LIGHT, whatever the page paints behind it: a dark-grey calendar icon on
+     #16181c, present the whole time and invisible. The report was "the calendar
+     will not open", and it was not a broken control, it was an unreadable one.
+     Declared, the icon follows the theme and the problem goes with it.
+
+     `data-theme` is set on <html> by the script at the end of the page. Before
+     it runs there is no attribute, which is what the media query is for. */
+  :root {
+    color-scheme: light;
+    --bg: #ffffff;
+    --bg-hover: #f7f9f9;
+    --bg-soft: #f7f9f9;
+    --border: #eff3f4;
+    --border-strong: #cfd9de;
+    --text: #0f1419;
+    --text-soft: #536471;
+    --text-faint: #8b98a5;
+    --accent: #1d9bf0;
+    --accent-hover: #1a8cd8;
+    --danger: #f4212e;
+    --ok: #00ba7c;
+    --warn: #d97706;
+    --radius: 16px;
+    --col: 600px;
+    /* The post page: 600 of reading column + 24 of gap + 300 of margin, plus
+       the page's own 32 of padding. */
+    --ppcol: 980px;
+    /* What X draws where a banner would go when the account has set none. The
+       dark value is the one that was measured on the live page; the light one
+       is X's own light-theme surface colour, since measuring it would have
+       meant switching the account's theme. */
+    --banner-empty: #cfd9de;
+  }
+  /* The dark palette, written out twice — here and in the media query below.
+     CSS cannot share one set of declarations between two selectors, and the
+     other way to do it (resolve "follow the system" in JavaScript before the
+     first paint) is not available: this page has exactly one script element and
+     it sits at the end of the body, so anything earlier would flash. Thirteen
+     repeated lines beat a white flash on every open. */
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #000000;
+    --bg-hover: #080808;
+    --bg-soft: #16181c;
+    --border: #2f3336;
+    --border-strong: #3e4144;
+    --text: #e7e9ea;
+    --text-soft: #71767b;
+    --text-faint: #71767b;
+    --accent: #1d9bf0;
+    --danger: #f4212e;
+    --ok: #00ba7c;
+    --warn: #e0a34a;
+    --banner-empty: #333639;
+  }
+  /* Only while no choice has been made: the script sets the attribute on the
+     first line it runs, and from then on the rule above is the only one in
+     play. Both selectors are (0,2,0), and they cannot collide anyway — this one
+     is excluded by its own :not() the moment the attribute exists. */
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme]) {
+      color-scheme: dark;
+      --bg: #000000;
+      --bg-hover: #080808;
+      --bg-soft: #16181c;
+      --border: #2f3336;
+      --border-strong: #3e4144;
+      --text: #e7e9ea;
+      --text-soft: #71767b;
+      --text-faint: #71767b;
+      --accent: #1d9bf0;
+      --danger: #f4212e;
+      --ok: #00ba7c;
+      --warn: #e0a34a;
+      --banner-empty: #333639;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+          "Microsoft YaHei", Roboto, Helvetica, Arial, sans-serif;
+    display: flex; flex-direction: column; overflow: hidden;
+    -webkit-font-smoothing: antialiased;
+  }
+  button, input, .filelabel { font-family: inherit; }
+  button { cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  /* ---------------------------------------------------------------- shell --
+   *
+   * Two boxes side by side, and the bottom tab bar BELOW both of them rather
+   * than floating over them.
+   *
+   * A fixed bar along the bottom edge is the obvious way to draw tabs on a
+   * phone and it is the wrong one here: it covers the last row of whatever is
+   * scrolling, which on this page is a post. Nothing overlaps nothing if the
+   * bar is simply the last thing in the column, so it takes its own height and
+   * the scroller gets the rest. It cannot hide a card, because it was never on
+   * top of one. */
+  #shell { flex: 1; display: flex; min-width: 0; min-height: 0; }
+  #main { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+  .grow { flex: 1; }
+  .btn {
+    border: 1px solid var(--border-strong); background: var(--bg); color: var(--text);
+    border-radius: 999px; padding: 5px 14px; font-size: 13px; font-weight: 600;
+    white-space: nowrap; transition: background .12s;
+  }
+  .btn:hover:not(:disabled) { background: var(--bg-soft); }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .btn.primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
+  .filelabel { display: inline-block; }
+  input[type=file] { display: none; }
+
+  /* ------------------------------------------------------------- sidebar ---
+   *
+   * The three views, then the accounts, then the one button that gets more of
+   * them. It is the whole navigation on a wide screen, which is why the account
+   * list is allowed to take the space between the two fixed ends: an archive
+   * per account is the thing a reader accumulates, and a menu that scrolls
+   * itself is better than one that pushes the button off the bottom.
+   *
+   * Not `position: fixed`. It is a flex child of #shell, so the reading column
+   * gets exactly the window minus 240 and nothing has to be kept in step with
+   * a magic width. */
+  #side {
+    flex: 0 0 240px; width: 240px;
+    display: flex; flex-direction: column; min-height: 0;
+    border-right: 1px solid var(--border); background: var(--bg);
+  }
+  .side__brand {
+    padding: 14px 16px 10px; font-size: 17px; font-weight: 800;
+    letter-spacing: -.2px; white-space: nowrap;
+  }
+  .side__nav { display: flex; flex-direction: column; padding: 0 8px; }
+  .side__link {
+    display: block; padding: 9px 10px; border-radius: 999px;
+    color: var(--text); font-size: 15px; font-weight: 600;
+  }
+  .side__link:hover { background: var(--bg-soft); text-decoration: none; }
+  .side__link.on { font-weight: 800; }
+  .side__accts { flex: 1; min-height: 0; overflow-y: auto; margin-top: 10px; padding: 0 8px 8px; }
+  .side__head {
+    padding: 6px 10px; font-size: 12px; color: var(--text-faint); font-weight: 700;
+  }
+  .side__acct {
+    display: block; padding: 7px 10px; border-radius: 10px;
+    color: var(--text); font-size: 13.5px; line-height: 1.35;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .side__acct:hover { background: var(--bg-soft); text-decoration: none; }
+  .side__acct.on { background: var(--bg-soft); font-weight: 700; }
+  .side__acct span { color: var(--text-faint); font-weight: 400; font-size: 12px; }
+  .side__foot { padding: 10px 16px 14px; border-top: 1px solid var(--border); }
+
+  /* -------------------------------------------------------- bottom tabs ---
+   * One of the two navigations, and only ever one of them is drawn: the sidebar
+   * is hidden below 900px and this is hidden above it. Neither is a fallback
+   * for the other — a phone has no room for a 240px column and a desktop has no
+   * room to waste on a bar whose three items are already on screen. */
+  #tabbar { display: none; }
+  .tabbar__t {
+    flex: 1; display: flex; align-items: center; justify-content: center;
+    padding: 13px 4px; font-size: 13.5px; font-weight: 600;
+    color: var(--text-soft); border-top: 2px solid transparent;
+  }
+  .tabbar__t:hover { text-decoration: none; }
+  .tabbar__t.on { color: var(--text); border-top-color: var(--accent); }
+  @media (max-width: 900px) {
+    #side { display: none; }
+    #tabbar {
+      display: flex; flex: 0 0 auto;
+      border-top: 1px solid var(--border); background: var(--bg);
+    }
+  }
+
+  /* ------------------------------------------------------- the views ------
+   * Which of the three is on screen is a class on <body>, and the routing that
+   * sets it is in 70-page.js. `#view` keeps its own `.on` class as well — that
+   * one means "an archive is open and the timeline has been built", which is a
+   * different question from "the timeline is the view being shown". */
+  body.view-me #view { display: none; }
+  #meView { flex: 1; display: none; flex-direction: column; min-height: 0; }
+  body.view-me #meView { display: flex; }
+
+  /* The search box, which used to live in the toolbar and belongs to the one
+     view that is about searching. */
+  #searchbar {
+    display: none; align-items: center; gap: 8px;
+    padding: 10px 16px; border-bottom: 1px solid var(--border);
+    background: var(--bg); flex: 0 0 auto;
+  }
+  body.view-search #searchbar { display: flex; }
+
+  /* ------------------------------------------------------------ 我 这一页 -- */
+  .me__scroll { flex: 1; min-height: 0; overflow-y: auto; }
+  .me__list { max-width: var(--col); width: 100%; margin: 0 auto; padding: 16px 16px 32px; }
+  .me__card {
+    border: 1px solid var(--border-strong); border-radius: var(--radius);
+    padding: 14px 16px; margin-bottom: 12px;
+  }
+  .me__head { display: flex; gap: 12px; align-items: flex-start; }
+  .me__who { min-width: 0; }
+  .me__name { font-size: 17px; font-weight: 800; line-height: 22px; }
+  .me__handle { color: var(--text-soft); font-size: 14px; line-height: 19px; }
+  .me__bio {
+    margin: 8px 0 0; font-size: 14px; line-height: 19px; color: var(--text-soft);
+    white-space: pre-wrap; word-break: break-word; overflow-wrap: anywhere;
+    display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden;
+  }
+  .me__meta { margin: 8px 0 0; font-size: 13px; color: var(--text-soft); }
+  .me__acts { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+  .me__tools {
+    flex: 0 0 auto; display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    padding: 10px 16px; border-top: 1px solid var(--border); background: var(--bg);
+  }
+  /* The one entry point that only exists where the sidebar does not. On a wide
+     screen ＋ 添加归档 is in the sidebar and a second one here would be the same
+     button twice; on a phone the sidebar is gone and the 我 page is all there
+     is. */
+  .me__add { display: none; }
+  @media (max-width: 900px) { .me__add { display: inline-block; } }
+
+  #q {
+    flex: 1; min-width: 120px; max-width: 320px;
+    background: var(--bg-soft); border: 1px solid transparent; border-radius: 999px;
+    padding: 7px 16px; font-size: 14px; color: var(--text); outline: none;
+  }
+  #q:focus { border-color: var(--accent); background: var(--bg); }
+  #q::placeholder { color: var(--text-faint); }
+  #when {
+    background: var(--bg-soft); border: 1px solid transparent; border-radius: 999px;
+    padding: 5px 10px; font-size: 13px; color: var(--text); outline: none;
+  }
+  #when:focus { border-color: var(--accent); }
+  .zone { font-size: 11px; color: var(--text-soft); white-space: nowrap; }
+
+  /* -------------------------------------------------------------- stats -- */
+  .stats {
+    display: flex; gap: 16px; flex-wrap: wrap; align-items: baseline;
+    padding: 7px 16px; border-bottom: 1px solid var(--border);
+    font-size: 12px; color: var(--text-soft);
+    background: var(--bg);
+  }
+  /* Written out because the rule above sets `display: flex`, and an author
+     display rule beats the user agent's `[hidden] { display: none }` whatever
+     the specificity — without this the strip renders as a 15px empty band under
+     the header before any file is open. */
+  .stats[hidden] { display: none; }
+  .stats b { color: var(--text); font-weight: 700; font-variant-numeric: tabular-nums; }
+  .stats .bad b { color: var(--danger); }
+  .stats .ok b { color: var(--ok); }
+
+  /* -------------------------------------------------- report and notice -- */
+  /* Two strips, because they hold two kinds of thing and only one of them may
+     be thrown away.
+   *
+   * `#report` is what the reader knows about the FILE: the integrity result, a
+   * roster it found, a deletion tombstone list, a profile that is missing. It is
+   * written once, when the file opens, and nothing the reader does to the view
+   * may clear it — an archive whose "no records were lost" statement disappears
+   * because you clicked a tab has stopped making that statement.
+   *
+   * `#notice` is what just happened: a search finished, a scan was stopped, a
+   * link was copied, a date was jumped to. Replacing it is correct, because the
+   * previous message was about a job that is over.
+   *
+   * Both are capped and scrollable. This chrome is NOT part of the timeline — it
+   * sits above the scroller and cannot be scrolled away — so an archive that
+   * reports three things at once would otherwise take a third of the window
+   * permanently and never give it back. */
+  #report, #notice {
+    padding: 0 16px; font-size: 13px; max-width: var(--col); width: 100%;
+    margin: 0 auto; max-height: 30vh; overflow-y: auto; flex: 0 1 auto;
+    scrollbar-width: thin;
+  }
+  #report:empty, #notice:empty { display: none; }
+
+  /* The report's control line, and the collapse it drives.
+   *
+   * The report is a wall of prose — three boxes on a file that carries a roster
+   * and a tombstone list — sitting ABOVE the profile header and the tabs, none
+   * of which can be scrolled away. On a short window that is the difference
+   * between seeing a post and seeing none. It is not collapsed by default: a
+   * file that reports something is reporting it for a reason. But the reader can
+   * put it away, and the line that remains still says whether anything was
+   * found, so closing it never turns a warning into silence. */
+  #reportBar {
+    display: flex; align-items: center; gap: 10px;
+    padding: 4px 16px 0; max-width: var(--col); width: 100%; margin: 0 auto;
+    font-size: 12px; color: var(--text-soft); flex: 0 0 auto;
+  }
+  #reportBar[hidden] { display: none; }
+  #reportBar .grow { flex: 1 1 auto; }
+  body.reportClosed #report { display: none; }
+  #notice .box {
+    margin: 10px 0; padding: 10px 14px; border-radius: 12px;
+    border: 1px solid var(--border-strong); background: var(--bg-soft);
+  }
+  #notice .box.error { border-color: var(--danger); color: var(--danger); }
+  #notice .box.warn { border-color: var(--warn); }
+  #notice .box.ok { border-color: var(--ok); }
+  #notice ul { margin: 6px 0 0; padding-left: 20px; }
+  #notice code { background: color-mix(in srgb, var(--text) 8%, transparent); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+
+  /* ---------------------------------------------------------- progress --- */
+  #prog { padding: 8px 16px; max-width: var(--col); width: 100%; margin: 0 auto; display: none; }
+  #prog.on { display: block; }
+  #prog .track { height: 4px; border-radius: 2px; background: var(--border); overflow: hidden; }
+  #prog .fill { height: 100%; width: 0; background: var(--accent); transition: width .12s linear; }
+  #prog .label { font-size: 12px; color: var(--text-soft); margin-top: 5px; display: flex; gap: 10px; align-items: baseline; }
+
+  /* -------------------------------------------------------------- drop --- */
+  /* Now the empty state of 我, and the whole window is still the target. The
+     three lines of prose that used to be here are gone by request: what is
+     left is what the page is and the two things you can press. */
+  #drop {
+    flex: 1; display: flex; align-items: center; justify-content: center;
+    text-align: center; color: var(--text-faint); padding: 40px; cursor: pointer;
+  }
+  #drop.over { background: var(--bg-soft); color: var(--accent); }
+  #drop .big { font-size: 20px; font-weight: 800; color: var(--text); margin-bottom: 14px; }
+  .me__empty { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
+
+  /* ----------------------------------------------------------- profile --- */
+  /* The account header, above the tab row and the timeline.
+     `flex: 0 0 auto` on this and on #tabs is not decoration: in a flex column
+     the children are shrunk before the container overflows, so without it the
+     header compresses to a sliver as soon as the list is long enough to scroll.
+     #view is the flex: 1 child, and it has to be the only thing that grows.
+
+     `[hidden]` is spelled out because an author `display` rule beats the user
+     agent's `[hidden] { display: none }` whatever the specificity — it is the
+     trap `.stats` was in until `.stats[hidden]` was added below, and the reason
+     `#view` is toggled by class rather than by the attribute. */
+  /* The header SCROLLS AWAY — it does not collapse.
+   *
+   * X's profile behaves like one continuous scroll: the banner, the avatar, the
+   * bio all travel up and out, and a bar with the name and the post count takes
+   * their place at the top. What was here before was a collapse: at 140px of
+   * scroll the whole header snapped to a 52px row, which reads as a jump rather
+   * than as scrolling, and it is not what X does.
+   *
+   * The mechanism, and why the header stays OUTSIDE the scroller: its height is
+   * driven from scrollTop, and its contents are translated up by the same
+   * amount. Clipping from the top and shrinking the box together are exactly
+   * what scrolling looks like — the top edge of the content leaves the window
+   * while everything below rises by the same number of pixels, which is what
+   * the cards in the scroller are doing at the same time.
+   *
+   * Moving the header inside the scroller instead would be the obvious way and
+   * is the wrong one: the height table and the row placement are built on the
+   * scroller containing cards and nothing else, and every one of those
+   * calculations would need a header-height offset threaded through it. This
+   * way the whole virtual-scroll core is untouched.
+   *
+   * `will-change` because this transform changes on every scroll frame. */
+  /* No max-height and no overflow any more. The header is CONTENT inside the
+     scroller now, not a box the layout has to clip: it is as tall as it is, it
+     scrolls because everything in the scroller scrolls, and there is no ceiling
+     to keep above the tallest it can get. The per-field clamps below are still
+     here — a hand-edited bio can be 2000 characters and a location can be
+     anything — but they bound a page's worth of scrolling rather than a
+     viewport's worth of chrome. */
+  #profile { width: 100%; }
+  #profile[hidden] { display: none; }
+
+  /* The bar the header scrolls away into.
+   *
+   * Its height is 0 while the header is on screen and grows to STICKY_H as the
+   * header leaves, so the two are a constant and nothing below ever jumps. The
+   * name is X's 17/800 in the sticky context and the count is the grey 13 that
+   * sits beside it; X shows the two and nothing else, which is the whole reason
+   * this bar exists rather than the header just being tall forever. */
+  #stickyBar {
+    flex: 0 0 auto;
+    height: 0; overflow: hidden;
+    display: flex; align-items: center; gap: 8px;
+    max-width: var(--col); width: 100%; margin: 0 auto;
+    padding: 0 16px;
+    background: color-mix(in srgb, var(--bg) 85%, transparent);
+    backdrop-filter: blur(12px);
+    /* The border only exists once the bar does. Kept on unconditionally it made
+       the element 1px tall even at height 0 — borders do not compress — which
+       showed up as the header and the bar summing to 491 at rest instead of
+       490. One pixel is not a jump anyone sees, but the whole reason this
+       layout is safe is that the sum is exactly constant, and a rule that is
+       only almost true is the kind that stops being true quietly. */
+  }
+  #stickyBar[hidden] { display: none; }
+  #stickyBar.on { border-bottom: 1px solid var(--border); }
+  .sb__name { font-size: 17px; font-weight: 800; line-height: 20px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sb__count { font-size: 13px; line-height: 20px; color: var(--text-soft); white-space: nowrap; }
+  /* X's own geometry, read off the live page at its 600px column rather than
+     eyeballed: banner 598x199, avatar 142 with a 4px ring, the banner's bottom
+     edge falling through the MIDDLE of the avatar (73 above it, 69 below), the
+     name 16px under the avatar and the bio 12px under that.
+
+     The previous header put a 40px avatar BESIDE the name on one line under a
+     96px strip. That is why it read as flat: not a font size, a different
+     shape. The type scale was genuinely a size down as well — name 17/20
+     against X's 20/24, handle 14 against 15, meta 14 against 15. */
+  .pf__banner {
+    height: 199px; transition: height .14s ease;
+    background: var(--banner-empty);
+    background-size: cover;
+    background-position: center;
+    /* No image by default. `bannerUrl` is a pbs.twimg.com address, and fetching
+       it would tell X's CDN who is being read; the reader is meant to work with
+       the network unplugged. With no image this is the flat grey X itself draws
+       for an account that has set no banner — measured rgb(51,54,57) on the
+       live page in its dark theme — and not the blue gradient that used to be
+       here, which was this reader's own invention and announced "banner" for an
+       account that has none. */
+  }
+  .pf__body { padding: 0 16px 12px; }
+  .pf__head { min-width: 0; }
+  /* `#profile` in the selector, and it is not decoration: the header reuses
+     .card__avatar, which is declared LATER in this file at the same
+     specificity (0,1,0). Source order decides ties, so a bare .pf__avatar lost
+     and the header avatar rendered at the card's 40px — measured, after the
+     first attempt drew a 40px disc floating in the middle of the 199px banner.
+     Any later rule that resizes this avatar has to carry an id too, or it will
+     lose the same way. */
+  #profile .pf__avatar {
+    display: block;
+    flex: 0 0 auto;
+    width: 142px; height: 142px;
+    /* Pulled up so the banner's bottom edge crosses it. The ring is the page
+       background, which is what makes the avatar read as cut out of the banner
+       rather than pasted on top of it. Border-box makes 142 the OUTER size, so
+       the disc inside is 134 — X's 142/134 exactly. */
+    margin-top: -73px;
+    border: 4px solid var(--bg);
+    position: relative;
+    font-size: 60px;
+  }
+  .pf__id { margin-top: 16px; min-width: 0; }
+  .pf__names { display: flex; align-items: center; gap: 4px; min-width: 0; }
+  .pf__name {
+    font-size: 20px; font-weight: 800; line-height: 24px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .pf__handle {
+    display: block;
+    color: var(--text-soft); font-size: 15px; line-height: 20px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  /* The header for a merged view of several accounts.
+     Deliberately NOT the shape of one account's card: no 199px banner and no
+     142px face passing through it. That arrangement reads as "this is
+     somebody", and this header's whole job is to say that it is not —
+     it names what is open instead of picking one of them. */
+  .pf__multi { padding-top: 16px; }
+  .pf__faces { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+  .pf__face {
+    width: 48px; height: 48px; border-radius: 999px;
+    overflow: hidden; flex: 0 0 auto; background: var(--bg);
+  }
+  .pf__face .card__avatar { width: 100%; height: 100%; }
+  .pf__more { color: var(--text-soft); font-size: 15px; }
+  .pf__bio {
+    margin: 12px 0 0; font-size: 15px; line-height: 20px;
+    white-space: pre-wrap; word-break: break-word; overflow-wrap: anywhere;
+    /* A bio is free text up to 2000 characters, and this header is chrome the
+       reader cannot scroll away. Four lines, ellipsised, with the whole text on
+       the element as its title: the alternative is a bio that permanently eats
+       the window the posts are read in. */
+    display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 4;
+    overflow: hidden; max-height: 80px;
+  }
+  .pf__bio a { color: var(--accent); }
+  .pf__meta, .pf__counts {
+    display: flex; flex-wrap: wrap; align-items: baseline;
+    margin-top: 6px; font-size: 15px; color: var(--text-soft);
+  }
+  /* Capped as a whole, on top of the per-field caps below: the header's height
+     has to be bounded by something, and a file that was hand-edited can put
+     anything at all in a location or a website. */
+  .pf__meta { gap: 6px; max-height: 84px; overflow: hidden; }
+  .pf__meta a { color: var(--accent); overflow-wrap: anywhere; }
+  .pf__lock { color: var(--text-soft); }
+  .pf__pin { font-size: 15px; }
+  /* The one meta field with no length cap of its own. */
+  .pf__loc {
+    display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+    overflow: hidden; max-height: 40px; overflow-wrap: anywhere;
+  }
+  .pf__dot { color: var(--text-faint); }
+  .pf__counts { gap: 14px; }
+  .pf__count b { color: var(--text); font-weight: 700; font-variant-numeric: tabular-nums; }
+  /* A count with a list behind it. Reset to look identical to the plain one —
+     X draws its counts as text, and a button here would read as a control
+     rather than as the sentence it is part of — then given the two things that
+     say it opens: a pointer, and an underline on hover. */
+  .pf__count--link {
+    border: 0; background: none; padding: 0; margin: 0;
+    font: inherit; color: inherit; cursor: pointer;
+  }
+  .pf__count--link:hover { text-decoration: underline; }
+  .pf__count--link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  /* There is deliberately no collapsed state any more.
+   *
+   * The header used to snap to a 52px row at 140px of scroll, with a hysteresis
+   * band so it would not oscillate on the boundary, and a row of rules here
+   * shrinking the avatar and hiding the bio to match. All of that existed to
+   * make one abrupt transition survivable. Now the header's height is a
+   * continuous function of scrollTop — see the #profile comment above — so
+   * there is no boundary to oscillate on, no threshold to tune, and nothing to
+   * keep in step with a class. The avatar keeps its CSS-driven size (avatarNode's
+   * third argument) only because it is what lets the stylesheet own 142px. */
+
+  /* -------------------------------------------------------------- tabs --- */
+  /* Three columns, and only the three the archive can actually fill — see the
+     banner comment in 55-tabs.js for why 转帖 and 文章 are absent. */
+  /* In the flow, so the three of them scroll away with the header they belong
+     to. They used to be `position: sticky` under the collapsing bar, which kept
+     the control on screen at all times — and on a timeline that is mostly short
+     posts, a permanent row of chrome above the first card is a row of chrome
+     over the content it was meant to label. X scrolls its own tabs away too.
+     `z-index` stays so a card passing under the collapsed bar is still under
+     the tabs' border while the header is leaving. */
+  #tabs {
+    position: relative; z-index: 2;
+    display: flex; align-items: stretch; gap: 2px;
+    width: 100%; padding: 0 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg);
+  }
+  #tabs[hidden] { display: none; }
+  #tabs .tab {
+    border: none; background: none; color: var(--text-soft);
+    font-size: 15px; font-weight: 600; padding: 12px 16px;
+    /* The 2px underline sits ON the row's border, the way X draws it. */
+    border-bottom: 2px solid transparent; margin-bottom: -1px;
+    transition: color .12s, background .12s;
+  }
+  #tabs .tab:hover { background: var(--bg-hover); color: var(--text); }
+  #tabs .tab.on { color: var(--text); border-bottom-color: var(--accent); }
+  #tabs .grow { flex: 1; }
+  #scope {
+    align-self: center; outline: none;
+    background: var(--bg-soft); border: 1px solid transparent; border-radius: 999px;
+    padding: 4px 10px; font-size: 13px; color: var(--text);
+  }
+  #scope:focus { border-color: var(--accent); }
+  #scope[hidden] { display: none; }
+
+  /* -------------------------------------------------------------- list --- */
+  /* `position: relative` here is what anchors the sticky bar to the scroller's
+     column rather than to the window. */
+  #view { flex: 1; display: none; min-height: 0; position: relative; }
+  #view.on { display: flex; justify-content: center; }
+  #scroller {
+    flex: 1; overflow-y: auto; overflow-x: hidden; position: relative;
+    max-width: var(--col); border-left: 1px solid var(--border); border-right: 1px solid var(--border);
+  }
+  /* position:relative is what makes `#spacer.offsetTop` — the distance from the
+     top of the scrolled content to the first card — the header's height, which
+     is the number the row placement has to subtract. See headSpace(). */
+  #spacer { position: relative; width: 100%; }
+  #win { position: absolute; left: 0; right: 0; top: 0; }
+
+  /* ---- the bar that stays while the profile leaves ----
+   *
+   * A layer, not a row: absolutely placed at the top of the scroller's column,
+   * present from the first pixel, with the profile scrolling underneath it. It
+   * carries no layout at all, which is the point — an earlier attempt grew it
+   * from zero height as the header shrank, and a bar whose height animates is a
+   * bar that moves everything below it. Nothing here has a height to animate.
+   *
+   * Two opacities, because X fades them at different times: the name arrives
+   * almost at once (it is what tells you where you are), the background only
+   * once the profile is nearly gone (so that over the banner it is text on the
+   * picture rather than a slab across it). Both are set by paintStickyBar. */
+  #stickyBar {
+    position: absolute; top: 0; left: 50%; transform: translateX(-50%);
+    width: 100%; max-width: var(--col); height: 53px; z-index: 3;
+    display: flex; align-items: center; gap: 8px; padding: 0 16px;
+    /* It is a label, not a control: a click anywhere on it belongs to whatever
+       is under it. */
+    pointer-events: none;
+  }
+  #stickyBar[hidden] { display: none; }
+  #stickyBar::before {
+    content: ''; position: absolute; inset: 0;
+    background: color-mix(in srgb, var(--bg) 88%, transparent);
+    backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--border);
+    opacity: var(--sb-bg, 0);
+  }
+  #stickyBar > * { position: relative; }
+  .sb__name { font-size: 17px; font-weight: 800; line-height: 20px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; opacity: var(--sb-text, 0); }
+  .sb__count { font-size: 13px; line-height: 20px; color: var(--text-soft); white-space: nowrap; opacity: var(--sb-text, 0); }
+
+  /* -------------------------------------------------------------- card --- */
+  .card {
+    position: absolute; left: 0; right: 0; top: 0;
+    padding: 12px 16px 4px; border-bottom: 1px solid var(--border);
+    background: var(--bg); cursor: pointer;
+    display: flex; gap: 12px; align-items: flex-start;
+    /* `contain` keeps a card's layout from reaching outside itself, so measuring
+       one is cheap and cannot be perturbed by its neighbours. The cards are
+       moved with transforms rather than `top` so that a correction is a
+       compositor operation instead of a layout pass. */
+    contain: layout paint style;
+    will-change: transform;
+  }
+  .card:hover { background: var(--bg-hover); }
+  .card__avatar {
+    width: 40px; height: 40px; border-radius: 50%; flex: 0 0 40px;
+    display: flex; align-items: center; justify-content: center;
+    color: #fff; font-weight: 700; font-size: 17px; overflow: hidden;
+    user-select: none;
+  }
+  .card__avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .card__body { flex: 1; min-width: 0; }
+  .card__head {
+    display: flex; align-items: baseline; gap: 4px; flex-wrap: wrap;
+    font-size: 15px; line-height: 20px; min-width: 0;
+  }
+  .card__name { font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 60%; }
+  .card__handle, .card__dot, .card__time { color: var(--text-soft); font-weight: 400; }
+  .card__handle { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .card__verified { color: var(--accent); flex: 0 0 auto; }
+  .card__text {
+    margin: 2px 0 0; font-size: 15px; line-height: 20px;
+    white-space: pre-wrap; word-break: break-word; overflow-wrap: anywhere;
+  }
+  .card__text a { color: var(--accent); }
+  .card__text .tag, .card__text .who { color: var(--accent); }
+  .card__text.void { color: var(--text-faint); font-style: italic; }
+  .card.loading .card__text, .card.loading .card__name { color: var(--text-faint); }
+  .card.failed .card__text { color: var(--danger); font-style: italic; }
+
+  .badges { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 4px; }
+  .badge {
+    font-size: 11px; padding: 1px 8px; border-radius: 999px;
+    border: 1px solid var(--border-strong); color: var(--text-soft); background: var(--bg);
+  }
+  .badge.reply { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
+  .badge.quote { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
+  .badge.poll  { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
+  .badge.edit  { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
+  .badge.dead  { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, transparent); }
+  .badge.media { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent); }
+
+  /* ------------------------------------------------------------- media --- */
+  /* The grid's height comes from an aspect-ratio set per card, and the cells
+     fill it. That is not decoration: the virtual scroller measures card heights,
+     and an image that grew the card when it loaded would feed a moving number
+     into the table. Fixed up front, the height is known before the bytes arrive. */
+  .grid {
+    margin-top: 10px; display: grid; gap: 2px;
+    border-radius: var(--radius); overflow: hidden;
+    border: 1px solid var(--border);
+    aspect-ratio: 16 / 9;
+    grid-template-columns: 1fr;
+    grid-template-rows: 1fr;
+    max-height: 510px;
+  }
+  .grid.n2 { grid-template-columns: 1fr 1fr; }
+  .grid.n3 { grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; }
+  .grid.n4 { grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; aspect-ratio: 1 / 1; }
+  .grid.n3 .cell:first-child { grid-row: span 2; }
+  .cell {
+    position: relative; background: var(--bg-soft); overflow: hidden;
+    display: flex; align-items: center; justify-content: center;
+    min-width: 0; min-height: 0;
+  }
+  .cell img, .cell video { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .cell .ph { font-size: 11px; color: var(--text-faint); text-align: center; padding: 6px; }
+  .cell .play {
+    position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+    width: 44px; height: 44px; border-radius: 50%; background: rgba(0,0,0,.65);
+    color: #fff; display: flex; align-items: center; justify-content: center;
+    font-size: 15px; pointer-events: none;
+  }
+  .cell .more, .cell .dur {
+    position: absolute; bottom: 8px; background: rgba(0,0,0,.65);
+    color: #fff; border-radius: 999px; padding: 1px 9px; font-size: 12px; pointer-events: none;
+  }
+  .cell .more { right: 8px; }
+  .cell .dur { left: 8px; }
+
+  /* -------------------------------------------------------------- poll --- */
+  .poll { margin-top: 10px; border: 1px solid var(--border-strong); border-radius: var(--radius); padding: 10px 12px; }
+  .poll ol { margin: 0; padding-left: 20px; font-size: 14px; }
+  .poll .note { margin: 6px 0 0; font-size: 12px; color: var(--text-soft); }
+
+  /* ---------------------------------------------------------- actions --- */
+  /* The counts are what X reported when the post was captured. There is nothing
+     behind them — this archive has no record of who liked a post — so they are
+     not buttons: no hover state, and every icon is the same grey X uses on a
+     post you have not interacted with. A pink heart or green repost arrows would
+     claim an interaction that was never recorded, which is the same class of lie
+     as a button that does nothing.
+     Clicking the row opens the post, exactly like clicking anywhere else on the
+     card. A dead patch inside a clickable card just reads as broken. */
+  .acts {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-top: 10px; padding-right: 8px; font-size: 13px; color: var(--text-soft);
+    max-width: 460px; user-select: none;
+  }
+  .act { display: flex; align-items: center; gap: 5px; }
+  .act i { font-style: normal; font-size: 15px; }
+  .act.none { visibility: hidden; }
+  /* 分享 is a real button — the only one in the row — and it has to look like
+     the spans beside it, because the row is reproducing X's. A control that
+     announced itself as a control would break the shape it exists to match. */
+  .act[type="button"] {
+    background: none; border: 0; padding: 0; margin: 0;
+    font: inherit; color: inherit; cursor: pointer;
+  }
+  .act[type="button"]:hover { color: var(--accent); }
+  .act[type="button"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  /* ------------------------------------------------------------- dialogs -- */
+  dialog {
+    border: 1px solid var(--border); border-radius: var(--radius); padding: 0;
+    background: var(--bg); color: var(--text); max-width: var(--col); width: 92vw;
+    max-height: 92vh; overflow: auto;
+  }
+  dialog::backdrop { background: rgba(0,0,0,.65); }
+  .dlg__bar {
+    position: sticky; top: 0; z-index: 2; display: flex; align-items: center; gap: 10px;
+    padding: 10px 14px; border-bottom: 1px solid var(--border);
+    background: color-mix(in srgb, var(--bg) 88%, transparent); backdrop-filter: blur(12px);
+  }
+  .dlg__bar h2 { margin: 0; font-size: 16px; font-weight: 800; }
+  .dlg__body { padding: 14px 16px 20px; }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; font-size: 12.5px; margin: 0; }
+  .kv dt { color: var(--text-soft); white-space: nowrap; }
+  .kv dd { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
+  .sect { margin-top: 18px; border-top: 1px solid var(--border); padding-top: 12px; }
+  .sect h3 { margin: 0 0 8px; font-size: 13px; color: var(--text-soft); font-weight: 700; }
+
+  /* ---- the post page's two columns ----
+   *
+   * The post and its replies read top to bottom in the main column; everything
+   * ABOUT the record sits to the right, where it can be ignored. This is the
+   * one dialog wider than the reading column, because it holds two of them.
+   *
+   * The border and the top margin that `.sect` gives every section are switched
+   * off in the side column: it is one narrow stack, and a rule across each of
+   * its four sections turns a column of reference notes into a stack of boxes.
+   * The first section's rule is kept, so there is still a line between the post
+   * and the record it came from. */
+  /* ---- the post page ----
+   *
+   * It takes the place of the timeline rather than covering it, so it is a flex
+   * sibling of #view with the same flex:1, and `body.postOpen` hides the one
+   * and shows the other. No dialog: there is no backdrop to click and nothing
+   * behind it to see.
+   *
+   * Two columns, and only now is there room for them. The post and its replies
+   * are the reading column at the same 600px the timeline uses — a conversation
+   * read in the same measure as the list it came from; the record's own detail
+   * goes in a column to the right, which is the space X leaves empty on a post
+   * page. */
+  #postPage { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+  #postPage[hidden] { display: none; }
+  body.postOpen #view { display: none; }
+
+  /* ---- the roster page ----
+   * Same shape as the post page, and the same rule about who is hidden: a
+   * sibling of #view taking its place rather than a sheet over it. Only the tab
+   * row and the row spacing are new; everything else is .pp__* reused, because
+   * two pages that differ only in what they list should not drift apart. */
+  #rosterPage { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+  #rosterPage[hidden] { display: none; }
+  body.rosterOpen #view { display: none; }
+  .rp__tabs {
+    display: flex; align-items: center; gap: 2px;
+    padding: 0 16px; border-bottom: 1px solid var(--border);
+    max-width: var(--ppcol); width: 100%; margin: 0 auto;
+  }
+  /* The same tab the timeline uses, restated. `#tabs .tab` is scoped to that
+     row and these are not in it, so the rule has to exist twice — the
+     alternative is an unscoped .tab, which is how one page's tab quietly
+     becomes another page's. */
+  .rp__tabs .tab {
+    border: none; background: none; color: var(--text-soft);
+    font-size: 15px; font-weight: 600; padding: 12px 16px;
+    border-bottom: 2px solid transparent; margin-bottom: -1px; cursor: pointer;
+  }
+  .rp__tabs .tab:hover { color: var(--text); }
+  .rp__tabs .tab.on { color: var(--text); border-bottom-color: var(--accent); }
+  #rosterFilter {
+    flex: 0 1 260px; min-width: 120px;
+    background: var(--bg-soft); border: 1px solid transparent; border-radius: 999px;
+    padding: 5px 12px; font-size: 13px; color: var(--text); outline: none;
+  }
+  #rosterFilter:focus { border-color: var(--accent); background: var(--bg); }
+  #rosterFilter::placeholder { color: var(--text-faint); }
+  .rp__scroll { flex: 1; min-height: 0; overflow-y: auto; }
+  .rp__list { max-width: var(--ppcol); width: 100%; margin: 0 auto; padding: 0 16px 40px; }
+  .rp__row { display: flex; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--border); }
+  .rp__who { min-width: 0; }
+  .rp__name { font-weight: 700; }
+  .rp__handle { color: var(--text-faint); }
+  .rp__bio {
+    margin: 2px 0 0; color: var(--text-soft); font-size: 13.5px;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  }
+  .rp__note { padding: 24px 4px; color: var(--text-soft); }
+  .pp__bar {
+    display: flex; align-items: center; gap: 12px;
+    padding: 10px 16px; border-bottom: 1px solid var(--border);
+    max-width: var(--ppcol); width: 100%; margin: 0 auto;
+  }
+  .pp__bar h2 { margin: 0; font-size: 17px; font-weight: 800; }
+  .pp__where { font-size: 12.5px; color: var(--text-faint); }
+  .pp__scroll { flex: 1; overflow-y: auto; overflow-x: hidden; }
+  /* Wide enough for 600 of conversation plus the column beside it, which is
+     what the timeline's own 600 was not. */
+  .pp__body { max-width: var(--ppcol); width: 100%; margin: 0 auto; padding: 0 0 40px; }
+  .tp { display: flex; align-items: flex-start; gap: 24px; padding: 0 16px; }
+  .tp__main { flex: 1 1 auto; min-width: 0; max-width: var(--col); }
+  /* The record's column does not scroll away with the conversation. It is the
+     reference material for whatever post is on screen, so it stays on screen
+     while the thread moves past it — which is the point of putting it in the
+     margin rather than in the flow. Its own overflow is a backstop: twelve rows
+     and three buttons fit anywhere, but a record with eight media items is a
+     column taller than a laptop window.
+   *
+   * `100vh - 150px` rather than `100%`: a sticky element's percentage resolves
+     against its containing block, which here is `.tp` — as tall as the whole
+     thread — so `100%` would mean "as tall as the page" and never scroll. */
+  .tp__side {
+    flex: 0 0 300px; min-width: 0;
+    position: sticky; top: 0;
+    max-height: calc(100vh - 150px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+  .tp__side .sect { margin-top: 0; border-top: 0; padding-top: 0; }
+  .tp__side .sect + .sect { margin-top: 20px; }
+  /* Room to breathe. `.kv` in the timeline is a dense two-column list because
+     it sits under a post that is the thing being read; here the rows are the
+     only content in the margin and 3px apart they read as a spreadsheet. */
+  .tp__side .kv { gap: 9px 14px; font-size: 13px; }
+  .tp__main .sect .card { margin-top: 8px; }
+  .tp__note { margin: 6px 0 0; font-size: 12.5px; color: var(--text-faint); }
+  .tp__note--above { margin: 0 0 10px; }
+  .tp__label { margin: 14px 0 0; font-size: 12.5px; color: var(--text-soft); font-weight: 700; }
+
+  /* The thread above the focal post, and the focal post itself.
+   *
+   * A rule down the same edge for both, in two colours: the ancestors in the
+   * border colour, dimmed, because they are the context; the post that was
+   * opened in the accent, because it is what the page is for. Coming down the
+   * column the eye lands on the colour change and knows where it is. */
+  .tp__main .card--ancestor { opacity: .8; border-left: 2px solid var(--border-strong); }
+  .tp__main .card--focal { border-left: 2px solid var(--accent); }
+
+  /* Narrow: one column, with the record's detail BELOW the conversation rather
+     than squeezed beside it. 900 is the two columns at their narrowest. */
+  @media (max-width: 900px) {
+    .tp { flex-direction: column; gap: 0; }
+    .tp__main { max-width: none; }
+    .tp__side { flex: 1 1 auto; width: 100%; max-width: none; margin-top: 18px; border-top: 1px solid var(--border); padding-top: 12px; }
+    .tp__side .sect + .sect { margin-top: 18px; }
+  }
+
+  #lightbox { max-width: 96vw; width: 96vw; background: transparent; border: none; }
+  #lightbox .stage {
+    position: relative; display: flex; align-items: center; justify-content: center;
+    min-height: 60vh; background: #000; border-radius: var(--radius); overflow: hidden;
+  }
+  #lightbox .stage img, #lightbox .stage video { max-width: 100%; max-height: 82vh; display: block; }
+  #lightbox .nav {
+    position: absolute; top: 50%; transform: translateY(-50%);
+    width: 44px; height: 44px; border-radius: 50%; border: none;
+    background: rgba(0,0,0,.6); color: #fff; font-size: 20px; line-height: 1;
+  }
+  #lightbox .nav.prev { left: 10px; }
+  #lightbox .nav.next { right: 10px; }
+  #lightbox .cap { color: #fff; text-align: center; padding: 10px; font-size: 13px; }
+  #lightbox .close { position: absolute; top: 10px; right: 10px; }
+  #lightbox .alt { color: #c9ced3; text-align: center; font-size: 12.5px; padding: 0 16px 12px; max-width: 700px; margin: 0 auto; }
+</style>
+</head>
+<body>
+
+<div id="shell">
+
+<aside id="side">
+  <div class="side__brand">归档阅读器</div>
+  <nav class="side__nav">
+    <a class="side__link" id="navTimeline" href="#/">全部时间线</a>
+    <a class="side__link" id="navSearch" href="#/search">检索</a>
+    <a class="side__link" id="navMe" href="#/me">我</a>
+  </nav>
+  <!-- One row per ACCOUNT, not per file: two exports of one handle are one
+       account, and listing them twice would be listing the same person twice.
+       Filled by renderAccounts() in 55-tabs.js. -->
+  <div class="side__accts" id="sideAccts"></div>
+  <div class="side__foot">
+    <label class="filelabel btn" for="pick" id="pickLabel">打开归档</label>
+  </div>
+</aside>
+
+<div id="main">
+
+<!-- One file input for the whole page, because "open" and "add" are the same
+     gesture and only the state decides which one it is: with nothing open it
+     replaces, with something open it appends. The handler is in 70-page.js. -->
+<input type="file" id="pick" accept=".zip,.json,application/zip,application/json" multiple>
+
+<div class="stats" id="stats" hidden></div>
+<!-- The report's own control line. A SIBLING of #report and not a child:
+     setReport() assigns #report's innerHTML wholesale, so anything living in
+     there is destroyed the moment a file is opened. This is the same trap
+     #connections documents against #list. -->
+<div id="reportBar" hidden>
+  <span id="reportSummary"></span>
+  <span class="grow"></span>
+  <button class="btn" id="btnReport" type="button">收起</button>
+</div>
+<div id="report"></div>
+<div id="notice"></div>
+<div id="prog">
+  <div class="track"><div class="fill" id="progFill"></div></div>
+  <div class="label"><span id="progText"></span><span class="grow"></span><button class="btn" id="progStop">停止</button></div>
+</div>
+
+<!-- The search box and the date jump, which used to sit in the toolbar. They
+     belong to 检索 and nowhere else: on the timeline there is nothing to search
+     FROM, and a search box on a page of results is a control for a question
+     nobody asked. Shown by `body.view-search`, in the stylesheet. -->
+<div id="searchbar">
+  <input id="q" type="search" placeholder="搜索正文 / 作者 / ID / 链接" autocomplete="off" spellcheck="false" disabled>
+  <input id="when" type="date" disabled title="跳到某一天">
+</div>
+
+<!-- The profile and the tabs live INSIDE the scroller, which is what makes the
+     header and the timeline one plane: scrolling pushes the banner, the avatar
+     and the bio up and out exactly as it pushes the cards, because they are all
+     in the same scrolled box. The tabs stick below the sticky bar once they
+     reach it.
+
+     `#stickyBar` is a sibling of the scroller and not a child, because it is a
+     LAYER over the top of it rather than a row in the flow: it is on screen from
+     the first pixel, transparent over the banner, and the profile passes under
+     it. Put inside the scroller it would scroll away with everything else. -->
+<div id="view">
+  <div id="scroller">
+    <div id="profile" hidden></div>
+    <div id="tabs" hidden>
+      <button type="button" class="tab on" data-tab="posts">帖子</button>
+      <button type="button" class="tab" data-tab="replies">回复</button>
+      <button type="button" class="tab" data-tab="media">媒体</button>
+      <span class="grow"></span>
+      <select id="scope" title="「帖子」这一栏显示什么">
+        <option value="all">所有</option>
+        <option value="posts">仅帖子</option>
+      </select>
+    </div>
+    <div id="spacer"><div id="win"></div></div>
+  </div>
+  <div id="stickyBar" hidden>
+    <span class="sb__name" id="sbName"></span>
+    <span class="sb__count" id="sbCount"></span>
+  </div>
+</div>
+
+<!-- 我 — the accounts that are open, one card each.
+     It is the entry point as well as a view: with no archive open the timeline
+     and the search are both empty, and this is the only page with anything on
+     it to press. `viewFor()` in 70-page.js says so, which is why the address
+     bar cannot leave the reader stranded on a blank column. -->
+<div id="meView">
+  <!-- The empty state, and the reason this element kept its old id: the whole
+       window is a drop target, clicking it opens the picker, and three places
+       in 20-loading.js switch it on and off. What changed is its contents. -->
+  <div id="drop">
+    <div>
+      <div class="big">还没有任何账号</div>
+      <div class="me__empty">
+        <label class="filelabel btn primary" for="pick">打开本地归档</label>
+        <button class="btn" id="btnConnect" type="button" disabled
+                title="把归档托管到 GitHub，别人也能打开看——下一轮">从 GitHub 连一个（下一轮）</button>
+      </div>
+    </div>
+  </div>
+  <!-- `hidden` in the markup and not only in refreshMe(): the first paint
+       happens before the script at the end of the body runs, and an empty
+       scroller sharing the page with the empty state is a band of nothing under
+       it for that one frame. -->
+  <div class="me__scroll" id="meScroll" hidden>
+    <div class="me__list" id="meList"></div>
+  </div>
+  <!-- The toolbar, rehomed from the old top bar. It lives here rather than at
+       the bottom of the sidebar because a phone has no sidebar: one copy of
+       each control that both layouts can reach. -->
+  <div class="me__tools">
+    <span class="zone" id="zone"></span>
+    <span class="grow"></span>
+    <button class="btn" id="btnZone" disabled title="在归档所在时区和本机时区之间切换">时区</button>
+    <button class="btn" id="btnTheme" title="跟随系统 → 浅色 → 深色"></button>
+    <button class="btn" id="btnAvatar" disabled title="只管别人的头像。你自己的跟着归档走，不用联网">他人头像</button>
+    <button class="btn" id="btnVerify" disabled>完整性检查</button>
+    <button class="btn" id="btnExport" disabled title="把现在开着的归档合并成一个文件写出来">合并导出</button>
+  </div>
+</div>
+
+<!-- The post page: a page, not a dialog.
+     X opens a post at its own address and the timeline is replaced by it, with
+     a back button where the timeline's header was. A modal over the list is a
+     different thing — it says "this is a detail about what you were looking
+     at", and the two columns it wants do not fit in a box laid over a column.
+     With the whole window it gets the reading column and, to its right, a
+     column for the record itself, which is where X leaves empty space. -->
+<div id="postPage" hidden>
+  <div class="pp__bar">
+    <button class="btn" id="btnPostBack" type="button">返回</button>
+    <h2>帖子</h2>
+    <span class="grow"></span>
+    <span class="pp__where" id="ppWhere"></span>
+  </div>
+  <div class="pp__scroll" id="ppScroll">
+    <div class="pp__body" id="postBody"></div>
+  </div>
+</div>
+
+<!-- The follow / follower roster: a page, for the same reason the post page is
+     one. X puts these two lists behind the two numbers on a profile, and the
+     numbers are the only door — which is what this copies. -->
+<div id="rosterPage" hidden>
+  <div class="pp__bar">
+    <button class="btn" id="btnRosterBack" type="button">返回</button>
+    <h2 id="rosterHeading">名单</h2>
+    <span class="grow"></span>
+    <span class="pp__where" id="rosterWhere"></span>
+  </div>
+  <div class="rp__tabs" id="rosterTabs">
+    <button type="button" class="tab on" data-list="following">正在关注</button>
+    <button type="button" class="tab" data-list="followers">关注者</button>
+    <span class="grow"></span>
+    <input id="rosterFilter" type="search" placeholder="筛选名字 / @用户名 / 简介"
+           autocomplete="off" spellcheck="false">
+  </div>
+  <div class="rp__scroll" id="rosterScroll">
+    <div class="rp__list" id="rosterList"></div>
+  </div>
+</div>
+
+</div><!-- /#main -->
+</div><!-- /#shell -->
+
+<!-- The phone navigation. A sibling of #shell rather than a fixed bar over it,
+     so it takes its own height out of the column and cannot cover the last
+     thing in the scroller. The two are the same three destinations; the
+     stylesheet decides which one is drawn, and never both. -->
+<nav id="tabbar">
+  <a class="tabbar__t" id="tabTimeline" href="#/">全部时间线</a>
+  <a class="tabbar__t" id="tabSearch" href="#/search">检索</a>
+  <a class="tabbar__t" id="tabMe" href="#/me">我</a>
+</nav>
+
+<dialog id="lightbox">
+  <div class="stage" id="lbStage"></div>
+  <p class="alt" id="lbAlt"></p>
+  <div class="cap" id="lbCap"></div>
+</dialog>
+<dialog id="askRemote">
+  <div class="dlg__body">
+    <h2 style="margin:0 0 8px;font-size:16px">要加载别人的真实头像吗？</h2>
+    <!-- This said "头像文件不在归档里" without qualification, which stopped
+         being true the day the account's OWN picture started travelling inside
+         the archive. That one is drawn with no network and is not affected by
+         this button either way; what is left here is everybody else's face. -->
+    <p style="margin:0 0 8px"><b>你自己账号的头像跟着归档走</b>，不联网也有，也不受这个按钮管。</p>
+    <p style="margin:0 0 8px">这个按钮管的是<b>别人的</b>头像 —— 推文作者、关注/粉丝名单里的人。
+      他们的头像文件不在归档里，只能从 <code>pbs.twimg.com</code> 联网取。</p>
+    <p style="margin:0 0 12px"><b>打开之后，每次翻归档都会向 X 的 CDN 发请求</b>——等于告诉它你正在看这份备份、看了哪些人。这就是它默认关着的原因。</p>
+    <p style="margin:0 0 14px">关掉随时可以点同一个按钮，立刻恢复成字母头像。</p>
+    <button class="btn primary" id="askYes">我知道，打开</button>
+    <button class="btn" data-close>不用了</button>
+  </div>
+</dialog>
+
+<script>
