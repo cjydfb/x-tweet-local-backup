@@ -683,13 +683,12 @@ function reRenderAll() {
      the offset renderWindow subtracts — laying out the rows against the height
      of the previous file's header puts every card in the wrong place for a
      frame. */
-  /* The same two calls commitSources makes, in the same order. Drawing only
-     the profile left the account-list header — the one for several different
-     accounts open at once — off the page for good: it is authored by
-     renderAccountList alone, so switching 他人头像 or 时区 with two accounts
-     open wiped the header and the sticky bar until every file was closed and
-     reopened. */
-  if (!renderProfile(archive.profile)) renderAccountList(archive.accounts);
+  /* The same call commitSources makes. Drawing only the profile left the
+     account-list header — the one for several different accounts open at once —
+     off the page for good: it is authored by renderAccountList alone, so
+     switching 他人头像 or 时区 with two accounts open wiped the header and the
+     sticky bar until every file was closed and reopened. */
+  paintHeader(parseHash());
   paintStickyBar();
   renderWindow(true);
   statsLine();
@@ -955,6 +954,11 @@ async function applyRouteEffects(route) {
        post still lights the account the post came from, even though the lookup
        it does on the way can fail. */
     paintAccounts();
+    /* And the chrome the address asks for, after everything that could have
+       drawn one. `paintAccounts` is not a header call, but it is the last thing
+       to run before this and it redraws the sidebar from the same route — the
+       two belong together. */
+    paintHeader(route);
   }
 }
 
@@ -1022,6 +1026,11 @@ async function routeEffects(route) {
   if (list.mode === 'search') { el.q.value = ''; timelineMode(); }
   else if (el.q.value.length > 0) el.q.value = '';
   setAccountFilter(null);
+  /* `#/` is named 全部时间线, so a tab left over from the last visit — 回复, or
+     帖子/仅帖子 — would show a subset under an address that promises all of it.
+     Guarded, because selectTab rebuilds a filter and there is nothing to
+     rebuild when the filter is already the default. */
+  if (list.tab !== 'posts' || list.scope !== 'all') void selectTab('posts', 'all');
   /* Last, for the same reason as the account branch above. */
   if (route.name === 'unknown') routeMissing(route);
 }

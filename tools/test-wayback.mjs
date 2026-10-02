@@ -819,8 +819,9 @@ function envelopeFor(id) {
       entities: { urls: [], hashtags: [], mentions: [] }
     },
     // The name carries the post id so a test can tell WHICH payload's profile
-    // card came out — they differ per crawl in the real thing, which is the
-    // whole reason the card is not simply taken from the first one.
+    // card came out — they differ per crawl in the real thing. Only the first
+    // payload that names the account has its card offered (see the card block
+    // in wayback.js); the store decides whether to keep it.
     includes: { users: [{ id: '9', username: 'fcjdfb', name: 'cjy ' + id, profile_image_url: null }], media: [], tweets: [] }
   };
 }
@@ -867,7 +868,11 @@ function world(options) {
       if (opts.fetchFails === true) return { ok: false, error: 'HTTP 404' };
       const id = /status\/(\d+)/.exec(url);
       if (id === null) return { ok: false, error: 'no id' };
-      return { ok: true, value: envelopeFor(id[1]) };
+      const value = envelopeFor(id[1]);
+      // A payload that names somebody else, so a test can make the account's
+      // card appear only on a later post.
+      if (opts.profileMissingAt === state.fetches.length) value.includes.users = [];
+      return { ok: true, value: value };
     },
     writeRecord: async (record) => {
       state.writeCount++;
@@ -1133,28 +1138,39 @@ await check('each outcome bumps its own counter and no other', async () => {
   assert.deepEqual(keys, ['waybackEnriched', 'waybackImported', 'waybackImported']);
 });
 
-await check('the card that ends up stored is the one from the newest crawl', async () => {
-  // Three posts, three crawls, three different cards. The rows are ordered
-  // oldest post first, so "the first card" would be the account on the day it
-  // started posting — measured on a real one, 0 followers and 1 post.
+await check('the card is offered to the store once per run, from the first payload that names the account', async () => {
+  // Three posts, three crawls, three different cards. The payloads disagree
+  // about the profile (in the real thing, measured: 0, 407 and 810 followers)
+  // but only the first card is offered — the store keeps the first card an
+  // account ever gets, so re-deriving one for every post would be work whose
+  // result nothing consumes.
   const w = world({});
   await run(w);
-  assert.ok(w.state.profiles.length > 0, 'no card was stored at all');
-  const last = w.state.profiles[w.state.profiles.length - 1];
-  assert.equal(last.name, 'cjy 3', 'the newest crawl did not win');
-  assert.equal(w.state.profileCalls, w.state.profiles.length);
+  assert.equal(w.state.profileCalls, 1, 'the card was re-derived for later posts');
+  assert.equal(w.state.profiles.length, 1);
+  assert.equal(w.state.profiles[0].name, 'cjy 1', 'the first payload did not supply the card');
 });
 
-await check('an older crawl never overwrites a newer one', async () => {
-  // Deliberately out of order: oldest, NEWEST, then one in between. Written as
-  // "newest first" this test passed against code that simply took the first
-  // card it ever saw, because there the two rules agree — so the ordering is
-  // the part that makes it a test.
+await check('crawl timestamps no longer decide anything: the first row wins even when it is the oldest crawl', async () => {
+  // Deliberately out of order: oldest crawl first, NEWEST second, one in
+  // between third. A comparison of crawl times would end on 'cjy 3'; under the
+  // one-rule store the engine stops after the first card it can derive. If a
+  // timestamp comparison ever creeps back into the engine without a consumer,
+  // this is the test that says so.
   const w = world({ rows: [SNAPSHOTS[0], SNAPSHOTS[2], SNAPSHOTS[1]] });
   await run(w);
-  assert.equal(w.state.profileCalls, 2, 'the older crawl that came last still wrote');
-  assert.equal(w.state.profiles[1].name, 'cjy 3', 'the newest crawl did not end up as the card');
-  assert.equal(w.state.profiles[1].name, w.state.profiles[w.state.profiles.length - 1].name);
+  assert.equal(w.state.profileCalls, 1, 'a later crawl still re-derived the card');
+  assert.equal(w.state.profiles[0].name, 'cjy 1', 'the first payload did not supply the card');
+});
+
+await check('when no payload names the account yet, the run keeps looking exactly until one does', async () => {
+  // Post 1's payload names somebody else, post 2's names the account, post 3's
+  // would name it again. The card is derived on post 2 and not touched again.
+  const w = world({ profileMissingAt: 1 });
+  await run(w);
+  assert.equal(w.state.profileCalls, 1, 'the card was not offered exactly once');
+  assert.equal(w.state.profiles.length, 1);
+  assert.equal(w.state.profiles[0].name, 'cjy 2');
 });
 
 await check('a card the source cannot supply costs nothing', async () => {

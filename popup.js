@@ -2156,7 +2156,23 @@ async function buildTweetsJson(options) {
   } catch (err) {
     throw new Error(t('errProfileUnreadable', [describe(err)]));
   }
-  const profile = profiles.length > 0 ? profiles[0] : null;
+  /* WHICH card names the archive and supplies its face.
+   *
+   * listProfiles returns most-recently-seen first, and an imported card is
+   * stamped with the IMPORT time — so a card taken off a crawl of the account's
+   * first day (measured on a real one: 0 followers, 1 post) sorts ahead of the
+   * card this browser captured today, even though its contents are years old.
+   * The export should describe the account as this browser knows it, so a card
+   * the browser captured itself wins over any import; only an archive whose
+   * every card came from the Archive falls back to the newest of those, which
+   * still beats leaving the header empty. */
+  let profile = null;
+  for (const row of profiles) {
+    const via = row && row.source && typeof row.source.operationName === 'string'
+      ? row.source.operationName : '';
+    if (via !== 'WaybackImport') { profile = row; break; }
+  }
+  if (profile === null && profiles.length > 0) profile = profiles[0];
   if (profile !== null) {
     const face = await avatarDataUrl(state.db, profile);
     if (face !== null) profile.avatarData = face;

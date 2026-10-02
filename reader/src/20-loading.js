@@ -1164,19 +1164,12 @@ function commitSources() {
   renderAccounts();
 
   /* After applyZone: the header's join date is rendered in the display zone. */
+  /* The chrome follows the address, not the file set — see paintHeader. This
+     runs after `renderAccounts()` has already applied the address once, so it
+     is deliberately painting the same answer a second time rather than asking
+     anything new; paintHeader is written to be safe to repeat. */
   el.tabs.hidden = false;
-  /* One card, or the list of them. The notice is only for the case where
-     neither could be drawn — a file whose `profile` is present but unusable, or
-     an archive old enough to have none. */
-  if (!renderProfile(archive.profile) && !renderAccountList(archive.accounts)) {
-    addNotice(accountProfiles().length > 0
-      ? '<b>这些归档里的账号资料读不出来。</b>信封里有一个 <code>profile</code> 字段，但它不是一个完整的对象——' +
-        '文件可能被手改过或者截断了。帖子本身不受影响。'
-      : '<b>这份归档里没有账号资料（<code>profile</code>），所以上面没有资料卡。</b>' +
-        '这是较早版本的扩展导出的文件；用新版扩展重新导出一次，就会带上名称、简介和关注数。' +
-        '帖子、媒体和下面的统计都不受影响。',
-      'warn');
-  }
+  paintHeader(parseHash());
 
   /* Compose before sizing: the height table is built from the list, so the list
      has to be settled first. clearIndexState left `ids` null, which is the whole

@@ -1334,7 +1334,7 @@ const MAX_CONSECUTIVE_FAILURES = 5;
  *   readRecord(id)    the stored row for a post id, or null
  *   fetchJson(url)    { ok: true, value } or { ok: false, error }
  *   writeRecord(rec)  stores it; { existed } says whether a row was already there
- *   saveProfile(card) stores the account's profile card, once per run
+ *   saveProfile(card) stores the account's profile card, at most once per run
  *   save()            persists `job` before the next risky step
  *   bump(bumps, err)  lifetime counters
  *   sleep(ms)         politeness delay
@@ -1358,10 +1358,10 @@ export async function runImportPass(options) {
   const rows = options.rows;
   const deps = options.deps;
 
-  /* Local to this run on purpose — see where they are used. `profileFrom` is the
-     crawl timestamp of the card already taken, null for none. */
-  let profileFrom = null;
-  let profileGaveUp = false;
+  /* Local to this run on purpose — see where it is used. `profileTaken` is true
+     once a payload has named the account; the card is derived then and never
+     again. */
+  let profileTaken = false;
 
   const stopped = (reason) => ({
     reason: reason,
@@ -1447,31 +1447,28 @@ export async function runImportPass(options) {
 
     /* The account's card, which rides in the very bytes already in hand.
      *
-     * WHICH payload's card is the whole question here, because they disagree.
-     * Measured on three real snapshots of one account, its follower count read
-     * 0, 407 and 810 — each payload holds the profile exactly as it stood when
-     * that crawl ran. The first row of a run is the OLDEST post in the list, so
-     * taking the first card offers up the account as it looked on the day it
-     * started posting: 0 followers, 1 post.
+     * The payloads disagree with each other — measured on three real snapshots
+     * of one account, its follower count read 0, 407 and 810 — but WHICH one
+     * wins is not this engine's decision. The store takes a card only when the
+     * account has none (see saveProfile in background.js), so the first card
+     * offered is the one that lands and no later crawl, older or newer, can
+     * replace it. A run whose first payload is the account's first day may
+     * therefore offer the store a 0-follower card; that is a true sighting of
+     * the account, and a visit to its own page refreshes the card from live
+     * bytes. Comparing crawl timestamps here bought nothing the store would
+     * honour, so it is not done.
      *
-     * So a card is taken whenever the crawl it came from is newer than the one
-     * already taken. CDX timestamps are always 14 digits, so comparing them as
-     * strings orders them. Usually that means most items re-save the card,
-     * which is one IndexedDB write next to a network request per item, and at
-     * the end of a full run what stands is the newest crawl in the list.
+     * One card is derived per run, and only until one has been found: every
+     * post after that carries the same account, so re-deriving it would only
+     * produce a card the store refuses — or one the validator refuses again.
      *
-     * `profileGaveUp` is the other half: a card the validator refuses is a card
-     * it will refuse again, so that is not retried once per post for the rest
-     * of the run.
-     *
-     * Neither flag is persisted on the job — a resumed run starts its own
-     * comparison, and the most that can come of it is a slightly older card
-     * after an interrupted run, which is still a true sighting of the account.
+     * The flag is not persisted on the job — a resumed run starts its own
+     * search, and the most that can come of it is one more card offered to a
+     * store that already has one, which is a refusal and not a downgrade.
      *
      * Deliberately not counted as a post and never allowed to fail the item:
      * the card is a bonus on top of the record already in hand. */
-    const crawl = typeof snapshot.timestamp === 'string' ? snapshot.timestamp : '';
-    if (!profileGaveUp && (profileFrom === null || crawl > profileFrom)) {
+    if (!profileTaken) {
       let profile = null;
       try {
         profile = toProfile(result.value, job.handle);
@@ -1479,14 +1476,19 @@ export async function runImportPass(options) {
         profile = null;
       }
       if (profile !== null) {
-        profileFrom = crawl;
+        /* Set before the offer, not after it succeeds. Whether the store keeps
+           the card or the validator refuses it, there is nothing more to learn
+           from later payloads — they name the same account, and the answer to
+           "may this card be stored" will be the same — so a rejected card is
+           not retried once per post for the rest of the run. */
+        profileTaken = true;
         // Deliberately not counted. The counters are about posts — imported,
         // enriched, skipped, failed — and a fifth one for a card that the "我"
         // page either shows or does not would be a row of diagnostics for
         // something the user can already see.
         try {
           await deps.saveProfile(profile);
-        } catch (_) { profileGaveUp = true; /* the posts still land */ }
+        } catch (_) { /* the posts still land */ }
       }
     }
 

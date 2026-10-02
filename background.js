@@ -1464,31 +1464,30 @@ async function runWaybackJob() {
           const clean = sanitizeProfile(card);
           if (clean === null) throw new Error('the archived profile failed validation');
 
-          /* Refuse to overwrite a card this browser actually SAW.
+          /* One rule: an import may write a card only when the store has NONE
+           * for this account. If any card is already there — live-captured or
+           * imported — it stays untouched.
            *
            * mergeProfile applies "the newest answer wins" by arrival order, and
-           * an imported card arrives now — so a snapshot of the account from
-           * years ago would take the place of today's bio, follower count and
-           * banner, and stamp `lastSeenAt` with the import time as if the
-           * browser had just looked. The card carries no crawl timestamp, so
-           * there is nothing here to compare against; the one thing that IS
-           * known is where the stored card came from.
+           * an imported card arrives now, so writing one over an existing card
+           * would replace it with a sighting from whenever the crawl ran and
+           * stamp `lastSeenAt` with the import time as if the browser had just
+           * looked. That is the reported bug: an archived payload from the day
+           * the account started posting carries 0 followers / 1 post, and once
+           * it is stamped with the import time listProfiles returns it first.
            *
-           * So an import may fill the gap when there is no card, and may
-           * improve another import's card — the engine already takes the newest
-           * crawl of a run. Anything the browser captured itself stays, because
-           * a live capture is by definition what the account looks like now.
-           * The reverse is not blocked: handleProfile has no such guard, so a
-           * later visit to the account's own page refreshes an imported card. */
+           * Nothing in the card says which crawl it came from — the engine's
+           * in-run "newest wins" cannot tell one run's card from a previous
+           * run's, and a resumed run can hold an older list than the one
+           * already stored. So the comparison is not attempted at all: no card,
+           * write; card of any origin, leave it. A live capture is what the
+           * account looks like now, and an imported card, however old, is still
+           * a true sighting of it. The reverse is not blocked: handleProfile
+           * has no such guard, so a later visit to the account's own page
+           * refreshes an imported card from live bytes. */
+          let existing;
           try {
-            const existing = await listProfiles(db);
-            for (const row of existing) {
-              if (String(row.userId) !== String(clean.userId)) continue;
-              const via = row.source && typeof row.source.operationName === 'string'
-                ? row.source.operationName : '';
-              if (via !== 'WaybackImport') return;
-              break;
-            }
+            existing = await listProfiles(db);
           } catch (_) {
             /* A read that failed means "cannot tell whether a card is there",
                and the two ways to be wrong are not equally bad: skipping the
@@ -1496,6 +1495,9 @@ async function runWaybackJob() {
                while writing over a card the browser captured live loses it for
                good. So a failed read skips. */
             return;
+          }
+          for (const row of existing) {
+            if (String(row.userId) === String(clean.userId)) return;
           }
 
           await upsertProfile(db, clean, job.seenAt);

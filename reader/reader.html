@@ -2050,6 +2050,34 @@ function sharedProfile(list) {
 }
 
 /**
+ * The profile one of the open archives carries for this handle, or null.
+ *
+ * Takes the list rather than reading `archive.accounts` so it can be tested
+ * outside a browser, the same as `sharedProfile` beside it — this is the
+ * lookup that decides WHOSE card goes over `#/@handle`, and getting it wrong
+ * is not a cosmetic failure: it puts one account's name, bio and follower
+ * count above another account's posts.
+ *
+ * `screenNameLower` first when the envelope has it, because that is the field
+ * the exporter normalises; a hand-written file may have only `screenName`, and
+ * a stored handle's case is whatever the export happened to carry.
+ */
+function profileForHandle(list, handle) {
+  if (!Array.isArray(list)) return null;
+  if (typeof handle !== 'string' || handle.length === 0) return null;
+  var want = handle.toLowerCase();
+  for (var i = 0; i < list.length; i++) {
+    var p = list[i];
+    if (!p || typeof p !== 'object') continue;
+    var lower = typeof p.screenNameLower === 'string' ? p.screenNameLower.toLowerCase() : '';
+    var name = typeof p.screenName === 'string' ? p.screenName.toLowerCase() : '';
+    var h = lower.length > 0 ? lower : name;
+    if (h.length > 0 && h === want) return p;
+  }
+  return null;
+}
+
+/**
  * What identifies the account behind a profile.
  *
  * The id when there is one, the handle otherwise — a file whose profile lost
@@ -3781,19 +3809,12 @@ function commitSources() {
   renderAccounts();
 
   /* After applyZone: the header's join date is rendered in the display zone. */
+  /* The chrome follows the address, not the file set — see paintHeader. This
+     runs after `renderAccounts()` has already applied the address once, so it
+     is deliberately painting the same answer a second time rather than asking
+     anything new; paintHeader is written to be safe to repeat. */
   el.tabs.hidden = false;
-  /* One card, or the list of them. The notice is only for the case where
-     neither could be drawn — a file whose `profile` is present but unusable, or
-     an archive old enough to have none. */
-  if (!renderProfile(archive.profile) && !renderAccountList(archive.accounts)) {
-    addNotice(accountProfiles().length > 0
-      ? '<b>这些归档里的账号资料读不出来。</b>信封里有一个 <code>profile</code> 字段，但它不是一个完整的对象——' +
-        '文件可能被手改过或者截断了。帖子本身不受影响。'
-      : '<b>这份归档里没有账号资料（<code>profile</code>），所以上面没有资料卡。</b>' +
-        '这是较早版本的扩展导出的文件；用新版扩展重新导出一次，就会带上名称、简介和关注数。' +
-        '帖子、媒体和下面的统计都不受影响。',
-      'warn');
-  }
+  paintHeader(parseHash());
 
   /* Compose before sizing: the height table is built from the list, so the list
      has to be settled first. clearIndexState left `ids` null, which is the whole
@@ -6244,6 +6265,66 @@ function renderAccountList(list) {
   return true;
 }
 
+/**
+ * Draw the chrome the ADDRESS asks for — the header and the tab strip.
+ *
+ * It used to be drawn from `archive.profile`, which is derived from whichever
+ * FILES are open. That is a different question from which page you are on, and
+ * the two disagree the moment a second account is opened: `#/@alice` with alice
+ * and bob both open drew a "2 个账号 · @alice · @bob" banner over a timeline
+ * that is entirely alice's. The address says whose page this is; the header
+ * follows the address.
+ *
+ *   #/@handle   that account's card — the whole point of the page
+ *   anything else   no header at all
+ *
+ * The timeline and the search page are not one account's page, so a card over
+ * either is a claim the page does not make. (The search page swaps in its own
+ * strip; see the tab-strip block below.)
+ *
+ * ⚠️ CALLED LAST, always. renderProfile and renderAccountList both force
+ * `hidden = false` on their way through, so anything that wants them hidden has
+ * to run after them — and commitSources paints the header after it has already
+ * applied the address once.
+ */
+function paintHeader(route) {
+  var r = route || { name: 'unknown' };
+
+  /* The post page is a layer over a view that is still there underneath, and
+     `body.postOpen` hides the whole column — leave its header alone so coming
+     back does not have to rebuild it. */
+  if (r.name === 'post' && viewFor(r) !== 'me') return;
+
+  var wantsCard = r.name === 'account';
+  if (wantsCard) {
+    if (renderProfile(profileForHandle(archive.accounts, r.handle)) ||
+        renderAccountList(archive.accounts)) return;
+
+    /* Nothing to draw. Two different states, and they are not the same
+       sentence: an archive written before the header existed has no card for
+       anybody, while one that has cards but not this one means the address
+       names somebody else. */
+    if (archive.accounts.length > 0) {
+      addNotice('<b>@' + esc(r.handle) + ' 的账号资料不在现在打开的归档里。</b>' +
+        '这些归档里有 ' + archive.accounts.length + ' 个账号的资料，但没有这一个。' +
+        '下面是全部记录。', 'warn');
+    } else {
+      addNotice('<b>这些归档里没有账号资料，所以上面没有资料卡。</b>' +
+        '这是较早版本的扩展导出的文件；用新版扩展重新导出一次，就会带上名称、简介和关注数。', 'warn');
+    }
+  }
+
+  el.profile.hidden = true;
+  el.profile.textContent = '';
+  el.stickyBar.hidden = true;
+  /* The bar keeps the last name and count it was given. Nothing renders them
+     while it is hidden, but leaving one account's name sitting in the DOM
+     after you have navigated to another page is the kind of thing that shows
+     up the day something unhides the bar for a different reason. */
+  el.sbName.textContent = '';
+  el.sbCount.textContent = '';
+}
+
 /* ---------------------------------------------------------------- 我 ---
  *
  * The accounts that are open, one card each.
@@ -7634,13 +7715,12 @@ function reRenderAll() {
      the offset renderWindow subtracts — laying out the rows against the height
      of the previous file's header puts every card in the wrong place for a
      frame. */
-  /* The same two calls commitSources makes, in the same order. Drawing only
-     the profile left the account-list header — the one for several different
-     accounts open at once — off the page for good: it is authored by
-     renderAccountList alone, so switching 他人头像 or 时区 with two accounts
-     open wiped the header and the sticky bar until every file was closed and
-     reopened. */
-  if (!renderProfile(archive.profile)) renderAccountList(archive.accounts);
+  /* The same call commitSources makes. Drawing only the profile left the
+     account-list header — the one for several different accounts open at once —
+     off the page for good: it is authored by renderAccountList alone, so
+     switching 他人头像 or 时区 with two accounts open wiped the header and the
+     sticky bar until every file was closed and reopened. */
+  paintHeader(parseHash());
   paintStickyBar();
   renderWindow(true);
   statsLine();
@@ -7906,6 +7986,11 @@ async function applyRouteEffects(route) {
        post still lights the account the post came from, even though the lookup
        it does on the way can fail. */
     paintAccounts();
+    /* And the chrome the address asks for, after everything that could have
+       drawn one. `paintAccounts` is not a header call, but it is the last thing
+       to run before this and it redraws the sidebar from the same route — the
+       two belong together. */
+    paintHeader(route);
   }
 }
 
@@ -7973,6 +8058,11 @@ async function routeEffects(route) {
   if (list.mode === 'search') { el.q.value = ''; timelineMode(); }
   else if (el.q.value.length > 0) el.q.value = '';
   setAccountFilter(null);
+  /* `#/` is named 全部时间线, so a tab left over from the last visit — 回复, or
+     帖子/仅帖子 — would show a subset under an address that promises all of it.
+     Guarded, because selectTab rebuilds a filter and there is nothing to
+     rebuild when the filter is already the default. */
+  if (list.tab !== 'posts' || list.scope !== 'all') void selectTab('posts', 'all');
   /* Last, for the same reason as the account branch above. */
   if (route.name === 'unknown') routeMissing(route);
 }

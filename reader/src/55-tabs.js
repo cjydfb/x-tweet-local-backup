@@ -661,3 +661,63 @@ function renderAccountList(list) {
   el.stickyBar.hidden = false;
   return true;
 }
+
+/**
+ * Draw the chrome the ADDRESS asks for — the header and the tab strip.
+ *
+ * It used to be drawn from `archive.profile`, which is derived from whichever
+ * FILES are open. That is a different question from which page you are on, and
+ * the two disagree the moment a second account is opened: `#/@alice` with alice
+ * and bob both open drew a "2 个账号 · @alice · @bob" banner over a timeline
+ * that is entirely alice's. The address says whose page this is; the header
+ * follows the address.
+ *
+ *   #/@handle   that account's card — the whole point of the page
+ *   anything else   no header at all
+ *
+ * The timeline and the search page are not one account's page, so a card over
+ * either is a claim the page does not make. (The search page swaps in its own
+ * strip; see the tab-strip block below.)
+ *
+ * ⚠️ CALLED LAST, always. renderProfile and renderAccountList both force
+ * `hidden = false` on their way through, so anything that wants them hidden has
+ * to run after them — and commitSources paints the header after it has already
+ * applied the address once.
+ */
+function paintHeader(route) {
+  var r = route || { name: 'unknown' };
+
+  /* The post page is a layer over a view that is still there underneath, and
+     `body.postOpen` hides the whole column — leave its header alone so coming
+     back does not have to rebuild it. */
+  if (r.name === 'post' && viewFor(r) !== 'me') return;
+
+  var wantsCard = r.name === 'account';
+  if (wantsCard) {
+    if (renderProfile(profileForHandle(archive.accounts, r.handle)) ||
+        renderAccountList(archive.accounts)) return;
+
+    /* Nothing to draw. Two different states, and they are not the same
+       sentence: an archive written before the header existed has no card for
+       anybody, while one that has cards but not this one means the address
+       names somebody else. */
+    if (archive.accounts.length > 0) {
+      addNotice('<b>@' + esc(r.handle) + ' 的账号资料不在现在打开的归档里。</b>' +
+        '这些归档里有 ' + archive.accounts.length + ' 个账号的资料，但没有这一个。' +
+        '下面是全部记录。', 'warn');
+    } else {
+      addNotice('<b>这些归档里没有账号资料，所以上面没有资料卡。</b>' +
+        '这是较早版本的扩展导出的文件；用新版扩展重新导出一次，就会带上名称、简介和关注数。', 'warn');
+    }
+  }
+
+  el.profile.hidden = true;
+  el.profile.textContent = '';
+  el.stickyBar.hidden = true;
+  /* The bar keeps the last name and count it was given. Nothing renders them
+     while it is hidden, but leaving one account's name sitting in the DOM
+     after you have navigated to another page is the kind of thing that shows
+     up the day something unhides the bar for a different reason. */
+  el.sbName.textContent = '';
+  el.sbCount.textContent = '';
+}

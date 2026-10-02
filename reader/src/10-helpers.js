@@ -630,6 +630,34 @@ function sharedProfile(list) {
 }
 
 /**
+ * The profile one of the open archives carries for this handle, or null.
+ *
+ * Takes the list rather than reading `archive.accounts` so it can be tested
+ * outside a browser, the same as `sharedProfile` beside it — this is the
+ * lookup that decides WHOSE card goes over `#/@handle`, and getting it wrong
+ * is not a cosmetic failure: it puts one account's name, bio and follower
+ * count above another account's posts.
+ *
+ * `screenNameLower` first when the envelope has it, because that is the field
+ * the exporter normalises; a hand-written file may have only `screenName`, and
+ * a stored handle's case is whatever the export happened to carry.
+ */
+function profileForHandle(list, handle) {
+  if (!Array.isArray(list)) return null;
+  if (typeof handle !== 'string' || handle.length === 0) return null;
+  var want = handle.toLowerCase();
+  for (var i = 0; i < list.length; i++) {
+    var p = list[i];
+    if (!p || typeof p !== 'object') continue;
+    var lower = typeof p.screenNameLower === 'string' ? p.screenNameLower.toLowerCase() : '';
+    var name = typeof p.screenName === 'string' ? p.screenName.toLowerCase() : '';
+    var h = lower.length > 0 ? lower : name;
+    if (h.length > 0 && h === want) return p;
+  }
+  return null;
+}
+
+/**
  * What identifies the account behind a profile.
  *
  * The id when there is one, the handle otherwise — a file whose profile lost

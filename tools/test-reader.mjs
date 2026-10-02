@@ -67,7 +67,7 @@ const P = new Function(pure + `
            readJsonValueEnd, readEnvelopeProfile, intersectAscending,
            envelopeHasList, remoteMediaUrl, sizedAvatarUrl, AVATAR_TIERS,
            safeDataImageUrl, REMOTE_MEDIA_HOSTS,
-           sharedProfile, accountKey,
+           sharedProfile, accountKey, profileForHandle,
            isAbsent, isPlainObject, mergeField, mergeCapture };
 `)();
 
@@ -956,6 +956,34 @@ check('nothing open has no shared card', () => {
   assertEqual(P.sharedProfile([]), null);
   assertEqual(P.sharedProfile([null, null]), null);
   assertEqual(P.sharedProfile(null), null);
+});
+
+check('the header for an account page is THAT account, not whichever came first', () => {
+  // The bug this exists for: with two accounts open, #/@bob drew a summary of
+  // the whole file set over a timeline that was entirely bob's.
+  const a = acct('1', 'alice');
+  const b = acct('2', 'bob');
+  assertEqual(P.profileForHandle([a, b], 'bob'), b);
+  assertEqual(P.profileForHandle([a, b], 'alice'), a);
+  // The address is whatever the user pasted; a stored handle's case is whatever
+  // the export carried.
+  assertEqual(P.profileForHandle([a, b], 'BOB'), b);
+  assertEqual(P.profileForHandle([{ userId: '2', screenName: 'Bob' }], 'bob').userId, '2');
+  // screenNameLower wins when the envelope has it — it is what the exporter
+  // normalises, and the two can disagree in a hand-edited file.
+  assertEqual(P.profileForHandle([{ userId: '2', screenName: 'BOB', screenNameLower: 'bob' }], 'bob').userId, '2');
+});
+
+check('an account page for somebody we do not have gets no card', () => {
+  const a = acct('1', 'alice');
+  assertEqual(P.profileForHandle([a], 'nobody'), null);
+  assertEqual(P.profileForHandle([a], ''), null);
+  assertEqual(P.profileForHandle([a], null), null);
+  assertEqual(P.profileForHandle([], 'alice'), null);
+  assertEqual(P.profileForHandle(null, 'alice'), null);
+  // A profile with no handle at all must not match the empty address.
+  assertEqual(P.profileForHandle([{ userId: '3' }], ''), null);
+  assertEqual(P.profileForHandle([null, undefined, 'x', a], 'alice'), a);
 });
 
 check('the id decides, and the handle only when there is no id', () => {
